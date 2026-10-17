@@ -1,0 +1,88 @@
+ext,class,software,domain,note
+sldprt,PART,SolidWorks,,
+par,PART,SolidEdge,,
+psm,PART,SolidEdge,,
+ipt,PART,Inventor,,
+catpart,PART,CATIA,,
+prt,PART,,,ambiguous (NX/Creo) - software left blank
+f3d,PART,Fusion360,,single-file design counted as a part
+fcstd,PART,FreeCAD,,
+3dm,PART,Rhino,,
+skp,PART,SketchUp,Architecture,
+rvt,PART,Revit,Architecture,single-file model counted as a part
+rfa,PART,Revit,Architecture,
+sldasm,ASSEMBLY,SolidWorks,,
+asm,ASSEMBLY,,,ambiguous (SolidEdge/Creo) - software left blank
+iam,ASSEMBLY,Inventor,,
+catproduct,ASSEMBLY,CATIA,,
+slddrw,DRAWING,SolidWorks,,
+dft,DRAWING,SolidEdge,,
+idw,DRAWING,Inventor,,
+drw,DRAWING,Creo,,
+catdrawing,DRAWING,CATIA,,
+dwg,DRAWING,AutoCAD,,
+dxf,DRAWING,,,open format - software left blank
+dwf,DRAWING,AutoCAD,,
+schdoc,DRAWING,Altium,Electronics,schematic
+pcbdoc,DRAWING,Altium,Electronics,PCB layout
+kicad_sch,DRAWING,KiCad,Electronics,schematic
+kicad_pcb,DRAWING,KiCad,Electronics,PCB layout
+sch,DRAWING,,Electronics,ambiguous (Eagle/KiCad) - software left blank
+brd,DRAWING,,Electronics,ambiguous - software left blank
+gbr,DRAWING,,Electronics,Gerber
+ger,DRAWING,,Electronics,Gerber
+step,NEUTRAL3D,,,
+stp,NEUTRAL3D,,,
+iges,NEUTRAL3D,,,
+igs,NEUTRAL3D,,,
+x_t,NEUTRAL3D,,,Parasolid
+x_b,NEUTRAL3D,,,Parasolid
+stl,NEUTRAL3D,,,
+obj,NEUTRAL3D,,,
+3mf,NEUTRAL3D,,,
+ifc,NEUTRAL3D,,Architecture,
+pdf,PDF,,,counted as PDF Drawings only with --pdf-drawings all
+inp,SIM,,,Abaqus and CalculiX share this
+frd,SIM,CalculiX,,
+dat,SIM,,,
+msh,SIM,,,
+vtu,SIM,,,
+vtk,SIM,,,
+sta,SIM,,,
+cvg,SIM,,,
+odb,SIM,Abaqus,,
+doc,DOC,,,
+docx,DOC,,,
+xls,DOC,,,
+xlsx,DOC,,,
+ppt,DOC,,,
+pptx,DOC,,,
+txt,DOC,,,
+md,DOC,,,
+rtf,DOC,,,
+html,DOC,,,
+htm,DOC,,,
+csv,DATA,,,
+json,DATA,,,
+xml,DATA,,,
+yaml,DATA,,,
+yml,DATA,,,
+log,DATA,,,
+out,DATA,,,
+ini,DATA,,,
+12d,DATA,,,
+sldmat,DATA,,,
+png,IMG,,,
+jpg,IMG,,,
+jpeg,IMG,,,
+gif,IMG,,,
+bmp,IMG,,,
+tif,IMG,,,
+tiff,IMG,,,
+svg,IMG,,,
+zip,ARCHIVE,,,
+7z,ARCHIVE,,,
+rar,ARCHIVE,,,
+gz,ARCHIVE,,,
+tar,ARCHIVE,,,
+(none),OTHER,,,

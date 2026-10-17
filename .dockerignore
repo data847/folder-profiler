@@ -1,0 +1,8 @@
+.git
+output
+python
+*.zip
+*.pdf
+claude-skill
+__pycache__
+.DS_Store

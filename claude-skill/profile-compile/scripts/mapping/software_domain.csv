@@ -1,0 +1,22 @@
+tag,display,domain
+SolidWorks,SolidWorks,Mechanical
+Inventor,Inventor,Mechanical
+CATIA,CATIA,Mechanical
+Creo,Creo,Mechanical
+NX,NX,Mechanical
+SolidEdge,Solid Edge,Mechanical
+Fusion360,Fusion 360,Mechanical
+FreeCAD,FreeCAD,Mechanical
+Onshape,Onshape,Mechanical
+Rhino,Rhino,Mechanical
+OpenCascade,OpenCascade,Mechanical
+CalculiX,CalculiX,Mechanical
+ANSYS,ANSYS,Mechanical
+Abaqus,Abaqus,Mechanical
+AutoCAD,AutoCAD,Mechanical
+SketchUp,SketchUp,Architecture
+Revit,Revit,Architecture
+ArchiCAD,ArchiCAD,Architecture
+Altium,Altium,Electronics
+KiCad,KiCad,Electronics
+Eagle,Eagle,Electronics
