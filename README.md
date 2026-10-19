@@ -46,14 +46,15 @@ OS clutter (`.DS_Store`, `Thumbs.db`, `desktop.ini`) is skipped and counted in `
 ## Compile (the Claude skill)
 
 ```bash
-python3 claude-skill/profile-compile/scripts/compile_profiles.py /folder/of/zips [--unique] [--pdf-drawings all]
+python3 claude-skill/profile-compile/scripts/compile_profiles.py /folder/of/zips [--unique] [--pdf-drawings all] [--estimate-assemblies]
 ```
 Writes `Project_Compiled.csv`, `File_Level.csv`, `Project_Stats.csv`, `Review.csv` (+ `compiled.xlsx` if `openpyxl`
 is installed). Rules are two editable CSVs in `scripts/mapping/`. See `claude-skill/profile-compile/SKILL.md`;
 upload that folder to Claude as a skill to use it conversationally.
 
-**Not produced:** the template's *Assembly Breakdown* rows (needs assembly file names and part-to-assembly links,
-which a metrics-only profile cannot provide) and *PDF Drawings* (default 0 — a PDF's content type is unknowable from
+**Not produced exactly:** the template's *Assembly Breakdown* rows (needs assembly file names and part-to-assembly links,
+which a metrics-only profile cannot provide). `--estimate-assemblies` fills the tab with an even-split ESTIMATE (placeholder
+names `EST_nnn`; rows sum to each project's totals) — clearly an estimate, not real structure and *PDF Drawings* (default 0 — a PDF's content type is unknowable from
 metrics; `--pdf-drawings all` counts every PDF).
 
 ## Tests

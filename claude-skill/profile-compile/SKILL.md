@@ -21,7 +21,7 @@ software, domain) is made here, from editable tables, never in the profiler.
 ## Run it
 
 ```bash
-python3 scripts/compile_profiles.py <zip | folder-of-zips> [more ...] [--unique] [--pdf-drawings none|all] [--out DIR]
+python3 scripts/compile_profiles.py <zip | folder-of-zips> [more ...] [--unique] [--pdf-drawings none|all] [--estimate-assemblies] [--out DIR]
 ```
 
 (path relative to this skill's folder)
@@ -51,9 +51,17 @@ python3 scripts/compile_profiles.py <zip | folder-of-zips> [more ...] [--unique]
 | 2D Files (file types) | DRAWING extensions (+ `PDF` only when PDF Drawings > 0), most frequent first, upper-case, or `None` |
 | 3D Files (file types) | PART + ASSEMBLY + NEUTRAL3D extensions, or `None` |
 
-**Assembly Breakdown** — the template's 6 headings, **left empty**. It needs each assembly's file name
-and which parts belong to it; the profiler records neither (no file names; assembly links are inside
-binary CAD files). Always say so and never fabricate rows.
+**Assembly Breakdown** — the template's 6 headings. By default **left empty**: it needs each assembly's file
+name and which parts belong to it, and the profiler records neither (no file names; assembly links are inside
+binary CAD files, and SolidWorks assemblies cannot be read without SolidWorks). Never invent real-looking rows.
+
+With `--estimate-assemblies` it is filled with an **ESTIMATE**: each project's parts / native 2D / PDF / neutral 3D
+totals are split evenly across its assembly files (remainders to the first rows), so the rows sum exactly to the
+project's totals on Project Compiled. Names are placeholders (`EST_001.ASM`, extension = the project's real assembly
+extensions), never real assembly names. Projects with no assembly files get no rows (Review lists their unattributed
+counts). Also written as `Assembly_Breakdown_ESTIMATE.csv`. Only use the flag when the user asks for an estimate, and
+**always call it an even-split estimate, not real structure**, whenever you show or hand over those rows. A better
+estimate (grouping by folder) would need the data owner to re-run an updated profiler.
 
 ## Decisions to surface (never pick silently)
 

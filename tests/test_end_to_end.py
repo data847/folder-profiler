@@ -25,7 +25,9 @@ with tempfile.TemporaryDirectory() as t:
     runs = cp.load_profiles([zip_path]); ext_map, soft = cp.load_mapping(os.path.join(ROOT, "claude-skill", "profile-compile", "scripts", "mapping"))
 
     def rows(**kw):
-        c, *_ , review = cp.compile_runs(runs, ext_map, soft, kw.get("unique", False), kw.get("pdf", "none"))
+        c, _files, _stats, review, asm = cp.compile_runs(runs, ext_map, soft, kw.get("unique", False), kw.get("pdf", "none"),
+                                                         kw.get("estimate", False))
+        rows.asm = asm
         return {r[0]: r for r in c}, review
 
     bad = []
@@ -47,4 +49,15 @@ with tempfile.TemporaryDirectory() as t:
     check("other tools note (FreeCAD from STEP)", any("FreeCAD (2)" in x[2] for x in review), True)
     r, _ = rows(unique=True); check("unique parts", r["Mech"][4], 2)
     r, _ = rows(pdf="all");  check("pdf all -> PDF Drawings and 2D types", (r["Mech"][7], r["Mech"][9]), (2, "PDF, SLDDRW, DWG"))   # types are ordered by frequency
+    # estimate: rows must add up to project totals; placeholder names; no rows when the flag is off
+    check("no assembly rows by default", len(rows()[0]) and len(rows.asm), 0)
+    r, review = rows(estimate=True)
+    mech = [a for a in rows.asm if a[0] == "Mech"]
+    check("Mech estimate rows sum to project totals (parts, 2D, PDF, neutral)", tuple(sum(a[i] for a in mech) for i in (2, 3, 4, 5)), (3, 2, 0, 2))
+    check("Mech placeholder name", mech[0][1], "EST_001.SLDASM")
+    check("projects without assemblies get no rows", {a[0] for a in rows.asm}, {"Mech"})
+    check("review says ESTIMATE", any("ESTIMATE" in x[2] for x in review), True)
+    # uneven split: 7 parts over 3 assemblies -> 3,2,2 summing to 7
+    check("split_evenly(7,3)", cp.split_evenly(7, 3), [3, 2, 2])
+    check("split_evenly(0,4)", cp.split_evenly(0, 4), [0, 0, 0, 0])
 sys.exit(1 if any(bad) else 0)
