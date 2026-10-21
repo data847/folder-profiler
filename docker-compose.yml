@@ -1,0 +1,20 @@
+# docker compose up --build   ->  open http://localhost:8765
+# Folder to measure: set PROFILE_DIR (e.g. in a .env file next to this one). Default: ./data
+# Linux/macOS: also set PUID/PGID to `id -u` / `id -g` so ./output is writable (Docker Desktop on Windows ignores this).
+services:
+  profiler-ui:
+    build: .
+    image: folder-profiler:1.5-ui
+    entrypoint: ["python", "/app/ui.py"]
+    ports:
+      - "127.0.0.1:8765:8765"   # loopback only: reachable from this computer, not the network
+    volumes:
+      - ${PROFILE_DIR:-./data}:/data:ro
+      - ./output:/out
+    user: "${PUID:-1000}:${PGID:-1000}"
+    environment:
+      PROFILER_WORKERS: "${PROFILER_WORKERS:-}"   # parallel hashing threads; empty = auto
+      PROFILER_TIER: "${PROFILER_TIER:-}"         # detail level 0/1/2 (also choosable on the page)
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]

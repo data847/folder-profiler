@@ -5,8 +5,9 @@
 # filesystem and no extra privileges. The metrics zip appears in ./output.
 set -euo pipefail
 cd "$(dirname "$0")"
-IMAGE="folder-profiler:1.1"
+IMAGE="folder-profiler:1.5"
 SRC="${1:-}"
+shift || true          # anything after the folder is passed to the profiler, e.g. --level 2 --project-depth 2
 [ -n "$SRC" ] || read -r -p "Drag the folder here and press Enter: " SRC
 SRC="${SRC%\"}"; SRC="${SRC#\"}"; SRC="${SRC%/}"
 [ -d "$SRC" ] || { echo "Not a folder: $SRC"; exit 1; }
@@ -20,4 +21,5 @@ docker run --rm \
   --user "$(id -u):$(id -g)" \
   -v "$SRC_ABS:/data:ro" -v "$PWD/output:/out" \
   -e PROFILER_FOLDER_NAME="$(basename "$SRC_ABS")" \
-  "$IMAGE"
+  -e PROFILER_TIER -e PROFILER_PROJECT_DEPTH -e PROFILER_HASH -e PROFILER_ANON_ASM -e PROFILER_ARCHIVES -e PROFILER_ARCHIVE_GB \
+  "$IMAGE" "$@"

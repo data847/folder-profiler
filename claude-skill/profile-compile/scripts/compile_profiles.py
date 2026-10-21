@@ -16,10 +16,18 @@ Local only: no network, no credentials. Reads zips, writes files.
 
 All classification lives in mapping/*.csv (next to this script) - edit those, not this file.
 Counting: every file by default; --unique counts each content hash once per project.
---estimate-assemblies: a profile has no assembly file names and no part-to-assembly links, so this fills the
-      Assembly Breakdown tab with an ESTIMATE: each project's parts / native 2D / PDF / neutral 3D totals are split
-      evenly across its assembly files (remainders to the first rows), so the rows add up to the project totals.
-      Names are placeholders ("EST_001.ASM") - never real assembly names. Projects with no assembly files get no rows.
+Defaults: --project-by auto (structure split whenever the profile has resolvable references) and the Assembly Breakdown is
+filled (confidence reported). --project-by folder / --no-assembly-breakdown turn these off.
+--project-by structure|auto: split each folder-project into sub-projects, one per ROOT assembly (an assembly no other assembly
+      references) plus everything it references; needs a level-2 profile. Sub-projects under --min-project-files merge into
+      "<project> / (other)". Outputs add Assembly_Confidence.csv (per project: High / Medium / Low and why) and
+      Assembly_Evidence.csv (per assembly: references, how many resolved, parts by method).
+--estimate-assemblies: a profile has no real part-to-assembly links, so this fills the Assembly Breakdown tab with an
+      ESTIMATE that adds up to each project's totals. Profiles from profiler >= 1.2 carry anonymous folder ids and the
+      names of assembly files, so each part / native 2D / PDF / neutral 3D file goes to the assembly in its own folder,
+      else the nearest folder above, else is spread over the nearest assemblies (FOLDER-BASED estimate, real names).
+      Older profiles have neither, so totals are split evenly with placeholder names ("EST_001.ASM") (EVEN-SPLIT).
+      Projects with no assembly files get no rows. Always call it an estimate: folders are not CAD links.
 PDFs: PDF Drawings is 0 by default (a metric-only profile cannot tell a drawing from a report);
       --pdf-drawings all counts every PDF as a drawing.
 """
@@ -27,6 +35,7 @@ import argparse
 import collections
 import csv
 import io
+import re
 import sys
 import zipfile
 from datetime import datetime
@@ -40,6 +49,8 @@ except ImportError:  # xlsx is a convenience; CSVs are always written
     Workbook = None
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))          # structure.py sits next to this file (also under `python -I`)
+from structure import (assign_assemblies, build_universe, detect_copies, split_by_structure, split_evenly, stem)  # noqa: E402,F401
 
 HEADINGS = ["Project Name", "Project Description", "Domain", "Native CAD Software", "Part Files",
             "Assembly Files", "Native 2D Drawings", "PDF Drawings", "Neutral 3D Files",
@@ -47,12 +58,16 @@ HEADINGS = ["Project Name", "Project Description", "Domain", "Native CAD Softwar
 ASSEMBLY_HEADINGS = ["Project Name", "Assembly File Name", "Part Files", "Native 2D Drawings",
                      "PDF Drawings", "Neutral 3D Files"]
 FILE_HEADER = ["project", "ext", "class", "native_software", "domain", "size_bytes", "modified_utc", "sha256",
-               "header_signature", "duplicate_of_earlier_file"]
+               "header_signature", "duplicate_of_earlier_file", "in_archive", "archive_duplicate_not_counted"]
 STATS_HEADER = ["project", "files_total", "unique_hashes", "duplicate_files", "parts", "assemblies",
                 "native_2d_drawings", "neutral_3d", "pdf", "simulation", "documents", "data", "images",
-                "archive_other", "unmapped", "total_bytes", "counted_as"]
+                "archive_other", "unmapped", "total_bytes", "counted_as", "files_in_archives", "archive_duplicates_not_counted",
+                "possible_copy_of", "copy_share"]
 CLASSES = {"PART", "ASSEMBLY", "DRAWING", "NEUTRAL3D", "PDF", "SIM", "DOC", "DATA", "IMG", "ARCHIVE", "OTHER"}
 NATIVE = {"PART", "ASSEMBLY", "DRAWING"}      # only these name the "Native CAD Software"
+REPORT_WORDS = re.compile(r"report|spec|manual|datasheet|data.?sheet|catalog|brochure|invoice|quot|certificate|summary|presentation|"
+                          r"assessment|breakdown|change.?log|verification|proposal|minutes|checklist|offer|\bbom\b|readme", re.I)
+DRAWING_WORDS = re.compile(r"drawing|\bdrg\b|\bdwg\b|layout|sheet|assy|detail|schematic|arrangement", re.I)
 EMPTY_SHA = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
 
@@ -98,7 +113,11 @@ def load_profiles(paths):
                 continue
             info = {r["key"]: r["value"] for r in read_csv(zf.read("Run_info.csv").decode("utf-8-sig"))}
             files = read_csv(zf.read("Files.csv").decode("utf-8-sig"))
-        runs.append({"zip": z.name, "info": info, "files": files})
+            links = read_csv(zf.read("Links.csv").decode("utf-8-sig")) if "Links.csv" in names else []
+            parents = {}
+            if "Dirs.csv" in names:  # profiler >= 1.2: anonymous folder tree (ids only)
+                parents = {d["dir_id"]: d["parent_dir_id"] for d in read_csv(zf.read("Dirs.csv").decode("utf-8-sig"))}
+        runs.append({"zip": z.name, "info": info, "files": files, "parents": parents, "links": links})
     if not runs:
         raise SystemExit("No profiler zips found.")
     keys = collections.Counter((r["info"].get("folder_name"), p) for r in runs for p in {f["project"] for f in r["files"]})
@@ -108,15 +127,19 @@ def load_profiles(paths):
     return runs
 
 
-def split_evenly(total, k):
-    """total split into k integers differing by at most 1; the first (total % k) rows get the extra unit."""
-    return [total // k + (1 if i < total % k else 0) for i in range(k)]
-
-
-def compile_runs(runs, ext_map, soft, unique, pdf_mode, estimate=False):
+def compile_runs(runs, ext_map, soft, unique, pdf_mode, estimate=False, project_by="folder", min_project_files=25,
+                 unique_scope="project", copies="flag"):
     names = collections.Counter(p for r in runs for p in {f["project"] for f in r["files"]})
     per_project, unmapped = {}, collections.Counter()
-    for run in runs:
+    for ri, run in enumerate(runs):
+        lk = collections.defaultdict(lambda: {"native": set(), "names": set(), "step": collections.defaultdict(set)})
+        for l in run.get("links", []):
+            e = lk[(l["project"], int(l["file_no"]))]
+            if l["kind"] == "native":
+                e["native"].add(stem(l["child"]))
+                e["names"].add(l["child"].lower())
+            else:
+                e["step"][stem(l["parent"], False)].add(stem(l["child"], False))
         folder = run["info"].get("folder_name", run["zip"])
         for f in run["files"]:
             proj = f["project"] if names[f["project"]] == 1 else f"{folder}/{f['project']}"
@@ -128,21 +151,76 @@ def compile_runs(runs, ext_map, soft, unique, pdf_mode, estimate=False):
             sw = (m["software"] if m else "") if cls in NATIVE else ""
             tool = tool_in_tag(f["header_signature"]) if cls in ("NEUTRAL3D", "SIM") else ""
             domain = (m["domain"] if m else "") or (soft[sw]["domain"] if sw in soft else "")
-            P = per_project.setdefault(proj, {"hashes": set(), "rows": []})
+            P = per_project.setdefault(proj, {"hashes": set(), "rows": [], "parents": {}})
+            P["parents"] = run.get("parents", {})
             sha = f["sha256"]
-            dup = sha in P["hashes"] and sha != EMPTY_SHA
-            P["hashes"].add(sha)
+            dup = bool(sha) and sha in P["hashes"] and sha != EMPTY_SHA      # blank = not hashed (smart hashing) = unique
+            if sha:
+                P["hashes"].add(sha)
+            rel = f.get("rel_path", "")
+            nm = rel.rsplit("/", 1)[-1] if rel else (f.get("asm_name", "") or "")
             P["rows"].append(dict(project=proj, ext=ext, cls=cls, sw=sw, tool=tool, domain=domain,
                                   size=int(f["size_bytes"]), modified=f["modified_utc"], sha=sha,
-                                  sig=f["header_signature"], dup=dup))
+                                  sig=f["header_signature"], dup=dup, dir=f.get("dir_id", ""), asm=f.get("asm_name", ""),
+                                  name=nm, stem=stem(nm) if nm else "", pdfdraw=False, archive=f.get("archive", ""),
+                                  adup=dup and bool(f.get("archive", "")),
+                                  lk=lk.get((f["project"], int(f["file_no"])))))
 
-    compiled, file_rows, stats, review, assemblies = [], [], [], [], []
+    review, evidence_rows, confidence_rows = [], [], []
+    universe = build_universe([r for P in per_project.values() for r in P["rows"]])    # references may point to other folders
+    if project_by in ("structure", "auto"):             # split folder-projects into sub-projects by root assembly
+        for proj in list(per_project):
+            P = per_project[proj]
+            groups, why = split_by_structure(proj, P["rows"], P["parents"], min_project_files, with_reason=True, universe=universe)
+            if not groups:
+                if project_by == "auto" and any(r.get("lk") for r in P["rows"]):
+                    review.append([proj, "project split", f"kept as one folder-project: {why}"])
+                continue
+            del per_project[proj]
+            if why:
+                review.append([proj, "project split", why])
+            for gname, grows in groups.items():
+                G = per_project.setdefault(gname, {"hashes": set(), "rows": [], "parents": P["parents"]})
+                for r in grows:
+                    r["project"] = gname
+                    r["dup"] = bool(r["sha"]) and r["sha"] in G["hashes"] and r["sha"] != EMPTY_SHA
+                    r["adup"] = r["dup"] and bool(r["archive"])
+                    if r["sha"]:
+                        G["hashes"].add(r["sha"])
+                    G["rows"].append(r)
+            review.append([proj, "project split", f"split into {len(groups)} sub-projects by root assembly (an assembly no other assembly "
+                           f"references, plus everything it references): " + ", ".join(sorted(g.split(" / ", 1)[-1] for g in groups)[:12])
+                           + (" ..." if len(groups) > 12 else "")])
+    copy_of = detect_copies(per_project) if copies != "keep" else {}
+    if unique and unique_scope == "all":                # each content counted once in the WHOLE profile (biggest project keeps it)
+        seen_all = set()
+        for proj in sorted(per_project, key=lambda p: (-len(per_project[p]["rows"]), p.lower())):
+            mine = set()
+            for r in per_project[proj]["rows"]:
+                if r["sha"] and r["sha"] != EMPTY_SHA:
+                    if r["sha"] in seen_all:
+                        r["dup"] = True
+                    mine.add(r["sha"])
+            seen_all |= mine
+    compiled, file_rows, stats, assemblies = [], [], [], []
     for proj in sorted(per_project, key=str.lower):
         rows = per_project[proj]["rows"]
         file_rows += rows
-        counted = [r for r in rows if not (unique and r["dup"])]
+        if proj in copy_of and copies == "exclude":
+            orig, share, nfiles = copy_of[proj]
+            review.append([proj, "possible copy", f"EXCLUDED from Project Compiled: {share:.0%} of its {nfiles} fingerprinted files are identical to files in '{orig}'"])
+            continue
+        counted = [r for r in rows if not ((unique and r["dup"]) or r["adup"])]
         n = collections.Counter(r["cls"] for r in counted)
-        pdf_drawings = n["PDF"] if pdf_mode == "all" else 0
+        models = {r["stem"] for r in counted if r["cls"] in ("DRAWING", "PART", "ASSEMBLY") and r["stem"]}
+        for r in counted:                               # which PDFs are drawings
+            if r["cls"] != "PDF":
+                continue
+            if pdf_mode == "all":
+                r["pdfdraw"] = True
+            elif pdf_mode == "auto" and r["name"]:
+                r["pdfdraw"] = (r["stem"] in models) or bool(DRAWING_WORDS.search(r["name"]) and not REPORT_WORDS.search(r["name"]))
+        pdf_drawings = sum(1 for r in counted if r["pdfdraw"])
 
         def types(classes, extra=()):
             c = collections.Counter(r["ext"] for r in counted if r["cls"] in classes)
@@ -163,10 +241,20 @@ def compile_runs(runs, ext_map, soft, unique, pdf_mode, estimate=False):
 
         compiled.append([proj, "", domain, sw_names, n["PART"], n["ASSEMBLY"], n["DRAWING"], pdf_drawings,
                          n["NEUTRAL3D"], t2d, t3d])
-        stats.append([proj, len(rows), len({r["sha"] for r in rows}), sum(r["dup"] for r in rows), n["PART"],
+        stats.append([proj, len(rows), len({r["sha"] for r in rows if r["sha"]}) + sum(1 for r in rows if not r["sha"]), sum(r["dup"] for r in rows), n["PART"],
                       n["ASSEMBLY"], n["DRAWING"], n["NEUTRAL3D"], n["PDF"], n["SIM"], n["DOC"], n["DATA"],
                       n["IMG"], n["ARCHIVE"] + n["OTHER"], n["UNMAPPED"], sum(r["size"] for r in rows),
-                      "unique hashes" if unique else "all files"])
+                      ("unique hashes (whole profile)" if unique_scope == "all" else "unique hashes (per project)") if unique else "all files",
+                      sum(1 for r in rows if r["archive"]), sum(1 for r in rows if r["adup"]),
+                      copy_of[proj][0] if proj in copy_of else "", f"{copy_of[proj][1]:.0%}" if proj in copy_of else ""])
+        n_arch = sum(1 for r in rows if r["archive"])
+        if n_arch:
+            review.append([proj, "archives", f"{n_arch} files found inside archives ({sum(1 for r in rows if r['adup'])} identical to files "
+                           "already present in this project, so not counted again; 7z/rar are listed only and have no fingerprint)"])
+        if proj in copy_of and copies == "flag":
+            orig, share, nfiles = copy_of[proj]
+            review.append([proj, "possible copy", f"{share:.0%} of its {nfiles} fingerprinted files are identical to files in '{orig}' - likely a "
+                           "backup or copy; counts include it (use --copies exclude to drop it, --unique --unique-scope all to count each content once)"])
 
         if domain == "Unclassified":
             review.append([proj, "domain", "No native or neutral model maps to a domain - set it by hand"])
@@ -181,17 +269,20 @@ def compile_runs(runs, ext_map, soft, unique, pdf_mode, estimate=False):
             review.append([proj, "other tools seen", "Named in STEP/IGES/IFC/simulation headers (not counted as native CAD "
                            "software): " + ", ".join(f"{t} ({k})" for t, k in tools.most_common())])
         if n["PDF"] and pdf_mode == "none":
-            review.append([proj, "PDF drawings", f"{n['PDF']} PDF file(s) NOT counted as drawings (PDF Drawings = 0). "
-                           "The profile cannot tell drawings from reports; re-run with --pdf-drawings all to count them"])
+            review.append([proj, "PDF drawings", f"{n['PDF']} PDF file(s) NOT counted as drawings (PDF Drawings = 0; --pdf-drawings none)"])
+        elif n["PDF"] and pdf_mode == "auto" and not any(r["name"] for r in counted if r["cls"] == "PDF"):
+            review.append([proj, "PDF drawings", f"{n['PDF']} PDF file(s) NOT counted: the profile has no file names (detail level 0), so "
+                           "drawings cannot be told from reports. Re-profile at level 1+, or use --pdf-drawings all"])
+        elif n["PDF"] and pdf_mode == "auto":
+            review.append([proj, "PDF drawings", f"{pdf_drawings} of {n['PDF']} PDFs counted as drawings by name (same name as a model or "
+                           "drawing, or drawing-like wording without report-like wording); the rest treated as documents"])
         if n["ASSEMBLY"] and estimate:
-            exts = [e for e, k in collections.Counter(r["ext"] for r in counted if r["cls"] == "ASSEMBLY").most_common()
-                    for _ in range(k)]
-            cols = [split_evenly(v, n["ASSEMBLY"]) for v in (n["PART"], n["DRAWING"], pdf_drawings, n["NEUTRAL3D"])]
-            for i, e in enumerate(exts):
-                assemblies.append([proj, f"EST_{i + 1:03d}.{e.upper()}", cols[0][i], cols[1][i], cols[2][i], cols[3][i]])
-            review.append([proj, "assembly breakdown", f"ESTIMATE: {n['PART']} parts, {n['DRAWING']} drawings, {pdf_drawings} PDFs and "
-                           f"{n['NEUTRAL3D']} neutral files split evenly across {n['ASSEMBLY']} assemblies; names are placeholders "
-                           "(EST_nnn), not real assembly names"])
+            rows_a, note, ev = assign_assemblies(proj, counted, per_project[proj]["parents"], universe)
+            assemblies += rows_a
+            review.append([proj, "assembly breakdown", f"ESTIMATE - {note}"])
+            if ev:
+                evidence_rows += ev["rows"]
+                confidence_rows.append(ev["project"])
         elif n["ASSEMBLY"]:
             review.append([proj, "assembly breakdown", f"{n['ASSEMBLY']} assembly file(s): Assembly Breakdown tab left empty "
                            "(needs assembly file names and which parts belong to each; --estimate-assemblies gives an even-split estimate)"])
@@ -200,20 +291,34 @@ def compile_runs(runs, ext_map, soft, unique, pdf_mode, estimate=False):
                            "(Assembly Breakdown rows will not sum to this project's totals)"])
     for (proj, ext), k in sorted(unmapped.items()):
         review.append([proj, "unmapped extension", f".{ext} x{k} - add it to extensions.csv"])
-    return compiled, file_rows, stats, review, assemblies
+    return compiled, file_rows, stats, review, assemblies, {"rows": evidence_rows, "projects": confidence_rows}
 
 
-def write_csvs(out, compiled, file_rows, stats, review, assemblies=()):
+EVIDENCE_HEADER = ["project", "assembly", "refs_total", "refs_resolved", "refs_external", "refs_ambiguous", "refs_unresolved", "parts_link", "parts_folder",
+                   "parts_spread", "parts_even", "other_by_link", "other_by_name", "other_by_folder"]
+CONFIDENCE_HEADER = ["project", "confidence", "why", "assemblies", "parts", "parts_link", "parts_folder", "parts_spread", "parts_even",
+                     "refs_total", "refs_resolved", "refs_external", "refs_ambiguous", "refs_unresolved", "shared_parts", "assemblies_without_refs",
+                     "others_link", "others_name", "others_folder_or_even", "unresolved_examples"]
+
+
+def file_row(r):
+    return [r["project"], r["ext"], r["cls"], r["sw"], r["domain"], r["size"], r["modified"], r["sha"], r["sig"],
+            "yes" if r["dup"] else "", r["archive"], "yes" if r["adup"] else ""]
+
+
+def write_csvs(out, compiled, file_rows, stats, review, assemblies=(), evidence=None):
     def dump(name, header, rows):
         with open(out / name, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.writer(f); w.writerow(header); w.writerows(rows)
     dump("Project_Compiled.csv", HEADINGS, compiled)
-    dump("File_Level.csv", FILE_HEADER, [[r["project"], r["ext"], r["cls"], r["sw"], r["domain"], r["size"],
-                                          r["modified"], r["sha"], r["sig"], "yes" if r["dup"] else ""] for r in file_rows])
+    dump("File_Level.csv", FILE_HEADER, [file_row(r) for r in file_rows])
     dump("Project_Stats.csv", STATS_HEADER, stats)
     dump("Review.csv", ["project", "topic", "detail"], review)
     if assemblies:
         dump("Assembly_Breakdown_ESTIMATE.csv", ASSEMBLY_HEADINGS, assemblies)
+    if evidence and evidence["projects"]:
+        dump("Assembly_Evidence.csv", EVIDENCE_HEADER, [[r[h] for h in EVIDENCE_HEADER] for r in evidence["rows"]])
+        dump("Assembly_Confidence.csv", CONFIDENCE_HEADER, [[r[h] for h in CONFIDENCE_HEADER] for r in evidence["projects"]])
 
 
 def style(ws, color="FF181F34"):
@@ -224,17 +329,21 @@ def style(ws, color="FF181F34"):
         ws.column_dimensions[get_column_letter(j)].width = min(max(w + 2, 12), 60)
 
 
-def write_workbook(path, compiled, file_rows, stats, review, assemblies=()):
+def write_workbook(path, compiled, file_rows, stats, review, assemblies=(), evidence=None):
     wb = Workbook()
     ws = wb.active; ws.title = "Project Compiled"
     ws.append(HEADINGS); [ws.append(r) for r in compiled]; style(ws)
     wa = wb.create_sheet("Assembly Breakdown"); wa.append(ASSEMBLY_HEADINGS); [wa.append(r) for r in assemblies]; style(wa)
     wf = wb.create_sheet("File Level"); wf.append(FILE_HEADER)
     for r in file_rows:
-        wf.append([r["project"], r["ext"], r["cls"], r["sw"], r["domain"], r["size"], r["modified"], r["sha"],
-                   r["sig"], "yes" if r["dup"] else ""])
+        wf.append(file_row(r))
     style(wf)
     wst = wb.create_sheet("Project Stats"); wst.append(STATS_HEADER); [wst.append(r) for r in stats]; style(wst)
+    if evidence and evidence["projects"]:
+        wc = wb.create_sheet("Assembly Confidence"); wc.append(CONFIDENCE_HEADER)
+        [wc.append([r[h] for h in CONFIDENCE_HEADER]) for r in evidence["projects"]]; style(wc)
+        we = wb.create_sheet("Assembly Evidence"); we.append(EVIDENCE_HEADER)
+        [we.append([r[h] for h in EVIDENCE_HEADER]) for r in evidence["rows"]]; style(we)
     wr = wb.create_sheet("Review"); wr.append(["project", "topic", "detail"]); [wr.append(r) for r in review]; style(wr)
     wb.save(path)
 
@@ -242,30 +351,43 @@ def write_workbook(path, compiled, file_rows, stats, review, assemblies=()):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("inputs", nargs="+")
-    ap.add_argument("--unique", action="store_true", help="count each content hash once per project")
-    ap.add_argument("--pdf-drawings", choices=["none", "all"], default="none")
-    ap.add_argument("--estimate-assemblies", action="store_true",
-                    help="fill Assembly Breakdown with an even-split ESTIMATE (placeholder names)")
+    ap.add_argument("--unique", action="store_true", help="count each content hash once (per project, or see --unique-scope)")
+    ap.add_argument("--unique-scope", choices=["project", "all"], default="project",
+                    help="with --unique: 'project' (default) or 'all' = once in the whole profile (copies of a project elsewhere vanish)")
+    ap.add_argument("--copies", choices=["flag", "exclude", "keep"], default="flag",
+                    help="projects that are mostly (>= 80%%) identical to a bigger project: flag them in Review (default), exclude them "
+                         "from Project Compiled, or keep = do not look")
+    ap.add_argument("--pdf-drawings", choices=["auto", "none", "all"], default="auto",
+                    help="auto (default): by file name when the profile has names (level >= 1), else none; none; all")
+    ap.add_argument("--estimate-assemblies", action="store_true", help=argparse.SUPPRESS)     # kept for old command lines: now the default
+    ap.add_argument("--no-assembly-breakdown", action="store_true",
+                    help="leave the Assembly Breakdown tab empty (default: fill it, with method and confidence reported)")
+    ap.add_argument("--project-by", choices=["auto", "structure", "folder"], default="auto",
+                    help="auto (default): split each folder into sub-projects by root assembly when the profile has references "
+                         "(level 2) and enough of them resolve, otherwise keep the folder; structure: same but always tries; "
+                         "folder: never split")
+    ap.add_argument("--min-project-files", type=int, default=25,
+                    help="with --project-by structure: sub-projects smaller than this are merged into '<project> / (other)'")
     ap.add_argument("--map-dir", default=str(HERE / "mapping"))
     ap.add_argument("--out", help="output dir (default: ./compile-profiles/<timestamp> under the current folder)")
     a = ap.parse_args()
 
     ext_map, soft = load_mapping(a.map_dir)
     runs = load_profiles(a.inputs)
-    compiled, file_rows, stats, review, assemblies = compile_runs(runs, ext_map, soft, a.unique, a.pdf_drawings,
-                                                                  a.estimate_assemblies)
+    compiled, file_rows, stats, review, assemblies, evidence = compile_runs(
+        runs, ext_map, soft, a.unique, a.pdf_drawings, not a.no_assembly_breakdown, a.project_by, a.min_project_files, a.unique_scope, a.copies)
 
     out = Path(a.out) if a.out else Path.cwd() / "compile-profiles" / datetime.now().strftime("%Y%m%d-%H%M%S")
     out.mkdir(parents=True, exist_ok=True)
-    write_csvs(out, compiled, file_rows, stats, review, assemblies)
+    write_csvs(out, compiled, file_rows, stats, review, assemblies, evidence)
     if Workbook:
-        write_workbook(out / "compiled.xlsx", compiled, file_rows, stats, review, assemblies)
+        write_workbook(out / "compiled.xlsx", compiled, file_rows, stats, review, assemblies, evidence)
     else:
         print("(openpyxl not installed - wrote CSVs only)")
 
     print(f"{len(runs)} profile zip(s) -> {len(compiled)} project(s), {len(file_rows)} files "
           f"({'unique hashes' if a.unique else 'all files'} counted; PDF drawings: {a.pdf_drawings}; "
-          f"assembly rows: {'ESTIMATED, ' + str(len(assemblies)) if a.estimate_assemblies else 'not produced'})")
+          f"assembly rows: {'ESTIMATED, ' + str(len(assemblies)) if not a.no_assembly_breakdown else 'not produced'})")
     for r in compiled:
         print("  ", r)
     print(f"Review items: {len(review)}  (see Review)\nWrote files in {out}")

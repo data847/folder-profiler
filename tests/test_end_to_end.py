@@ -4,7 +4,11 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "claude-skill", "profile-compile", "scripts"))
 import file_profiler as fp
-import compile_profiles as cp
+try:
+    import compile_profiles as cp
+except ImportError:  # the compiler skill lives in the folder-profiler repo / skill zip, not in the client package
+    print("SKIP - compile_profiles not found next to this package (end-to-end test needs the skill)")
+    sys.exit(0)
 
 def put(base, rel, body=b"x"):
     path = os.path.join(base, rel); os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -25,7 +29,7 @@ with tempfile.TemporaryDirectory() as t:
     runs = cp.load_profiles([zip_path]); ext_map, soft = cp.load_mapping(os.path.join(ROOT, "claude-skill", "profile-compile", "scripts", "mapping"))
 
     def rows(**kw):
-        c, _files, _stats, review, asm = cp.compile_runs(runs, ext_map, soft, kw.get("unique", False), kw.get("pdf", "none"),
+        c, _files, _stats, review, asm, _ev = cp.compile_runs(runs, ext_map, soft, kw.get("unique", False), kw.get("pdf", "none"),
                                                          kw.get("estimate", False))
         rows.asm = asm
         return {r[0]: r for r in c}, review
@@ -54,7 +58,7 @@ with tempfile.TemporaryDirectory() as t:
     r, review = rows(estimate=True)
     mech = [a for a in rows.asm if a[0] == "Mech"]
     check("Mech estimate rows sum to project totals (parts, 2D, PDF, neutral)", tuple(sum(a[i] for a in mech) for i in (2, 3, 4, 5)), (3, 2, 0, 2))
-    check("Mech placeholder name", mech[0][1], "EST_001.SLDASM")
+    check("Mech row carries the real assembly name recorded by profiler 1.2", mech[0][1], "top.sldasm")
     check("projects without assemblies get no rows", {a[0] for a in rows.asm}, {"Mech"})
     check("review says ESTIMATE", any("ESTIMATE" in x[2] for x in review), True)
     # uneven split: 7 parts over 3 assemblies -> 3,2,2 summing to 7
