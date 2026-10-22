@@ -42,7 +42,7 @@ with tempfile.TemporaryDirectory() as t:
           tuple(sum(r[i] for r in rows.values()) for i in (2, 3, 4, 5)), (10, 1, 0, 1))
     m = next(c for c in compiled if c[0] == "M")
     check("... which equal Project Compiled's totals", (m[4], m[6], m[7], m[8]), (10, 1, 0, 1))
-    check("project without assemblies gets no rows", [r for r in asm if r[0] == "N"], [])
+    check("project without assemblies gets ONE clearly named summary row (the tab is never empty)", [r for r in asm if r[0] == "N"], [["N", "(no assembly file in this project)", 1, 0, 0, 0]])
     check("note says folder-based", any("confidence Low" in x[2] and "% by folder" in x[2] and x[0] == "M" for x in review), True)
     # backwards compatibility: an older profile (no dir ids / names) falls back to the even split
     old = [dict(r, parents={}) for r in runs]

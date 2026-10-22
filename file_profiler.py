@@ -1,24 +1,32 @@
-"""Folder Profiler — collects file METRICS only. It never copies, uploads or stores file contents.
+"""Folder Profiler — collects file METRICS only. It never copies, uploads or stores file contents, and (since 1.6) it never
+hashes a file: nothing is read in full except, at detail level 2, the assembly / drawing / STEP files whose references are listed.
 
 What it writes (one zip of CSVs, nothing else):
-  Files.csv       one row per file: project, file_no, ext, size_bytes, modified, depth, sha256, header_signature
+  Files.csv       one row per file: project, file_no, ext, size_bytes, modified, depth, header_signature, dir_id, asm_name,
+                  (rel_path at level >= 1), archive
   Projects.csv    one row per project folder: counts, bytes, date range
   Extensions.csv  one row per project + extension: counts, bytes
-  Run_info.csv    tool version, date, OS, folder name, totals, read errors
+  Dirs.csv        the folder tree (anonymous ids; names at level >= 1)
+  Links.csv       (level 2) names of files referenced inside assemblies, drawings and STEP files
+  Run_info.csv    tool version, date, OS, folder name, totals, read errors, time per step
+  Run_log.csv, Run_phases.csv, Run_metrics.csv, System_info.csv   how the run went and what machine it ran on (also written
+                  separately as run_stats_*.zip, safe to share: no file or folder names)
 
-What it does NOT write: folder names or paths below the project name, file names (except ASSEMBLY files, see
-below), or any file text.
+What it does NOT write: folder names or paths below the project name (levels 0), file names (except ASSEMBLY files at level 0),
+or any file text.
 
-Assembly Breakdown support (1.2): each file carries `dir_id`, an anonymous folder identifier (salted hash, the salt
-is thrown away, so folder names cannot be recovered from it) and Dirs.csv holds the folder tree as ids only. Files
-whose extension is an assembly format (sldasm asm iam catproduct) also carry `asm_name` - the real file name, or an
-anonymous code such as ASM-3F9A1C2B.SLDASM with --anonymize-assembly-names. No other file name is ever written.
+Assembly Breakdown support: each file carries `dir_id`, an anonymous folder identifier (salted hash of the folder name; the salt is
+thrown away, so folder names cannot be recovered) and Dirs.csv holds the folder tree as ids only. Files whose extension is an
+assembly format (sldasm asm iam catproduct) also carry `asm_name` - the real file name, or an anonymous code such as
+ASM-3F9A1C2B.SLDASM with --anonymize-assembly-names. No other file name is written at level 0.
 
 How the file contents are touched (and nothing else):
-  * sha256   - one-way fingerprint of the whole file (cannot be turned back into the file)
-  * header_signature - computed from the first few KB of certain file types and reduced to a tag
-    from the fixed lists in this file (e.g. "STEP:AP214:SolidWorks", "DXF:AC1027:3D", "PDF").
-    The raw header text is never kept.
+  * header_signature - computed from the first few KB of certain file types and reduced to a tag from the fixed lists in this
+    file (e.g. "STEP:AP214:SolidWorks", "DXF:AC1027:3D", "PDF"). The raw header text is never kept.
+  * level 2 only: assembly / drawing / STEP files are read to list the FILE NAMES they reference.
+
+Resumable: progress is saved in <out>/.resume/ after every chunk of files; if the run stops for any reason, start it again with the
+same settings and it continues from the last saved chunk (--fresh ignores saved progress). No depth limit on folders.
 
 Standard library only. No network code. Files are opened read-only.
 
@@ -27,21 +35,24 @@ Usage:  python file_profiler.py [folder] [--out DIR] [--name LABEL]
 Detail levels: 0 = metrics only (default) | 1 = + file/folder names and paths (rel_path) | 2 = + Links.csv, the NAMES of
 files that assemblies/drawings/STEP files reference (read with cad_links.py; nothing else is taken from inside files).
 --archives off|list|full looks inside .zip / .tar(.gz) archives (7z/rar listed only): their CAD files become normal rows.
---project-depth N makes the folders N levels down the projects. Smart hashing skips full reads where a hash cannot matter.
+--project-depth N makes the folders N levels down the projects (any N).
 Docker: see Dockerfile / run-docker.* - read-only input mount, no network, non-root user.
 """
 import collections
 import csv
 import hashlib
 import io
+import json
 import os
 import platform
 import re
+import shutil
 import sys
 import threading
 import time
 import traceback
 import zipfile
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
@@ -54,13 +65,12 @@ try:
     import archives
 except ImportError:
     archives = None
+import sysmetrics
+from sysmetrics import now_utc
 
-VERSION = "1.5"
+VERSION = "1.6"
 HEAD_BYTES = 4096            # header peek for every file
 DXF_SCAN_BYTES = 1_048_576   # DXF only: scan up to 1 MB for 3D entity names (flag only, text discarded)
-HASH_CHUNK = 1024 * 1024
-PARALLEL_MIN_AVG_BYTES = 256 * 1024   # below this average file size a batch is hashed serially
-BATCH = 2000                 # files hashed per parallel batch (bounds memory on huge trees)
 
 # ---- closed vocabularies: every header tag is built from these, never from file text ----
 CAD_SYSTEMS = [  # (substring in STEP header, lowercase) -> tag
@@ -88,13 +98,6 @@ TEXT_FORMATS = [  # (lowercase pattern in first 4 KB, tag) - first match wins; t
     (b"<vtkfile", "VTK:XML"),
 ]
 LINK_READ_EXTS = {"sldasm", "asm", "iam", "slddrw", "dft", "idw", "step", "stp"}   # level 2: assemblies, drawings, STEP
-NO_HASH_EXTS = {"zip", "rar", "7z", "gz", "tgz", "tar", "iso", "mp4", "mov", "avi", "mkv", "png", "jpg", "jpeg", "gif",
-                "bmp", "tif", "tiff", "dll", "exe", "bak", "old", "tmp"}   # never CAD: not worth reading in full just to hash
-CAD_HASH_EXTS = {"sldprt", "sldasm", "slddrw", "par", "psm", "asm", "pwd", "dft", "iam", "ipt", "ipn", "idw", "prt", "catpart",
-                 "catproduct", "catdrawing", "x_t", "x_b", "step", "stp", "igs", "iges", "stl", "obj", "3mf", "ifc", "3dm", "f3d",
-                 "fcstd", "skp", "rvt", "rfa", "dwg", "dxf", "dwf", "pdf"}   # archive entries of these types are read and fingerprinted
-ENTRY_HASH_MAX = 2 * 1024 ** 3          # an archive entry larger than this is listed, never decompressed
-ENTRY_MEMORY_MAX = 64 * 1024 * 1024     # entries up to this size are read into memory once (hash + format tag + references together)
 ENTRY_LINK_MAX = 128 * 1024 * 1024      # level 2: archived assemblies/drawings/STEP up to this size are searched for references
 ASSEMBLY_EXTS = {"sldasm", "asm", "iam", "catproduct"}   # the only files whose NAME is recorded (Assembly Breakdown tab)
 SYSTEM_JUNK = {".ds_store", "thumbs.db", "desktop.ini", "ehthumbs.db"}  # OS clutter, not project files
@@ -179,31 +182,16 @@ def _signature_file(f, ext):
         return "BINARY"
 
 
-def sha256_of(path):
-    h = hashlib.sha256()
-    try:
-        with open(path, "rb") as f:
-            for chunk in iter(lambda: f.read(HASH_CHUNK), b""):
-                h.update(chunk)
-    except OSError:
-        return "UNREADABLE"
-    return h.hexdigest()
-
-
 def default_workers():
     env = os.environ.get("PROFILER_WORKERS", "")
     if env.isdigit() and int(env) > 0:
         return int(env)
-    return min(16, (os.cpu_count() or 4) * 2)   # hashing is I/O + hashlib (releases the GIL), so threads scale
-
-
-def fingerprint(path, ext, size, do_hash=True):
-    return (sha256_of(path) if do_hash else ""), signature(path, ext, size)
+    return min(16, (os.cpu_count() or 4) * 2)   # file reads release the GIL, so threads scale
 
 
 def build_units(root, depth):
-    """Projects are the folders `depth` levels below root (1 = folders directly inside it). Files sitting in the
-    folders above that level become small non-recursive units named "(root)" / "<folder>/(files)"."""
+    """Projects are the folders `depth` levels below root (1 = folders directly inside it; any depth is allowed). Files sitting in
+    the folders above that level become small non-recursive units named "(root)" / "<folder>/(files)"."""
     projects, loose, level = [], [], [("", root)]
     for _ in range(depth):
         nxt = []
@@ -216,6 +204,8 @@ def build_units(root, depth):
                 loose.append(("(root)" if not rel else f"{rel}/(files)", ab, False))
             nxt += [(f"{rel}/{d}" if rel else d, os.path.join(ab, d)) for d in items if os.path.isdir(os.path.join(ab, d))]
         level = nxt
+        if not level:
+            break
     projects = [(rel, ab, True) for rel, ab in level]
     return projects + loose
 
@@ -228,54 +218,109 @@ def lp(path):
     return "\\\\?\\UNC\\" + path[2:] if path.startswith("\\\\") else "\\\\?\\" + path
 
 
+VERSIONED_EXTS = {"prt", "asm", "drw", "frm", "lay", "mfg", "sec", "dgm"}       # Creo / Pro-E keep versions as part.prt.7
+
+
 def ext_of(name):
     if name.startswith(".") and name.count(".") == 1:
         return "(none)"
-    return os.path.splitext(name)[1].lstrip(".").lower() or "(none)"
+    base, ext = os.path.splitext(name)
+    ext = ext.lstrip(".").lower()
+    if ext.isdigit():                                    # "bracket.prt.12" is a Creo part, not a ".12" file
+        inner = os.path.splitext(base)[1].lstrip(".").lower()
+        if inner in VERSIONED_EXTS:
+            return inner
+    return ext or "(none)"
 
 
 def iso(ts):
     return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def walk_dirs(base, recurse, on_error, counts):
+    """Depth-first, deterministic (sorted) walk with NO depth limit. Yields (dirpath, rel, depth, [file DirEntry]).
+    Directory links / junctions are not followed (loops, double counting) and are counted in counts['links_skipped']."""
+    stack = [(base, ".", 0)]
+    while stack:
+        dirpath, rel, depth = stack.pop()
+        try:
+            with os.scandir(dirpath) as it:
+                entries = sorted(it, key=lambda e: e.name)
+        except OSError as e:
+            on_error(e)
+            continue
+        files, subdirs = [], []
+        for e in entries:
+            try:
+                if e.is_symlink() or (hasattr(e, "is_junction") and e.is_junction()):
+                    if e.is_dir():
+                        counts["links_skipped"] += 1
+                        continue
+                    files.append(e)
+                elif e.is_dir(follow_symlinks=False):
+                    subdirs.append(e)
+                elif e.is_file(follow_symlinks=False):
+                    files.append(e)
+            except OSError as err:
+                on_error(err)
+        yield dirpath, rel, depth, files
+        if recurse:
+            for e in reversed(subdirs):
+                stack.append((e.path, e.name if rel == "." else rel + os.sep + e.name, depth + 1))
+
+
+CHUNK_FILES = 5000           # files per checkpoint: after a crash at most this many files of one project are redone
+_TEST_HOOK = None            # tests set this to a callable(unit_index, chunk_index) to simulate a crash after a chunk is saved
+
+
+def _save_json(path, obj):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f)
+    os.replace(tmp, path)
+
+
+def _write_csv_atomic(path, rows):
+    tmp = path + ".tmp"
+    with open(tmp, "w", newline="", encoding="utf-8") as f:
+        csv.writer(f, lineterminator="\r\n").writerows(rows)
+    os.replace(tmp, path)
+
+
 def profile(root, out_dir, log=print, label=None, folders=None, workers=None, progress=None,
-            anonymize_assembly_names=None, tier=None, project_depth=None, hash_mode=None, archive_mode=None,
-            archive_budget_gb=None):
-    """root: parent folder (each sub-folder = one project). folders: instead, an explicit list of
-    project folders (each one = one project; root is ignored).
-    progress(phase, files_done, files_total, bytes_done, bytes_total): phase "scan" (totals still growing)
-    then "hash"."""
+            anonymize_assembly_names=None, tier=None, project_depth=None, archive_mode=None,
+            archive_budget_gb=None, resume=True, metrics_interval=None, system_info=True, chunk_files=None):
+    """Profile a folder tree. Streaming and resumable: every project is processed in chunks that are saved to
+    <out_dir>/.resume/<run id>/ as they finish; a run that stops (crash, power cut, Ctrl+C) continues from the last saved chunk when
+    started again with the same settings. The state is deleted when the run completes. Nothing is ever hashed except folder
+    NAMES (salted, to make anonymous folder ids); file contents are never hashed.
+    progress(phase, files_done, files_total, bytes_done, bytes_total): phase "scan" (counting), "process" or "links"."""
     progress = progress or (lambda *a: None)
+    t_run0 = time.time()
+    workers = max(1, workers or default_workers())
+    chunk_files = int(chunk_files or CHUNK_FILES)
     env_int = lambda k, d: int(os.environ[k]) if os.environ.get(k, "").isdigit() else d
     tier = env_int("PROFILER_TIER", 0) if tier is None else int(tier)
     if tier not in (0, 1, 2):
         raise SystemExit("detail level must be 0, 1 or 2")
     if tier == 2 and cad_links is None:
         raise SystemExit("detail level 2 needs cad_links.py next to file_profiler.py")
-    project_depth = max(1, min(6, env_int("PROFILER_PROJECT_DEPTH", 1) if project_depth is None else int(project_depth)))
-    hash_mode = hash_mode or os.environ.get("PROFILER_HASH", "smart")
-    if hash_mode not in ("smart", "all"):
-        raise SystemExit("hash mode must be 'smart' or 'all'")
+    project_depth = max(1, env_int("PROFILER_PROJECT_DEPTH", 1) if project_depth is None else int(project_depth))
     archive_mode = archive_mode or os.environ.get("PROFILER_ARCHIVES", "full")
     if archive_mode not in ("off", "list", "full"):
         raise SystemExit("archives must be 'off', 'list' or 'full'")
     if archives is None:
         archive_mode = "off"
     try:
-        budget_left = int(float(archive_budget_gb if archive_budget_gb is not None else os.environ.get("PROFILER_ARCHIVE_GB", 20)) * 1024 ** 3)
+        budget_gb = float(archive_budget_gb if archive_budget_gb is not None else os.environ.get("PROFILER_ARCHIVE_GB", 20))
     except ValueError:
         raise SystemExit("archive budget must be a number of GB")
     if tier >= 1:
-        anonymize_assembly_names = False          # names are recorded for every file at level >= 1
+        anonymize_assembly_names = False
     if anonymize_assembly_names is None:
         anonymize_assembly_names = os.environ.get("PROFILER_ANON_ASM", "").lower() in ("1", "true", "yes")
-    salt = os.urandom(8).hex()                      # per run, never stored: folder ids cannot be reversed or linked across runs
 
-    def ident(*parts, n=10):
-        return hashlib.sha256((salt + "\0" + "\0".join(parts)).encode("utf-8", "surrogatepass")).hexdigest()[:n]
-    dirs = {}                                       # dir_id -> (project, parent_dir_id, depth)
-    t0 = time.time()
-    workers = max(1, workers or default_workers())
+    # ---- what to profile
     if folders:
         units, used = [], set()
         for f in folders:
@@ -287,318 +332,487 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
             used.add(name.lower())
             units.append((name, f, True))
         label = label or "selected-folders"
+        data_paths = [u[1] for u in units]
     else:
         root = os.path.abspath(root)
         label = label or os.path.basename(root) or "folder"
         units = build_units(root, project_depth)
+        data_paths = [root]
     if not units:
         raise SystemExit("That folder is empty - nothing to profile.")
 
-    files_rows, errors, seen, junk, link_jobs = [], 0, 0, 0, []
-    hashed_n = skipped_n = dir_errors = 0
-    done_bytes = 0
-    last_print = last_log = 0.0
+    # ---- run identity, checkpoint state
+    cfg = json.dumps({"v": VERSION, "units": [[u[0], u[1], u[2]] for u in units], "tier": tier, "depth": project_depth,
+                      "archives": archive_mode, "anon": bool(anonymize_assembly_names), "budget": budget_gb,
+                      "chunk": chunk_files}, sort_keys=True)
+    run_id = f"{zlib.crc32(cfg.encode()):08x}{zlib.adler32(cfg.encode()):08x}"
+    state_dir = os.path.join(out_dir, ".resume", run_id)
+    if not resume:
+        shutil.rmtree(state_dir, ignore_errors=True)
+    for sub in ("rows", "links", "dirs"):
+        os.makedirs(os.path.join(state_dir, sub), exist_ok=True)
+    mpath = os.path.join(state_dir, "manifest.json")
+    man = None
+    if os.path.exists(mpath):
+        try:
+            man = json.load(open(mpath, encoding="utf-8"))
+            if man.get("cfg") != cfg:
+                man = None
+        except Exception:
+            man = None
+    resumed = man is not None
+    if man is None:
+        man = {"cfg": cfg, "salt": os.urandom(8).hex(), "created": now_utc(), "restarts": 0, "elapsed": 0.0, "units": {},
+               "prescan_s": 0.0, "process_s": 0.0, "c": collections.Counter()}
+    else:
+        man["restarts"] += 1
+        man["c"] = collections.Counter(man["c"])
+    C = man["c"]
+    elapsed_before = man["elapsed"]
+    salt = man["salt"]
 
-    # Phase 1: list every file (cheap, metadata only) so the second phase knows the real totals.
-    #   entry layout: 0 path, 1 file_no, 2 depth, 3 ext, 4 size, 5 mtime, 6 dir_id, 7 asm_name, 8 rel_path, 9 do_hash, 10 archive info|None
-    scanned, total_files, total_bytes = [], 0, 0
-    counters, gsizes, arch_jobs = {}, collections.Counter(), []
+    def ident(*parts, n=10):
+        return hashlib.sha256((salt + "\0" + "\0".join(parts)).encode("utf-8", "surrogatepass")).hexdigest()[:n]
+    dirs = {}                                           # dir_id -> (project, parent_dir_id, depth, name)
+
+    def reg(proj, rel, depth, name, parent=None):
+        i = ident(proj, rel)
+        if i not in dirs:
+            if parent is None:
+                parent = "" if rel == "." else ident(proj, os.path.dirname(rel) or ".")
+            dirs[i] = (proj, parent, depth, name)
+        return i
+
+    # ---- logs, metrics, system info (Run_log.csv / Run_metrics.csv live in the state dir so they survive a restart)
+    t0 = time.time()
+    rlog = sysmetrics.RunLog(os.path.join(state_dir, "Run_log.csv"), t0=t0, echo=log)
+    act = sysmetrics.Activity()
+    state = {"phase": "start", "files": 0, "bytes": 0}
+    mon = sysmetrics.Monitor(os.path.join(state_dir, "Run_metrics.csv"), state,
+                             interval=metrics_interval or env_int("PROFILER_METRICS_INTERVAL", 5), t0=t0)
+    mon.start()
+    rlog.event("start", ("RESUMED run (restart #%d) " % man["restarts"] if resumed else "started ") +
+               f"v{VERSION}: level {tier}, project depth {project_depth}, archives {archive_mode}, {workers} workers, "
+               f"{len(units)} projects, hashing: none")
+
+    def save_manifest():
+        man["elapsed"] = elapsed_before + (time.time() - t_run0)
+        _save_json(mpath, man)
+
+    def on_walk_error(e):
+        C["dir_errors"] += 1
+        C["errors"] += 1
+        rlog.event(state["phase"], f"unreadable folder skipped ({type(e).__name__})", "WARN")
+
+    walk_counts = collections.Counter()
     pool = ThreadPoolExecutor(max_workers=workers)
-    for proj, base, recurse in units:
-        n, entries = 0, []
-        wbase = lp(base)
-        def walk_error(e):                                  # an unreadable folder must be reported, not silently skipped
-            nonlocal errors, dir_errors
-            errors += 1; dir_errors += 1
-        for dirpath, _dirs, names in os.walk(wbase, onerror=walk_error):
-            rel = "." if dirpath == wbase else os.path.relpath(dirpath, wbase)
-            depth = 0 if rel == "." else rel.count(os.sep) + 1
-            dir_id = ident(proj, rel)
-            parent_id = "" if rel == "." else ident(proj, os.path.dirname(rel) or ".")
-            dirs[dir_id] = (proj, parent_id, depth, proj if rel == "." else os.path.basename(rel))
-            for name in sorted(names):
-                if name.lower() in SYSTEM_JUNK or name.startswith("._"):
-                    junk += 1
-                    continue
-                path = os.path.join(dirpath, name)
-                try:
-                    st = os.stat(path)
-                except OSError:
-                    errors += 1
-                    continue
-                n += 1
-                ext = ext_of(name)
-                asm = ""
-                if ext in ASSEMBLY_EXTS:
-                    asm = f"ASM-{ident(proj, rel, name, n=8).upper()}.{ext.upper()}" if anonymize_assembly_names else name
-                relpath = name if rel == "." else (rel + os.sep + name).replace(os.sep, "/")
-                gsizes[st.st_size] += 1
-                entries.append([path, n, depth, ext, st.st_size, iso(st.st_mtime), dir_id, asm, relpath, None, None])
-                if archive_mode != "off" and archives.kind_of(name):
-                    arch_jobs.append((proj, path, relpath, dir_id, depth))
-                total_files += 1
-                total_bytes += st.st_size
-                if time.time() - last_print > 0.3:
-                    progress("scan", total_files, total_files, 0, total_bytes)
-                    last_print = time.time()
-            if not recurse:
-                break
-        counters[proj] = n
-        scanned.append((proj, entries))
-
-    # Phase 1b: look inside archives (listing only - cheap for zip, a full decompression pass for .tar.gz) ...
-    arch_entries = {}                                       # project -> archive entries (same layout as above)
-    arch_opened = arch_unreadable = arch_listed = 0
-    if arch_jobs:
-        log(f"  looking inside {len(arch_jobs):,} archive(s) ...")
-        for job, ents in zip(arch_jobs, pool.map(lambda j: archives.list_archive(j[1]), arch_jobs)):
-            proj, apath, arel, adir, adepth = job
-            if ents is None:
-                arch_unreadable += 1
-                continue
-            arch_opened += 1
-
-            def reg(rel, parent, depth, name, proj=proj):
-                i = ident(proj, rel)
-                dirs.setdefault(i, (proj, parent, depth, name))
-                return i
-            kind = archives.kind_of(apath)
-            for e in ents:
-                inner = e["inner"]
-                base_name = inner.rsplit("/", 1)[-1]
-                if base_name.lower() in SYSTEM_JUNK or base_name.startswith("._"):
-                    junk += 1
-                    continue
-                counters[proj] += 1
-                n = counters[proj]
-                rel_base, d = arel + "!", adepth + 1
-                cur = reg(rel_base, adir, d, os.path.basename(apath))
-                for c in e["chain"]:
-                    rel_base += "/" + c + "!"; d += 1
-                    cur = reg(rel_base, cur, d, c)
-                for part in inner.split("/")[:-1]:
-                    rel_base += "/" + part; d += 1
-                    cur = reg(rel_base, cur, d, part)
-                ext = ext_of(base_name)
-                asm = ""
-                if ext in ASSEMBLY_EXTS:
-                    asm = f"ASM-{ident(proj, rel_base, base_name, n=8).upper()}.{ext.upper()}" if anonymize_assembly_names else base_name
-                gsizes[e["size"]] += 1
-                arch_entries.setdefault(proj, []).append(
-                    [apath, n, d + 1, ext, e["size"], e["mtime"], cur, asm, rel_base + "/" + base_name, None,
-                     {"kind": kind, "chain": e["chain"], "inner": inner, "readable": e["readable"]}])
-                arch_listed += 1
-                total_files += 1
-                total_bytes += e["size"]
-
-    # ... then decide, with every size in the whole run known, which files need a full read to be fingerprinted.
-    # A size that occurs only once in the ENTIRE run cannot have a duplicate anywhere (so copies of whole projects in other
-    # folders are still found); never-CAD types are skipped. Hash left blank = not read; the compiler treats blank as unique.
-    hashed_arch = 0
-    for proj, entries in scanned:
-        for e in entries:
-            e[9] = hash_mode == "all" or e[4] == 0 or (e[3] not in NO_HASH_EXTS and gsizes[e[4]] > 1)
-        hashed_n += sum(1 for e in entries if e[9]); skipped_n += sum(1 for e in entries if not e[9])
-    for proj, entries in arch_entries.items():
-        for e in entries:
-            a_ = e[10]
-            want = (archive_mode == "full" and a_["readable"] and a_["kind"] in ("zip", "tar") and e[4] <= ENTRY_HASH_MAX
-                    and (e[4] == 0 or (e[3] in CAD_HASH_EXTS and (hash_mode == "all" or gsizes[e[4]] > 1
-                                                                 or (tier >= 2 and e[3] in LINK_READ_EXTS)))))
-            e[9] = bool(want)
-        hashed_arch += sum(1 for e in entries if e[9])
-    progress("hash", 0, total_files, 0, total_bytes)
-
-
-    def flush(batch, proj):
-        """Hash/fingerprint one batch in parallel; map() keeps input order so output is deterministic."""
-        if workers == 1 or sum(m[4] for m in batch) / len(batch) < PARALLEL_MIN_AVG_BYTES:
-            # tiny files are dominated by Python-level work that threads cannot overlap (GIL): serial is faster
-            results = (fingerprint(m[0], m[3], m[4], m[9]) for m in batch)
-            return _consume(batch, results, proj)
-        step = max(1, -(-len(batch) // (workers * 4)))      # a few chunks per worker: per-file tasks cost more than tiny files
-        chunks = [batch[i:i + step] for i in range(0, len(batch), step)]
-        results = (r for part in pool.map(lambda c: [fingerprint(m[0], m[3], m[4], m[9]) for m in c], chunks) for r in part)
-        _consume(batch, results, proj)
-
-    def _consume(batch, results, proj):
-        nonlocal errors, seen, last_print, last_log, done_bytes
-        for (_p, n, depth, ext, size, mtime, dir_id, asm, relpath, _dh, _arch), (digest, sig) in zip(batch, results):
-            if "UNREADABLE" in (digest, sig):
-                errors += 1
-            files_rows.append([proj, n, ext, size, mtime, depth, digest, sig, dir_id, asm] + ([relpath] if tier >= 1 else []) + [""])
-            if tier >= 2 and ext in LINK_READ_EXTS:
-                link_jobs.append((proj, n, ext, _p))
-            seen += 1
-            done_bytes += size
-            now = time.time()
-            if now - last_print > 0.3:
-                progress("hash", seen, total_files, done_bytes, total_bytes)
-                last_print = now
-            if now - last_log > 1.0:
-                log(f"  scanned {seen:,} files ... (now in {proj})")
-                last_log = now
-
     try:
-        for proj, entries in scanned:
-            for i in range(0, len(entries), BATCH):
-                flush(entries[i:i + BATCH], proj)
-            log(f"  {proj}: {len(entries):,} files")
-        links, arch_link_files = [], 0
-        arch_hashed = arch_budget_hit = 0
-        if arch_entries:
-            # ---- archive entries: one pass per archive; content is read ONCE for hash + format tag (+ references at level 2) ----
-            lock = threading.Lock()
-            spent = [0]
+        # ================================================================= scan (count) - cached per project in the manifest
+        state["phase"] = "scan"
+        total_files = total_bytes = 0
+        t_scan = time.time()
+        for ui, (proj, base, recurse) in enumerate(units):
+            u = man["units"].setdefault(proj, {})
+            if "files" not in u:
+                nfiles = nbytes = narch = njunk = 0
+                for dirpath, rel, depth, files in walk_dirs(lp(base), recurse, on_walk_error, walk_counts):
+                    for e in files:
+                        if e.name.lower() in SYSTEM_JUNK or e.name.startswith("._"):
+                            njunk += 1
+                            continue
+                        try:
+                            nbytes += e.stat().st_size
+                        except OSError:
+                            pass
+                        nfiles += 1
+                        if archive_mode != "off" and archives.kind_of(e.name):
+                            narch += 1
+                    state["files"] = total_files + nfiles
+                    if time.time() - t_scan > 0.3:
+                        progress("scan", total_files + nfiles, total_files + nfiles, 0, total_bytes + nbytes)
+                        t_scan = time.time()
+                u.update(files=nfiles, bytes=nbytes, archives=narch, junk=njunk)
+                save_manifest()
+            total_files += u["files"]
+            total_bytes += u["bytes"]
+        scan_s = time.time() - t0
+        man["prescan_s"] += scan_s
+        rlog.event("scan", f"counted {total_files:,} files, {total_bytes / 1e9:.1f} GB in {len(units)} projects "
+                           f"({scan_s:.1f}s; unreadable folders {C['dir_errors']}, linked folders skipped {walk_counts['links_skipped']})")
+        done_files = sum(man["units"][p[0]].get("files", 0) for p in units if man["units"][p[0]].get("complete"))
+        done_bytes = sum(man["units"][p[0]].get("bytes", 0) for p in units if man["units"][p[0]].get("complete"))
+        state.update(phase="process", files=done_files, bytes=done_bytes)
+        progress("process", done_files, total_files, done_bytes, total_bytes)
+        t_proc0 = time.time()
+        last_prog = [0.0]
 
-            def process_archive(job):
-                aproj, apath, items = job
-                out = {}
-                wanted = [(it[10]["chain"], it[10]["inner"]) for it in items if it[9] and it[4] > 0]
-                for chain, inner, f in archives.read_entries(apath, wanted):
-                    ext = ext_of(inner.rsplit("/", 1)[-1])
-                    res = ("", "ARCHIVED", None)
-                    if f is not None:
-                        size = next(it[4] for it in items if it[10]["chain"] == chain and it[10]["inner"] == inner)
-                        with lock:
-                            ok = spent[0] + size <= budget_left
-                            if ok:
-                                spent[0] += size
-                        if ok:
-                            try:
-                                h = hashlib.sha256()
-                                if size <= ENTRY_MEMORY_MAX:
+        def tick():
+            now = time.time()
+            if now - last_prog[0] > 0.3:
+                progress("process", state["files"], max(total_files, state["files"]), state["bytes"], max(total_bytes, state["bytes"]))
+                last_prog[0] = now
+
+        budget_left = [int(budget_gb * 1024 ** 3) - C["arch_spent"]]
+        budget_lock = threading.Lock()
+
+        def columns():
+            return (["project", "file_no", "ext", "size_bytes", "modified_utc", "depth", "header_signature", "dir_id", "asm_name"]
+                    + (["rel_path"] if tier >= 1 else []) + ["archive"])
+
+        def link_rows(proj, n, ext, res):
+            if res[0] == "native":
+                return [[proj, n, ext, "native", "", c] for c in res[1]]
+            return [[proj, n, ext, "step", par, c] for par, kids in res[1].items() for c in kids]
+
+        # ================================================================= process each project, chunk by chunk
+        for ui, (proj, base, recurse) in enumerate(units):
+            u = man["units"][proj]
+            if u.get("complete"):
+                rlog.event("process", f"[{ui + 1}/{len(units)}] {proj}: already done in an earlier run - skipped")
+                continue
+            t_unit = time.time()
+            chunks_done = u.get("chunks_done", 0)
+            if chunks_done:
+                rlog.event("process", f"[{ui + 1}/{len(units)}] {proj}: resuming after chunk {chunks_done}")
+                state["files"] += min(u.get("files", 0), chunks_done * chunk_files)
+            n = 0
+            pending, chunk_idx = [], 0
+            arch_jobs = []                                                    # (relpath, path, dir_id, depth) in walk order
+            wbase = lp(base)
+
+            def flush_chunk():
+                nonlocal pending, chunk_idx
+                if chunk_idx < chunks_done:
+                    chunk_idx += 1
+                    pending = []
+                    return
+                t_c = time.time()
+
+                def work(e):
+                    path, name, ext, size, mtime, dir_id, depth, asm, relpath, nn = e
+                    with act.timer("format_tag_read"):
+                        sig = signature(path, ext, size)
+                    res = None
+                    if tier >= 2 and ext in LINK_READ_EXTS and cad_links is not None:
+                        with act.timer("reference_read"):
+                            res = cad_links.read_links(path, ext)
+                        return sig, res, True
+                    return sig, None, False
+
+                rows, lrows = [], []
+                for e, (sig, res, was_link) in zip(pending, pool.map(work, pending)):
+                    path, name, ext, size, mtime, dir_id, depth, asm, relpath, nn = e
+                    if "UNREADABLE" in sig:
+                        C["errors"] += 1
+                    rows.append([proj, nn, ext, size, mtime, depth, sig, dir_id, asm] + ([relpath] if tier >= 1 else []) + [""])
+                    if was_link:
+                        if res is None:
+                            C["link_unreadable"] += 1
+                        else:
+                            C["link_read"] += 1
+                            lrows += link_rows(proj, nn, ext, res)
+                    state["files"] += 1
+                    state["bytes"] += size
+                    tick()
+                with act.timer("write_checkpoint"):
+                    _write_csv_atomic(os.path.join(state_dir, "rows", f"u{ui}_c{chunk_idx:06d}.csv"), rows)
+                    _write_csv_atomic(os.path.join(state_dir, "links", f"u{ui}_c{chunk_idx:06d}.csv"), lrows)
+                    u["chunks_done"] = chunk_idx + 1
+                    save_manifest()
+                rlog.event("process", f"{proj}: chunk {chunk_idx + 1} saved ({len(rows):,} files, {time.time() - t_c:.1f}s)")
+                if _TEST_HOOK:
+                    _TEST_HOOK(ui, chunk_idx)
+                chunk_idx += 1
+                pending = []
+
+            for dirpath, rel, depth, files in walk_dirs(wbase, recurse, lambda e: None, collections.Counter()):   # already counted by the scan
+                dir_id = reg(proj, rel, depth, proj if rel == "." else os.path.basename(rel))
+                for e in files:
+                    name = e.name
+                    if name.lower() in SYSTEM_JUNK or name.startswith("._"):
+                        continue
+                    n += 1
+                    skip = (n - 1) // chunk_files < chunks_done
+                    if archive_mode != "off" and archives.kind_of(name):
+                        relp = name if rel == "." else (rel + os.sep + name).replace(os.sep, "/")
+                        arch_jobs.append((relp, e.path, dir_id, depth))
+                    if not skip:
+                        try:
+                            st = e.stat()
+                        except OSError:
+                            C["errors"] += 1
+                            st = None
+                        if st is not None:
+                            ext = ext_of(name)
+                            asm = ""
+                            if ext in ASSEMBLY_EXTS:
+                                asm = (f"ASM-{ident(proj, rel, name, n=8).upper()}.{ext.upper()}" if anonymize_assembly_names else name)
+                            relpath = name if rel == "." else (rel + os.sep + name).replace(os.sep, "/")
+                            pending.append((e.path, name, ext, st.st_size, iso(st.st_mtime), dir_id, depth, asm, relpath, n))
+                    if n % chunk_files == 0:
+                        flush_chunk()
+            if pending or (n and n % chunk_files):
+                flush_chunk()
+            n_loose = n
+            if n != u.get("files", n):
+                C["changed_projects"] += 1
+                rlog.event("process", f"{proj}: the folder changed while profiling or between restarts ({u.get('files')} files when counted, "
+                                       f"{n} now) - run with --fresh if you need an exact result for this project", "WARN")
+            # ---- archives of this project (processed in batches, saved one archive at a time)
+            a_done = u.get("archives_done", 0)
+            counts_list = u.setdefault("arch_counts", [])
+            base_n = n_loose + sum(counts_list[:a_done])
+            for j in range(a_done):                                           # re-register folders of archives finished earlier
+                fpath = os.path.join(state_dir, "dirs", f"u{ui}_a{j:06d}.csv")
+                if os.path.exists(fpath):
+                    for d in csv.reader(open(fpath, newline="", encoding="utf-8")):
+                        dirs.setdefault(d[0], (proj, d[1], int(d[2]), d[3]))
+            def arch_worker(job):
+                relp, apath, adir, adepth = job
+                with act.timer("archive_listing"):
+                    ents = archives.list_archive(apath)
+                if ents is None:
+                    return job, None, {}
+                reads = {}
+                if archive_mode == "full" and tier >= 2 and cad_links is not None and archives.kind_of(apath) in ("zip", "tar"):
+                    want = [(e["chain"], e["inner"]) for e in ents
+                            if e["readable"] and ext_of(e["inner"].rsplit("/", 1)[-1]) in LINK_READ_EXTS and e["size"] <= ENTRY_LINK_MAX]
+                    if want:
+                        for chain, inner, f in archives.read_entries(apath, want):
+                            ext = ext_of(inner.rsplit("/", 1)[-1])
+                            size = next(x["size"] for x in ents if x["chain"] == chain and x["inner"] == inner)
+                            if f is None:
+                                continue
+                            with budget_lock:
+                                ok = budget_left[0] - size >= 0
+                                if ok:
+                                    budget_left[0] -= size
+                            if not ok:
+                                reads[(chain, inner)] = "BUDGET"
+                                continue
+                            with act.timer("archive_entry_read"):
+                                try:
                                     data = f.read()
-                                    h.update(data)
-                                    sig = signature_stream(io.BytesIO(data), ext, size)
-                                    lk = None
-                                    if tier >= 2 and cad_links is not None and ext in LINK_READ_EXTS and size <= ENTRY_LINK_MAX:
-                                        lk = cad_links.read_links_bytes(data, ext, inner.rsplit("/", 1)[-1])
-                                else:
-                                    head = f.read(HEAD_BYTES)
-                                    h.update(head)
-                                    for chunk in iter(lambda: f.read(HASH_CHUNK), b""):
-                                        h.update(chunk)
-                                    sig, lk = signature_stream(io.BytesIO(head), ext, size), None
-                                res = (h.hexdigest(), sig, lk)
-                            except Exception:
-                                res = ("", "UNREADABLE", None)
-                        else:
-                            res = ("", "ARCHIVED", "BUDGET")
-                    out[(chain, inner)] = res
-                return job, out
+                                    reads[(chain, inner)] = (signature_stream(io.BytesIO(data), ext, size),
+                                                             cad_links.read_links_bytes(data, ext, inner.rsplit("/", 1)[-1]), size)
+                                except Exception:
+                                    reads[(chain, inner)] = ("UNREADABLE", None, size)
+                return job, ents, reads
 
-            by_arch = {}
-            for aproj, ents in arch_entries.items():
-                for it in ents:
-                    by_arch.setdefault((aproj, it[0]), []).append(it)
-            jobs = [(aproj, apath, items) for (aproj, apath), items in by_arch.items()]
-            for (job, out) in pool.map(process_archive, jobs):
-                aproj, apath, items = job
-                for it in items:
-                    a_ = it[10]
-                    digest, sig, lk = out.get((a_["chain"], a_["inner"]), ("", "ARCHIVED", None))
-                    if it[4] == 0:
-                        digest, sig = hashlib.sha256(b"").hexdigest(), "EMPTY"
-                    if lk == "BUDGET":
-                        arch_budget_hit += 1; lk = None
-                    if "UNREADABLE" in (digest, sig):
-                        errors += 1
-                    if digest:
-                        arch_hashed += 1
-                    if sig == "ARCHIVED" and not digest:
-                        sig = "ARCHIVED"
-                    files_rows.append([aproj, it[1], it[3], it[4], it[5], it[2], digest, sig, it[6], it[7]]
-                                      + ([it[8]] if tier >= 1 else []) + [a_["kind"]])
-                    if lk is not None:
-                        arch_link_files += 1
-                        if lk[0] == "native":
-                            links += [[aproj, it[1], it[3], "native", "", c] for c in lk[1]]
-                        else:
-                            links += [[aproj, it[1], it[3], "step", par, c] for par, kids in lk[1].items() for c in kids]
-                    seen += 1
-                    done_bytes += it[4]
-            log(f"  archives: {arch_opened:,} opened, {arch_listed:,} entries, {arch_hashed:,} read in full")
-    finally:
-        pool.shutdown()
-    progress("hash", seen, total_files, done_bytes, total_bytes)
-
-    # ---- level 2: references inside assemblies / drawings / STEP (names of referenced files only) ----
-    link_read, link_fail = arch_link_files, 0
-    if tier >= 2 and link_jobs:
-        progress("links", 0, len(link_jobs), 0, 0)
-        log(f"  reading references inside {len(link_jobs):,} assembly/drawing/STEP files ...")
-        with ThreadPoolExecutor(max_workers=workers) as lpool:
-            for k, (job, res) in enumerate(zip(link_jobs, lpool.map(lambda j: cad_links.read_links(j[3], j[2]), link_jobs))):
-                lproj, ln, lext, _lp = job
-                if res is None:
-                    link_fail += 1
-                else:
-                    link_read += 1
-                    if res[0] == "native":
-                        links += [[lproj, ln, lext, "native", "", c] for c in res[1]]
+            todo = arch_jobs[a_done:]
+            for b in range(0, len(todo), workers):
+                batch = todo[b:b + workers]
+                for job, ents, reads in pool.map(arch_worker, batch):
+                    relp, apath, adir, adepth = job
+                    j = a_done
+                    rows, lrows, adirs = [], [], {}
+                    if ents is None:
+                        C["arch_unreadable"] += 1
+                        rlog.event("process", f"{proj}: archive could not be opened ({relp.rsplit('/', 1)[-1]})", "WARN")
+                        ents = []
                     else:
-                        links += [[lproj, ln, lext, "step", par, c] for par, kids in res[1].items() for c in kids]
-                if (k + 1) % 200 == 0 or k + 1 == len(link_jobs):
-                    progress("links", k + 1, len(link_jobs), 0, 0)
+                        C["arch_opened"] += 1
+                    kind = archives.kind_of(apath)
 
-    # ---- aggregates ----
-    proj_stats, ext_stats = {}, {}
-    for row in files_rows:
-        proj, ext, size, mod = row[0], row[2], row[3], row[4]
-        p = proj_stats.setdefault(proj, [0, 0, mod, mod, set()])
-        p[0] += 1; p[1] += size; p[2] = min(p[2], mod); p[3] = max(p[3], mod); p[4].add(ext)
-        e = ext_stats.setdefault((proj, ext), [0, 0])
-        e[0] += 1; e[1] += size
+                    def areg(rel_, parent_, depth_, name_):
+                        i = ident(proj, rel_)
+                        dirs.setdefault(i, (proj, parent_, depth_, name_))
+                        adirs[i] = dirs[i]
+                        return i
+                    cnt = 0
+                    for e in ents:
+                        inner = e["inner"]; bname = inner.rsplit("/", 1)[-1]
+                        if bname.lower() in SYSTEM_JUNK or bname.startswith("._"):
+                            C["junk"] += 1
+                            continue
+                        cnt += 1
+                        nn = base_n + cnt
+                        rel_base, d = relp + "!", adepth + 1
+                        cur = areg(rel_base, adir, d, os.path.basename(apath))
+                        for c in e["chain"]:
+                            rel_base += "/" + c + "!"; d += 1
+                            cur = areg(rel_base, cur, d, c)
+                        for part in inner.split("/")[:-1]:
+                            rel_base += "/" + part; d += 1
+                            cur = areg(rel_base, cur, d, part)
+                        ext = ext_of(bname)
+                        asm = ""
+                        if ext in ASSEMBLY_EXTS:
+                            asm = (f"ASM-{ident(proj, rel_base, bname, n=8).upper()}.{ext.upper()}" if anonymize_assembly_names else bname)
+                        sig, lres = "ARCHIVED", None
+                        rd = reads.get((e["chain"], inner))
+                        if rd == "BUDGET":
+                            C["arch_budget_hit"] += 1
+                        elif rd:
+                            sig, lres = rd[0], rd[1]
+                            C["arch_read"] += 1
+                            C["arch_spent"] += rd[2]
+                            if lres is not None:
+                                C["link_read"] += 1
+                                lrows += link_rows(proj, nn, ext, lres)
+                        rows.append([proj, nn, ext, e["size"], e["mtime"], d + 1, sig, cur, asm] + ([rel_base + "/" + bname] if tier >= 1 else []) + [kind])
+                        state["files"] += 1
+                        state["bytes"] += e["size"]
+                    C["arch_entries"] += cnt
+                    counts_list.append(cnt)
+                    base_n += cnt
+                    with act.timer("write_checkpoint"):
+                        _write_csv_atomic(os.path.join(state_dir, "rows", f"u{ui}_a{j:06d}.csv"), rows)
+                        _write_csv_atomic(os.path.join(state_dir, "links", f"u{ui}_a{j:06d}.csv"), lrows)
+                        _write_csv_atomic(os.path.join(state_dir, "dirs", f"u{ui}_a{j:06d}.csv"),
+                                          [[i, v[1], v[2], v[3]] for i, v in adirs.items()])
+                        a_done += 1
+                        u["archives_done"] = a_done
+                        save_manifest()
+                    tick()
+                    if _TEST_HOOK:
+                        _TEST_HOOK(ui, "a%d" % (a_done - 1))
+            # ---- project finished: remember its folder tree, mark it complete
+            with act.timer("write_checkpoint"):
+                _write_csv_atomic(os.path.join(state_dir, "dirs", f"u{ui}.csv"),
+                                  [[i, v[1], v[2], v[3]] for i, v in dirs.items() if v[0] == proj])
+                u["complete"] = True
+                u["loose_files"] = n_loose
+                save_manifest()
+            rlog.event("process", f"[{ui + 1}/{len(units)}] {proj}: done ({n_loose:,} files + {sum(counts_list):,} in archives, {time.time() - t_unit:.1f}s)")
+        man["process_s"] += time.time() - t_proc0
+        save_manifest()
+    except BaseException as exc:
+        rlog.event(state["phase"], f"run stopped: {type(exc).__name__}. Progress is saved - start again with the same settings to resume.", "ERROR")
+        save_manifest()
+        mon.stop()
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise
+    finally:
+        try:
+            pool.shutdown(wait=False)
+        except Exception:
+            pass
 
+    # ===================================================================== finalize: stream the saved chunks into the zip
+    state["phase"] = "finalize"
+    t_fin = time.time()
+    progress("process", total_files, total_files, total_bytes, total_bytes)
     os.makedirs(out_dir, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    zip_path = os.path.join(out_dir, f"profile_{re.sub(r'[^A-Za-z0-9_.-]', '_', label)}_{stamp}.zip")
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", label)
+    zip_path = os.path.join(out_dir, f"profile_{safe}_{stamp}.zip")
+    stats_zip = os.path.join(out_dir, f"run_stats_{safe}_{stamp}.zip")
+    proj_stats, ext_stats, nfiles_out, bytes_out = {}, {}, 0, 0
 
-    def table(header, rows):
-        import io
-        buf = io.StringIO(newline="")
-        w = csv.writer(buf, lineterminator="\r\n")
-        w.writerow(header); w.writerows(rows)
-        return buf.getvalue()
+    def chunk_files_of(sub, ui):
+        d = os.path.join(state_dir, sub)
+        pre = f"u{ui}_"
+        names = sorted((f for f in os.listdir(d) if f.startswith(pre) and f.endswith(".csv") and f[len(pre)] in "ca"),
+                       key=lambda f: (f[len(pre)] != "c", f))          # loose-file chunks first, then archives, each in order
+        return [os.path.join(d, f) for f in names]
 
-    tables = {
-        "Files.csv": table(["project", "file_no", "ext", "size_bytes", "modified_utc", "depth", "sha256",
-                            "header_signature", "dir_id", "asm_name"] + (["rel_path"] if tier >= 1 else []) + ["archive"], files_rows),
-        "Dirs.csv": table(["dir_id", "project", "parent_dir_id", "depth"] + (["name"] if tier >= 1 else []),
-                          [[d, v[0], v[1], v[2]] + ([v[3]] if tier >= 1 else [])
-                           for d, v in sorted(dirs.items(), key=lambda kv: (kv[1][0], kv[1][2], kv[0]))]),
-        **({"Links.csv": table(["project", "file_no", "ext", "kind", "parent", "child"], links)} if tier >= 2 else {}),
-        "Projects.csv": table(["project", "file_count", "total_bytes", "distinct_extensions",
-                               "first_modified_utc", "last_modified_utc"],
-                              [[p, s[0], s[1], len(s[4]), s[2], s[3]] for p, s in sorted(proj_stats.items())]),
-        "Extensions.csv": table(["project", "ext", "file_count", "total_bytes", "avg_bytes"],
-                                [[p, e, s[0], s[1], s[1] // s[0]] for (p, e), s in sorted(ext_stats.items())]),
-        "Run_info.csv": table(["key", "value"], [
-            ["tool_version", VERSION], ["run_utc", datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")],
-            ["os", platform.platform()], ["python", platform.python_version()],
-            ["folder_name", label], ["mode", "docker" if os.environ.get("PROFILER_IN_DOCKER") else "native"],
-            ["projects", len(units)], ["workers", workers],
-            ["assembly_names", "anonymized" if anonymize_assembly_names else "real"],
-            ["detail_level", tier], ["project_depth", project_depth], ["hash_mode", hash_mode],
-            ["files_hashed", hashed_n], ["files_hash_skipped", skipped_n],
-            ["archives_mode", archive_mode], ["archives_opened", arch_opened], ["archives_unreadable", arch_unreadable],
-            ["archive_entries", arch_listed], ["archive_entries_read", arch_hashed], ["archive_budget_hit", arch_budget_hit],
-            ["link_files_read", link_read], ["link_files_unreadable", link_fail], ["link_rows", len(links)],
-            ["files", len(files_rows)], ["total_bytes", sum(r[3] for r in files_rows)],
-            ["read_errors", errors], ["unreadable_folders", dir_errors], ["ignored_system_files", junk], ["seconds", round(time.time() - t0, 1)]]),
-        "WHAT_IS_IN_THIS_ZIP.txt": what_is(tier, anonymize_assembly_names),
-    }
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
-        for name, text in tables.items():
-            z.writestr(name, text.encode("utf-8-sig") if name.endswith(".csv") else text.encode("utf-8"))
-    return zip_path, len(units), len(files_rows), errors
+    all_dirs = dict(dirs)
+    for ui in range(len(units)):
+        fpath = os.path.join(state_dir, "dirs", f"u{ui}.csv")
+        if os.path.exists(fpath):
+            for d in csv.reader(open(fpath, newline="", encoding="utf-8")):
+                all_dirs.setdefault(d[0], (units[ui][0], d[1], int(d[2]), d[3]))
+    tmp_zip = zip_path + ".tmp"
+    with zipfile.ZipFile(tmp_zip, "w", zipfile.ZIP_DEFLATED) as z:
+        with z.open("Files.csv", "w", force_zip64=True) as out:
+            out.write(("﻿" + ",".join(columns()) + "\r\n").encode("utf-8"))
+            for ui in range(len(units)):
+                for fpath in chunk_files_of("rows", ui):
+                    text = open(fpath, encoding="utf-8", newline="").read()
+                    out.write(text.encode("utf-8"))
+                    for row in csv.reader(io.StringIO(text)):
+                        proj_, ext_, size_, mod_ = row[0], row[2], int(row[3]), row[4]
+                        p = proj_stats.setdefault(proj_, [0, 0, mod_, mod_, set()])
+                        p[0] += 1; p[1] += size_; p[2] = min(p[2], mod_); p[3] = max(p[3], mod_); p[4].add(ext_)
+                        e = ext_stats.setdefault((proj_, ext_), [0, 0])
+                        e[0] += 1; e[1] += size_
+                        nfiles_out += 1; bytes_out += size_
+
+        def put(name, header, rows):
+            buf = io.StringIO(newline="")
+            w = csv.writer(buf, lineterminator="\r\n")
+            w.writerow(header); w.writerows(rows)
+            z.writestr(name, ("﻿" + buf.getvalue()).encode("utf-8"))
+
+        if tier >= 2:
+            with z.open("Links.csv", "w", force_zip64=True) as out:
+                out.write(("﻿" + "project,file_no,ext,kind,parent,child\r\n").encode("utf-8"))
+                for ui in range(len(units)):
+                    for fpath in chunk_files_of("links", ui):
+                        out.write(open(fpath, encoding="utf-8", newline="").read().encode("utf-8"))
+        put("Dirs.csv", ["dir_id", "project", "parent_dir_id", "depth"] + (["name"] if tier >= 1 else []),
+            [[d, v[0], v[1], v[2]] + ([v[3]] if tier >= 1 else [])
+             for d, v in sorted(all_dirs.items(), key=lambda kv: (kv[1][0], kv[1][2], kv[0]))])
+        put("Projects.csv", ["project", "file_count", "total_bytes", "distinct_extensions", "first_modified_utc", "last_modified_utc"],
+            [[p, s[0], s[1], len(s[4]), s[2], s[3]] for p, s in sorted(proj_stats.items())])
+        put("Extensions.csv", ["project", "ext", "file_count", "total_bytes", "avg_bytes"],
+            [[p, e, s[0], s[1], s[1] // s[0]] for (p, e), s in sorted(ext_stats.items())])
+        fin_s = time.time() - t_fin
+        active = elapsed_before + (time.time() - t_run0)
+        busy, calls = act.snapshot()
+        proc_s = man["process_s"]
+        info = [["tool_version", VERSION], ["run_utc", now_utc()], ["os", platform.platform()], ["python", platform.python_version()],
+                ["folder_name", label], ["mode", "docker" if os.environ.get("PROFILER_IN_DOCKER") else "native"],
+                ["projects", len(units)], ["workers", workers], ["files", nfiles_out], ["total_bytes", bytes_out],
+                ["hashing", "none"], ["assembly_names", "anonymized" if anonymize_assembly_names else "real"],
+                ["detail_level", tier], ["project_depth", project_depth], ["archives_mode", archive_mode],
+                ["archives_opened", C["arch_opened"]], ["archives_unreadable", C["arch_unreadable"]],
+                ["archive_entries", C["arch_entries"]], ["archive_entries_read", C["arch_read"]],
+                ["archive_budget_hit", C["arch_budget_hit"]], ["link_files_read", C["link_read"]],
+                ["link_files_unreadable", C["link_unreadable"]], ["read_errors", C["errors"]],
+                ["unreadable_folders", C["dir_errors"]], ["linked_folders_skipped", walk_counts["links_skipped"]],
+                ["ignored_system_files", C["junk"] + sum(u.get("junk", 0) for u in man["units"].values())],
+                ["projects_changed_during_run", C["changed_projects"]], ["restarts_resumed", man["restarts"]],
+                ["seconds", round(active, 1)], ["seconds_scan", round(man["prescan_s"], 1)], ["seconds_process", round(proc_s, 1)],
+                ["seconds_finalize", round(fin_s, 1)],
+                ["avg_MB_per_s", round(bytes_out / 1e6 / max(1.0, proc_s + man["prescan_s"]), 1)],
+                ["avg_files_per_s", round(nfiles_out / max(1.0, proc_s + man["prescan_s"]))]]
+        put("Run_info.csv", ["key", "value"], info)
+        z.writestr("WHAT_IS_IN_THIS_ZIP.txt", what_is(tier, anonymize_assembly_names).encode("utf-8"))
+        # ---- shareable run statistics
+        phases = [["phase", "wall_seconds", "files", "GB", "MB_per_s", "files_per_s", "note"],
+                  ["scan (count files and bytes)", round(man["prescan_s"], 1), total_files, round(total_bytes / 1e9, 2),
+                   round(total_bytes / 1e6 / max(0.1, man["prescan_s"]), 1), round(total_files / max(0.1, man["prescan_s"])), "metadata only, no file is opened"],
+                  ["process (read tags / references, save chunks)", round(proc_s, 1), nfiles_out, round(bytes_out / 1e9, 2),
+                   round(bytes_out / 1e6 / max(0.1, proc_s), 1), round(nfiles_out / max(0.1, proc_s)), "includes any time before a restart"],
+                  ["finalize (build the zip)", round(fin_s, 1), nfiles_out, "", "", "", ""]]
+        phases += [["", "", "", "", "", "", ""], ["activity (busy seconds summed over all workers)", "busy_seconds", "calls", "", "", "", "share of process wall time x workers"]]
+        for k in sorted(busy, key=lambda k: -busy[k]):
+            phases.append([k, round(busy[k], 1), calls[k], "", "", "", f"{100 * busy[k] / max(0.1, proc_s * workers):.0f}%"])
+        sysrows = sysmetrics.system_info(data_paths, out_dir, {"workers": workers, "detail_level": tier, "archives_mode": archive_mode,
+                                                                "hashing": "none"}, deep=system_info) if system_info else [("system_info", "skipped")]
+        rlog.event("finalize", f"done: {nfiles_out:,} files, {bytes_out / 1e9:.1f} GB, scan {man['prescan_s']:.0f}s + process {proc_s:.0f}s + finalize {fin_s:.0f}s")
+        mon.stop(); rlog.close()
+        log_files = {"Run_log.csv": open(os.path.join(state_dir, "Run_log.csv"), "rb").read(),
+                     "Run_metrics.csv": open(os.path.join(state_dir, "Run_metrics.csv"), "rb").read()}
+        buf = io.StringIO(newline=""); csv.writer(buf, lineterminator="\r\n").writerows(phases); log_files["Run_phases.csv"] = ("﻿" + buf.getvalue()).encode("utf-8")
+        buf = io.StringIO(newline=""); w = csv.writer(buf, lineterminator="\r\n"); w.writerow(["key", "value"]); w.writerows(sysrows)
+        log_files["System_info.csv"] = ("﻿" + buf.getvalue()).encode("utf-8")
+        for name, data in log_files.items():
+            z.writestr(name, data)
+    os.replace(tmp_zip, zip_path)
+    with zipfile.ZipFile(stats_zip, "w", zipfile.ZIP_DEFLATED) as z:
+        for name, data in log_files.items():
+            z.writestr(name, data)
+        z.writestr("README.txt", "Run statistics from the Folder Profiler: timings per step, a CPU / memory / read-speed sample every few seconds, and the "
+                                  "machine description. No file names, folder names or file contents. Safe to share.\r\n".encode("utf-8"))
+    shutil.rmtree(state_dir, ignore_errors=True)
+    try:
+        os.rmdir(os.path.join(out_dir, ".resume"))
+    except OSError:
+        pass
+    LAST_RUN.update(zip=zip_path, stats_zip=stats_zip)
+    return zip_path, len(units), nfiles_out, C["errors"]
+
+
+LAST_RUN = {}                # paths of the most recent run's zip and run-statistics zip (used by the browser UI)
 
 
 def what_is(tier, anonymized):
     head = ("This archive was made by the Folder Profiler (detail level %d). You can open every file in it with Excel or Notepad.\r\n\r\n" % tier)
     if tier == 0:
-        body = ("It contains METRICS only: extensions, sizes, dates, SHA-256 fingerprints and short format tags, plus anonymous\r\n"
+        body = ("It contains METRICS only: extensions, sizes, dates and short format tags (no file is hashed), plus anonymous\r\n"
                 "folder ids (Dirs.csv) so files can be grouped by folder. No folder names, no paths below the project name, no file\r\n"
                 "contents. " + ("The only file names are anonymous codes (ASM-xxxxxxxx) for assembly files.\r\n" if anonymized else
                 "The only file names are those of ASSEMBLY files (sldasm, asm, iam, catproduct) in the asm_name column.\r\n"))
@@ -609,7 +823,9 @@ def what_is(tier, anonymized):
         body = ("Level 2 = level 1 (names and paths) plus Links.csv: for assembly, drawing and STEP files, the FILE NAMES of the\r\n"
                 "other CAD files they reference (or, for STEP, the product-structure names). Nothing else was copied from inside the\r\n"
                 "files - no geometry, no text, no properties.\r\n")
-    return head + body + ("Files found INSIDE archives (zip, tar; 7z/rar listed only) appear as normal rows with the archive column set; their\r\n"
+    return head + body + ("Run_log.csv, Run_phases.csv, Run_metrics.csv and System_info.csv describe how the run went and what machine it ran\r\n"
+                          "on (no file or folder names). "
+                          "Files found INSIDE archives (zip, tar; 7z/rar listed only) appear as normal rows with the archive column set; their\r\n"
                           "names are shown as <archive>!/<inner path> at level >= 1.\r\n")
 
 
@@ -655,7 +871,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="Collect file metrics (never contents) for a folder.")
     ap.add_argument("folder", nargs="?", help="parent folder to profile (asked for if omitted)")
     ap.add_argument("--out", help="where to write the zip (default: ./output next to this script)")
-    ap.add_argument("--workers", type=int, help="parallel hashing threads (default: auto, max 16; env PROFILER_WORKERS)")
+    ap.add_argument("--workers", type=int, help="parallel reader threads (default: auto, max 16; env PROFILER_WORKERS)")
     ap.add_argument("--anonymize-assembly-names", action="store_true",
                     help="write codes like ASM-3F9A1C2B.SLDASM instead of the real assembly file names")
     ap.add_argument("--level", "--tier", dest="level", type=int, choices=[0, 1, 2], default=None,
@@ -663,14 +879,15 @@ def main(argv=None):
                          "2 = + names of files referenced inside assemblies/drawings/STEP (env PROFILER_TIER)")
     ap.add_argument("--project-depth", type=int, default=None,
                     help="projects are the folders this many levels below the chosen one (default 1; env PROFILER_PROJECT_DEPTH)")
-    ap.add_argument("--hash", dest="hash_mode", choices=["smart", "all"], default=None,
-                    help="smart (default): skip full-file hashing where it cannot matter (unique size in project, non-CAD types); "
-                         "all: hash every file")
     ap.add_argument("--archives", choices=["off", "list", "full"], default=None,
                     help="look inside .zip/.tar(.gz) archives (7z/rar are listed only, needs bsdtar/tar.exe): off; list = names and "
-                         "sizes only; full (default) = also fingerprint CAD files inside (env PROFILER_ARCHIVES)")
+                         "sizes only; full (default) = also read assemblies/drawings/STEP inside at level 2 (env PROFILER_ARCHIVES)")
     ap.add_argument("--archive-budget-gb", type=float, default=None,
                     help="stop decompressing archive entries after this many GB in total (default 20; env PROFILER_ARCHIVE_GB)")
+    ap.add_argument("--fresh", action="store_true", help="ignore saved progress of an earlier run and start from the beginning")
+    ap.add_argument("--metrics-interval", type=float, default=None, help="seconds between system samples in Run_metrics.csv (default 5)")
+    ap.add_argument("--no-system-info", action="store_true", help="do not ask the OS about disks / antivirus (System_info.csv is shorter)")
+    ap.add_argument("--chunk-files", type=int, default=None, help=argparse.SUPPRESS)
     ap.add_argument("--name", help="folder label for the report (default: the folder's own name; "
                                    "env PROFILER_FOLDER_NAME is used when running in Docker)")
     a = ap.parse_args(argv)
@@ -684,8 +901,10 @@ def main(argv=None):
     try:
         zip_path, nproj, nfiles, errors = profile(folder, out_dir, label=label, workers=a.workers,
                                                     anonymize_assembly_names=a.anonymize_assembly_names or None,
-                                                    tier=a.level, project_depth=a.project_depth, hash_mode=a.hash_mode,
-                                                    archive_mode=a.archives, archive_budget_gb=a.archive_budget_gb)
+                                                    tier=a.level, project_depth=a.project_depth,
+                                                    archive_mode=a.archives, archive_budget_gb=a.archive_budget_gb,
+                                                    resume=not a.fresh, metrics_interval=a.metrics_interval,
+                                                    system_info=not a.no_system_info, chunk_files=a.chunk_files)
     except SystemExit as e:
         print(e)
         return 1
@@ -696,6 +915,8 @@ def main(argv=None):
         print(f"\nSomething went wrong. Please send us this file: {log}")
         return 1
     print(f"\nDone: {nproj} folders, {nfiles:,} files" + (f", {errors} unreadable" if errors else ""))
+    if LAST_RUN.get("stats_zip"):
+        print(f"Run statistics (timings + system info, safe to share): {os.path.basename(LAST_RUN['stats_zip'])}")
     if os.environ.get("PROFILER_IN_DOCKER"):  # /out is the container's view; the user knows it as ./output
         print(f"\nPlease send us this ONE file (in the 'output' folder next to run-docker):\n  {os.path.basename(zip_path)}")
     else:

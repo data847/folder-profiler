@@ -18,7 +18,8 @@ STEP = "ISO-10303-21;\nHEADER;\nFILE_NAME('a','2026',(''),(''),'','FreeCAD','');
 with tempfile.TemporaryDirectory() as t:
     src = os.path.join(t, "parent")
     # Mech: 3 parts (two byte-identical), 1 assembly, 1 slddrw + 1 dwg, 2 step, 2 pdf, 1 png, junk, 1 unmapped
-    for i, body in enumerate([b"a", b"a", b"b"]): put(src, f"Mech/p{i}.sldprt", body)
+    # identical files share size+date; different content gets a different size (duplicates are judged without hashing)
+    for i, body in enumerate([b"a", b"a", b"bb"]): put(src, f"Mech/p{i}.sldprt", body)
     put(src, "Mech/sub/top.sldasm"); put(src, "Mech/d1.slddrw"); put(src, "Mech/d2.dwg", b"AC1027....")
     put(src, "Mech/m1.step", STEP); put(src, "Mech/m2.step", STEP + "\n"); put(src, "Mech/r1.pdf", b"%PDF-1"); put(src, "Mech/r2.pdf", b"%PDF-2")
     put(src, "Mech/pic.png", b"\x89PNG\r\n\x1a\n"); put(src, "Mech/.DS_Store"); put(src, "Mech/odd.weird", "?")
@@ -59,7 +60,9 @@ with tempfile.TemporaryDirectory() as t:
     mech = [a for a in rows.asm if a[0] == "Mech"]
     check("Mech estimate rows sum to project totals (parts, 2D, PDF, neutral)", tuple(sum(a[i] for a in mech) for i in (2, 3, 4, 5)), (3, 2, 0, 2))
     check("Mech row carries the real assembly name recorded by profiler 1.2", mech[0][1], "top.sldasm")
-    check("projects without assemblies get no rows", {a[0] for a in rows.asm}, {"Mech"})
+    check("projects without an assembly file get one summary row each (never an empty tab)",
+          sorted((a[0], a[1]) for a in rows.asm if a[1].startswith("(no assembly")), [("Arch", "(no assembly file in this project)"), ("Elec", "(no assembly file in this project)")])
+    check("Mech's rows are its real assembly", {a[0] for a in rows.asm if not a[1].startswith("(no assembly")}, {"Mech"})
     check("review says ESTIMATE", any("ESTIMATE" in x[2] for x in review), True)
     # uneven split: 7 parts over 3 assemblies -> 3,2,2 summing to 7
     check("split_evenly(7,3)", cp.split_evenly(7, 3), [3, 2, 2])

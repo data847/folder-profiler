@@ -47,7 +47,7 @@ with tempfile.TemporaryDirectory() as t:
         sevenz = False
 
     def run(**kw):
-        z, *_ = fp.profile(src, os.path.join(t, "out" + str(len(os.listdir(t)))), log=lambda *_: None, workers=1, hash_mode="all", **kw)
+        z, *_ = fp.profile(src, os.path.join(t, "out" + str(len(os.listdir(t)))), log=lambda *_: None, workers=1, **kw)
         return rows(z)
 
     f, info, links, dirs = run(tier=2, archive_mode="full")
@@ -59,10 +59,9 @@ with tempfile.TemporaryDirectory() as t:
            "backup.zip!/old/p1.sldprt", "backup.zip!/old/p2.sldprt", "backup.zip!/old/readme.txt",
            "t.tar.gz!/d/x.slddrw"])
     check("archive column says which kind", sorted({r["archive"] for r in arch}), ["7z", "tar", "zip"] if sevenz else ["tar", "zip"])
-    loose = next(r for r in f if r["rel_path"] == "loose/p1.sldprt")
     inz = next(r for r in f if r["rel_path"].endswith("backup.zip!/old/p1.sldprt"))
-    check("fingerprint of a file inside the zip equals its loose copy (sha256 + format)", (inz["sha256"] == loose["sha256"] != "", inz["header_signature"] == loose["header_signature"]), (True, True))
-    check("sha256 is the real content hash", inz["sha256"], hashlib.sha256(PART).hexdigest())
+    check("no hashing anywhere: Files.csv has no sha256 column", ("sha256" in f[0], info["hashing"]), (False, "none"))
+    check("a plain archived part is listed (name, size) but never read", (inz["archive"], inz["header_signature"], int(inz["size_bytes"])), ("zip", "ARCHIVED", len(PART)))
     check("level 2: references read from an assembly INSIDE the zip", sorted(l["child"] for l in links if l["ext"] == "sldasm"), ["p1.sldprt", "p2.sldprt"])
     check("archive folders exist in the folder tree, chained under the folder holding the archive",
           any(d["name"] == "backup.zip" for d in dirs) and any(d["name"] == "nested.zip" for d in dirs), True)
@@ -70,12 +69,12 @@ with tempfile.TemporaryDirectory() as t:
     check("Run_info reports the archive work", (info["archives_mode"], int(info["archive_entries"]) >= 8), ("full", True))
     if sevenz:
         s7 = next(r for r in f if r["rel_path"].endswith("c.7z!/s.step"))
-        check("7z: listed (names/sizes) but not read", (s7["archive"], s7["sha256"], s7["header_signature"]), ("7z", "", "ARCHIVED"))
+        check("7z: listed (names/sizes) but not read", (s7["archive"], s7["header_signature"]), ("7z", "ARCHIVED"))
 
     f0, info0, *_ = run(tier=0, archive_mode="full")
     check("level 0: entries present but no names recorded", ("rel_path" in f0[0], sum(1 for r in f0 if r["archive"]) >= 8), (False, True))
     fl, infol, *_ = run(tier=1, archive_mode="list")
-    check("list mode: entries listed, nothing decompressed (no sha256)", ({r["sha256"] for r in fl if r["archive"] and r["archive"] != "7z" and r["ext"] != "txt"}, any(r["archive"] for r in fl)), ({""}, True))
+    check("list mode: entries listed, nothing decompressed", ({r["header_signature"] for r in fl if r["archive"]}, any(r["archive"] for r in fl)), ({"ARCHIVED"}, True))
     foff, infooff, *_ = run(tier=1, archive_mode="off")
     check("off mode: archives are just files again", (sum(1 for r in foff if r["archive"]), infooff["archives_mode"]), (0, "off"))
     fb, infob, *_ = run(tier=2, archive_mode="full", archive_budget_gb=0.0000001)

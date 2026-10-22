@@ -86,3 +86,56 @@ rar,ARCHIVE,,,
 gz,ARCHIVE,,,
 tar,ARCHIVE,,,
 (none),OTHER,,,
+pwd,ASSEMBLY,SolidEdge,,Solid Edge weldment (an assembly-type document)
+jt,NEUTRAL3D,,,JT visualization / neutral 3D
+sat,NEUTRAL3D,,,ACIS neutral 3D
+sab,NEUTRAL3D,,,ACIS neutral 3D (binary)
+3dxml,NEUTRAL3D,,,CATIA / 3DEXPERIENCE neutral 3D
+cgr,NEUTRAL3D,,,CATIA graphical representation
+wrl,NEUTRAL3D,,,VRML
+dae,NEUTRAL3D,,,Collada
+fbx,NEUTRAL3D,,,
+x3d,NEUTRAL3D,,,
+dgn,DRAWING,,,MicroStation drawing
+dwfx,DRAWING,AutoCAD,,
+bak,DATA,,,backup copy (often of a DWG) - not counted as a drawing
+old,DATA,,,backup copy
+cfg,DATA,,,configuration / settings (OLE storage in Solid Edge folders), not a model
+dwl,DATA,,,AutoCAD lock file
+dwl2,DATA,,,AutoCAD lock file
+dwt,DATA,,,AutoCAD template
+ctb,DATA,,,AutoCAD plot style
+stb,DATA,,,AutoCAD plot style
+pc3,DATA,,,AutoCAD plotter configuration
+atc,DATA,,,AutoCAD tool palette
+lxds,DATA,,,
+srp,DATA,,,
+rpt,DATA,,,report file
+ipj,DATA,,,Inventor project file
+ipn,DATA,Inventor,,Inventor presentation (exploded view) - not a model
+dll,DATA,,,software
+exe,DATA,,,software
+ocx,DATA,,,software
+lib,DATA,,,software
+exp,DATA,,,software
+ilk,DATA,,,software
+manifest,DATA,,,
+lnk,DATA,,,shortcut
+lck,DATA,,,lock file
+err,DATA,,,
+inf,DATA,,,
+bat,DATA,,,
+js,DATA,,,
+php,DATA,,,
+ico,DATA,,,
+mpr,DATA,,,
+hcg,DATA,,,
+sev,DATA,,,
+tmp,DATA,,,temporary file
+z$w,DATA,,,temporary file
+mp4,IMG,,,video
+wmv,IMG,,,video
+mov,IMG,,,video
+avi,IMG,,,video
+mkv,IMG,,,video
+iso,ARCHIVE,,,disk image

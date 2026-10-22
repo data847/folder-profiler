@@ -58,7 +58,7 @@ HEADINGS = ["Project Name", "Project Description", "Domain", "Native CAD Softwar
 ASSEMBLY_HEADINGS = ["Project Name", "Assembly File Name", "Part Files", "Native 2D Drawings",
                      "PDF Drawings", "Neutral 3D Files"]
 FILE_HEADER = ["project", "ext", "class", "native_software", "domain", "size_bytes", "modified_utc", "sha256",
-               "header_signature", "duplicate_of_earlier_file", "in_archive", "archive_duplicate_not_counted"]
+               "header_signature", "duplicate_of_earlier_file", "in_archive", "archive_duplicate_not_counted", "dedupe_key"]
 STATS_HEADER = ["project", "files_total", "unique_hashes", "duplicate_files", "parts", "assemblies",
                 "native_2d_drawings", "neutral_3d", "pdf", "simulation", "documents", "data", "images",
                 "archive_other", "unmapped", "total_bytes", "counted_as", "files_in_archives", "archive_duplicates_not_counted",
@@ -68,7 +68,48 @@ NATIVE = {"PART", "ASSEMBLY", "DRAWING"}      # only these name the "Native CAD 
 REPORT_WORDS = re.compile(r"report|spec|manual|datasheet|data.?sheet|catalog|brochure|invoice|quot|certificate|summary|presentation|"
                           r"assessment|breakdown|change.?log|verification|proposal|minutes|checklist|offer|\bbom\b|readme", re.I)
 DRAWING_WORDS = re.compile(r"drawing|\bdrg\b|\bdwg\b|layout|sheet|assy|detail|schematic|arrangement", re.I)
+NO_ASSEMBLY_ROW = "(no assembly file in this project)"
 EMPTY_SHA = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+
+VERSIONED_EXTS = {"prt", "asm", "drw", "frm", "lay", "mfg", "sec", "dgm"}      # Creo / Pro-E: part.prt.7
+SIG_FALLBACK = (("STEP:", "NEUTRAL3D"), ("IFC:", "NEUTRAL3D"), ("IGES:", "NEUTRAL3D"), ("DXF:", "DRAWING"), ("DWG:", "DRAWING"),
+                ("PDF", "DOC"), ("ZIP", "ARCHIVE"), ("GZIP", "ARCHIVE"), ("7Z", "ARCHIVE"), ("PNG", "IMG"), ("JPEG", "IMG"),
+                ("GIF", "IMG"), ("BMP", "IMG"), ("TIFF", "IMG"), ("SIM:", "SIM"), ("MESH:", "SIM"), ("VTK:", "SIM"))
+
+
+def derive_ext(ext, rel):
+    """Old profiles recorded Creo versions as '.7'; when the file name is known, recover the real type ('.prt')."""
+    if ext.isdigit() and rel:
+        base = rel.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+        inner = base.rsplit(".", 1)[-1].lower() if "." in base else ""
+        if inner in VERSIONED_EXTS:
+            return inner
+    return ext
+
+
+def class_from_signature(sig):
+    """When the extension is not in the table: classify by what the file starts with (STEP, DXF, PDF, ZIP ...)."""
+    for prefix, cls in SIG_FALLBACK:
+        if sig.startswith(prefix):
+            return cls
+    return None
+
+
+def dedupe_keys(size, mtime, sha, name, archive, ext=""):
+    """-> (primary, secondary) keys used to spot duplicate files WITHOUT hashing contents:
+         profile with sha256 (older profiler)   primary = that exact hash
+         loose file                             primary = type + size + modified date, secondary = file name + size
+         file inside an archive                 primary = file name + size (zip dates are too coarse to compare)
+       The secondary key lets an archived file be matched with a loose copy. Empty files are never duplicates."""
+    if size <= 0:
+        return "", ""
+    sec = f"ad:{name}:{size}" if name else ""
+    if sha:
+        return "sha:" + sha, sec
+    if archive:
+        return sec, sec
+    return f"sd:{ext}:{size}:{mtime}", sec           # two different file types are never duplicates of each other
 
 
 def read_csv(text_or_path):
@@ -103,7 +144,7 @@ def load_profiles(paths):
     zips = []
     for p in paths:
         p = Path(p)
-        zips += sorted(p.glob("*.zip")) if p.is_dir() else [p]
+        zips += sorted(z for z in p.glob("*.zip") if not z.name.startswith("run_stats_")) if p.is_dir() else [p]
     runs = []
     for z in zips:
         with zipfile.ZipFile(z) as zf:
@@ -131,6 +172,8 @@ def compile_runs(runs, ext_map, soft, unique, pdf_mode, estimate=False, project_
                  unique_scope="project", copies="flag"):
     names = collections.Counter(p for r in runs for p in {f["project"] for f in r["files"]})
     per_project, unmapped = {}, collections.Counter()
+    sig_classified = collections.Counter()
+    unmapped_info = collections.defaultdict(lambda: [0, 0, set(), collections.Counter()])
     for ri, run in enumerate(runs):
         lk = collections.defaultdict(lambda: {"native": set(), "names": set(), "step": collections.defaultdict(set)})
         for l in run.get("links", []):
@@ -143,26 +186,38 @@ def compile_runs(runs, ext_map, soft, unique, pdf_mode, estimate=False, project_
         folder = run["info"].get("folder_name", run["zip"])
         for f in run["files"]:
             proj = f["project"] if names[f["project"]] == 1 else f"{folder}/{f['project']}"
-            ext = f["ext"].lower()
+            rel = f.get("rel_path", "")
+            ext = derive_ext(f["ext"].lower(), rel)
             m = ext_map.get(ext)
             cls = m["class"] if m else "UNMAPPED"
+            by_signature = False
             if not m:
-                unmapped[(proj, ext)] += 1
+                fb = class_from_signature(f["header_signature"])
+                if fb:
+                    cls, by_signature = fb, True
+                    sig_classified[ext] += 1
+                else:
+                    unmapped[(proj, ext)] += 1
+                    unmapped_info[ext][0] += 1
+                    unmapped_info[ext][1] += int(f["size_bytes"])
+                    unmapped_info[ext][2].add(proj)
+                    unmapped_info[ext][3][f["header_signature"]] += 1
             sw = (m["software"] if m else "") if cls in NATIVE else ""
             tool = tool_in_tag(f["header_signature"]) if cls in ("NEUTRAL3D", "SIM") else ""
             domain = (m["domain"] if m else "") or (soft[sw]["domain"] if sw in soft else "")
             P = per_project.setdefault(proj, {"hashes": set(), "rows": [], "parents": {}})
             P["parents"] = run.get("parents", {})
-            sha = f["sha256"]
-            dup = bool(sha) and sha in P["hashes"] and sha != EMPTY_SHA      # blank = not hashed (smart hashing) = unique
-            if sha:
-                P["hashes"].add(sha)
-            rel = f.get("rel_path", "")
-            nm = rel.rsplit("/", 1)[-1] if rel else (f.get("asm_name", "") or "")
+            sha = f.get("sha256", "")
+            size = int(f["size_bytes"])
+            rel_name = rel.rsplit("/", 1)[-1] if rel else ""
+            prim, sec = dedupe_keys(size, f["modified_utc"], sha, rel_name.lower(), f.get("archive", ""), ext)
+            dup = bool(prim) and prim in P["hashes"]
+            P["hashes"].update(k for k in (prim, sec) if k)
+            nm = rel_name if rel else (f.get("asm_name", "") or "")
             P["rows"].append(dict(project=proj, ext=ext, cls=cls, sw=sw, tool=tool, domain=domain,
-                                  size=int(f["size_bytes"]), modified=f["modified_utc"], sha=sha,
+                                  size=size, modified=f["modified_utc"], sha=sha, keys=(prim, sec), fp=prim if prim.startswith(("sha:", "sd:")) else "",
                                   sig=f["header_signature"], dup=dup, dir=f.get("dir_id", ""), asm=f.get("asm_name", ""),
-                                  name=nm, stem=stem(nm) if nm else "", pdfdraw=False, archive=f.get("archive", ""),
+                                  name=nm, stem=stem(nm) if nm else "", rel=rel, pdfdraw=False, archive=f.get("archive", ""),
                                   adup=dup and bool(f.get("archive", "")),
                                   lk=lk.get((f["project"], int(f["file_no"])))))
 
@@ -183,10 +238,9 @@ def compile_runs(runs, ext_map, soft, unique, pdf_mode, estimate=False, project_
                 G = per_project.setdefault(gname, {"hashes": set(), "rows": [], "parents": P["parents"]})
                 for r in grows:
                     r["project"] = gname
-                    r["dup"] = bool(r["sha"]) and r["sha"] in G["hashes"] and r["sha"] != EMPTY_SHA
+                    r["dup"] = bool(r["keys"][0]) and r["keys"][0] in G["hashes"]
                     r["adup"] = r["dup"] and bool(r["archive"])
-                    if r["sha"]:
-                        G["hashes"].add(r["sha"])
+                    G["hashes"].update(k for k in r["keys"] if k)
                     G["rows"].append(r)
             review.append([proj, "project split", f"split into {len(groups)} sub-projects by root assembly (an assembly no other assembly "
                            f"references, plus everything it references): " + ", ".join(sorted(g.split(" / ", 1)[-1] for g in groups)[:12])
@@ -197,10 +251,10 @@ def compile_runs(runs, ext_map, soft, unique, pdf_mode, estimate=False, project_
         for proj in sorted(per_project, key=lambda p: (-len(per_project[p]["rows"]), p.lower())):
             mine = set()
             for r in per_project[proj]["rows"]:
-                if r["sha"] and r["sha"] != EMPTY_SHA:
-                    if r["sha"] in seen_all:
+                if r["fp"]:
+                    if r["fp"] in seen_all:
                         r["dup"] = True
-                    mine.add(r["sha"])
+                    mine.add(r["fp"])
             seen_all |= mine
     compiled, file_rows, stats, assemblies = [], [], [], []
     for proj in sorted(per_project, key=str.lower):
@@ -208,7 +262,7 @@ def compile_runs(runs, ext_map, soft, unique, pdf_mode, estimate=False, project_
         file_rows += rows
         if proj in copy_of and copies == "exclude":
             orig, share, nfiles = copy_of[proj]
-            review.append([proj, "possible copy", f"EXCLUDED from Project Compiled: {share:.0%} of its {nfiles} fingerprinted files are identical to files in '{orig}'"])
+            review.append([proj, "possible copy", f"EXCLUDED from Project Compiled: {share:.0%} of its {nfiles} files match files in '{orig}'"])
             continue
         counted = [r for r in rows if not ((unique and r["dup"]) or r["adup"])]
         n = collections.Counter(r["cls"] for r in counted)
@@ -241,7 +295,7 @@ def compile_runs(runs, ext_map, soft, unique, pdf_mode, estimate=False, project_
 
         compiled.append([proj, "", domain, sw_names, n["PART"], n["ASSEMBLY"], n["DRAWING"], pdf_drawings,
                          n["NEUTRAL3D"], t2d, t3d])
-        stats.append([proj, len(rows), len({r["sha"] for r in rows if r["sha"]}) + sum(1 for r in rows if not r["sha"]), sum(r["dup"] for r in rows), n["PART"],
+        stats.append([proj, len(rows), len({r["keys"][0] for r in rows if r["keys"][0]}) + sum(1 for r in rows if not r["keys"][0]), sum(r["dup"] for r in rows), n["PART"],
                       n["ASSEMBLY"], n["DRAWING"], n["NEUTRAL3D"], n["PDF"], n["SIM"], n["DOC"], n["DATA"],
                       n["IMG"], n["ARCHIVE"] + n["OTHER"], n["UNMAPPED"], sum(r["size"] for r in rows),
                       ("unique hashes (whole profile)" if unique_scope == "all" else "unique hashes (per project)") if unique else "all files",
@@ -253,7 +307,7 @@ def compile_runs(runs, ext_map, soft, unique, pdf_mode, estimate=False, project_
                            "already present in this project, so not counted again; 7z/rar are listed only and have no fingerprint)"])
         if proj in copy_of and copies == "flag":
             orig, share, nfiles = copy_of[proj]
-            review.append([proj, "possible copy", f"{share:.0%} of its {nfiles} fingerprinted files are identical to files in '{orig}' - likely a "
+            review.append([proj, "possible copy", f"{share:.0%} of its {nfiles} files match files in '{orig}' (same size and modified date, or identical content when the profile has hashes) - likely a "
                            "backup or copy; counts include it (use --copies exclude to drop it, --unique --unique-scope all to count each content once)"])
 
         if domain == "Unclassified":
@@ -286,12 +340,28 @@ def compile_runs(runs, ext_map, soft, unique, pdf_mode, estimate=False, project_
         elif n["ASSEMBLY"]:
             review.append([proj, "assembly breakdown", f"{n['ASSEMBLY']} assembly file(s): Assembly Breakdown tab left empty "
                            "(needs assembly file names and which parts belong to each; --estimate-assemblies gives an even-split estimate)"])
-        elif estimate and (n["PART"] or n["DRAWING"] or n["NEUTRAL3D"]):
-            review.append([proj, "assembly breakdown", "no assembly files, so its parts/drawings are not attributed to any estimate row "
-                           "(Assembly Breakdown rows will not sum to this project's totals)"])
+        elif estimate and (n["PART"] or n["DRAWING"] or n["NEUTRAL3D"] or pdf_drawings):
+            assemblies.append([proj, NO_ASSEMBLY_ROW, n["PART"], n["DRAWING"], pdf_drawings, n["NEUTRAL3D"]])
+            review.append([proj, "assembly breakdown", f"this project has no assembly file, so ONE summary row ('{NO_ASSEMBLY_ROW}') carries its "
+                           f"{n['PART']} parts, {n['DRAWING']} drawings, {pdf_drawings} PDF drawings and {n['NEUTRAL3D']} neutral files; the tab adds "
+                           "up to the project totals"])
+            confidence_rows.append({"project": proj, "confidence": "n/a", "why": "no assembly file in this project: one summary row, no assembly structure",
+                                    **{h: 0 for h in CONFIDENCE_HEADER[3:19]}, "unresolved_examples": ""})
     for (proj, ext), k in sorted(unmapped.items()):
         review.append([proj, "unmapped extension", f".{ext} x{k} - add it to extensions.csv"])
-    return compiled, file_rows, stats, review, assemblies, {"rows": evidence_rows, "projects": confidence_rows}
+    total_n = sum(len(P["rows"]) for P in per_project.values())
+    unm_n = sum(v[0] for v in unmapped_info.values())
+    unm_b = sum(v[1] for v in unmapped_info.values())
+    tot_b = sum(r["size"] for P in per_project.values() for r in P["rows"]) or 1
+    sig_n = sum(sig_classified.values())
+    review.insert(0, ["(all projects)", "categorisation",
+                      f"{total_n - sig_n - unm_n:,} of {total_n:,} files ({100 * (total_n - sig_n - unm_n) / max(1, total_n):.1f}%) classified by extension, "
+                      f"{sig_n:,} by file content (unknown extension but a recognisable STEP/DXF/DWG/PDF/ZIP/... start), {unm_n:,} unmapped "
+                      f"({100 * unm_b / tot_b:.1f}% of bytes) - see Unmapped_Extensions.csv"
+                      + (f"; by content: {', '.join(f'.{e} x{k}' for e, k in sig_classified.most_common(5))}" if sig_n else "")])
+    unm_rows = [[e, v[0], round(v[1] / 1e6, 1), len(v[2]), "; ".join(f"{t} x{k}" for t, k in v[3].most_common(3))]
+                for e, v in sorted(unmapped_info.items(), key=lambda kv: -kv[1][0])]
+    return compiled, file_rows, stats, review, assemblies, {"rows": evidence_rows, "projects": confidence_rows, "unmapped": unm_rows}
 
 
 EVIDENCE_HEADER = ["project", "assembly", "refs_total", "refs_resolved", "refs_external", "refs_ambiguous", "refs_unresolved", "parts_link", "parts_folder",
@@ -301,9 +371,12 @@ CONFIDENCE_HEADER = ["project", "confidence", "why", "assemblies", "parts", "par
                      "others_link", "others_name", "others_folder_or_even", "unresolved_examples"]
 
 
+UNMAPPED_HEADER = ["ext", "files", "MB", "projects", "header_tags_seen"]
+
+
 def file_row(r):
     return [r["project"], r["ext"], r["cls"], r["sw"], r["domain"], r["size"], r["modified"], r["sha"], r["sig"],
-            "yes" if r["dup"] else "", r["archive"], "yes" if r["adup"] else ""]
+            "yes" if r["dup"] else "", r["archive"], "yes" if r["adup"] else "", r["fp"] or r["keys"][0]]
 
 
 def write_csvs(out, compiled, file_rows, stats, review, assemblies=(), evidence=None):
@@ -316,6 +389,8 @@ def write_csvs(out, compiled, file_rows, stats, review, assemblies=(), evidence=
     dump("Review.csv", ["project", "topic", "detail"], review)
     if assemblies:
         dump("Assembly_Breakdown_ESTIMATE.csv", ASSEMBLY_HEADINGS, assemblies)
+    if evidence and evidence.get("unmapped"):
+        dump("Unmapped_Extensions.csv", UNMAPPED_HEADER, evidence["unmapped"])
     if evidence and evidence["projects"]:
         dump("Assembly_Evidence.csv", EVIDENCE_HEADER, [[r[h] for h in EVIDENCE_HEADER] for r in evidence["rows"]])
         dump("Assembly_Confidence.csv", CONFIDENCE_HEADER, [[r[h] for h in CONFIDENCE_HEADER] for r in evidence["projects"]])
@@ -344,6 +419,9 @@ def write_workbook(path, compiled, file_rows, stats, review, assemblies=(), evid
         [wc.append([r[h] for h in CONFIDENCE_HEADER]) for r in evidence["projects"]]; style(wc)
         we = wb.create_sheet("Assembly Evidence"); we.append(EVIDENCE_HEADER)
         [we.append([r[h] for h in EVIDENCE_HEADER]) for r in evidence["rows"]]; style(we)
+    if evidence and evidence.get("unmapped"):
+        wu = wb.create_sheet("Unmapped Extensions"); wu.append(UNMAPPED_HEADER)
+        [wu.append(r) for r in evidence["unmapped"]]; style(wu)
     wr = wb.create_sheet("Review"); wr.append(["project", "topic", "detail"]); [wr.append(r) for r in review]; style(wr)
     wb.save(path)
 

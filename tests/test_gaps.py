@@ -35,7 +35,7 @@ with tempfile.TemporaryDirectory() as t:
     src = os.path.join(t, "parent")
     put(src, "Proj/Top.sldasm", sw_file(["own.sldprt", "std_bolt.sldprt", "nowhere.sldprt"])); put(src, "Proj/own.sldprt", "own part")
     put(src, "Library/std_bolt.sldprt", "standard bolt")
-    z = profile(src, t, "o", tier=2, hash_mode="all")
+    z = profile(src, t, "o", tier=2)
     *_x, ev = comp(z, False, "auto", True)
     e = {x["project"]: x for x in ev["projects"]}["Proj"]
     check("reference to a part in another top-level folder now resolves (external), the missing one stays unresolved",
@@ -51,7 +51,7 @@ with tempfile.TemporaryDirectory() as t:
         zf.writestr("old/a.sldprt", "part a" * 9)                    # identical to the loose a.sldprt -> must not count twice
         zf.writestr("old/b.sldprt", "part b is only inside the zip")  # exists nowhere else -> counts
         zf.writestr("old/Sub.sldasm", sw_file(["b.sldprt"]))          # archived assembly with a reference to an archived part
-    z = profile(src, t, "o", tier=2, hash_mode="all")
+    z = profile(src, t, "o", tier=2)
     c, f, s, rev, asm, ev = comp(z, False, "auto", True)
     pc = {r[0]: r for r in c}["P"]
     check("parts: loose a + archived b counted; archived duplicate of a NOT counted again", pc[4], 2)
@@ -69,22 +69,28 @@ with tempfile.TemporaryDirectory() as t:
         put(src, f"Orig/f{i}.sldprt", ("part %d " % i) * (i + 3))
     for i in range(25):
         put(src, f"Orig backup/f{i}.sldprt", ("part %d " % i) * (i + 3))   # identical copy of 25 files
+        st = os.stat(os.path.join(src, f"Orig/f{i}.sldprt"))
+        os.utime(os.path.join(src, f"Orig backup/f{i}.sldprt"), (st.st_atime, st.st_mtime))   # a real copy keeps the modified date
     for i in range(5):
         put(src, f"Orig backup/new{i}.sldprt", "new only here " * (40 + i))
-    z = profile(src, t, "o", tier=0)                                # default smart hashing
-    files = list(csv.DictReader(io.StringIO(zipfile.ZipFile(z).read("Files.csv").decode("utf-8-sig"))))
-    cp_rows = [r for r in files if r["project"] == "Orig backup" and r["ext"] == "sldprt"]
-    check("smart hashing compares sizes across the WHOLE run (copy files are fingerprinted)", (sum(1 for r in cp_rows if r["sha256"]), len(cp_rows)), (25, 30))
+    for i in range(25):                                              # a second backup made by a tool that did NOT keep the dates
+        put(src, f"Orig restored/f{i}.sldprt", ("part %d " % i) * (i + 3))
+        st = os.stat(os.path.join(src, f"Orig/f{i}.sldprt"))
+        os.utime(os.path.join(src, f"Orig restored/f{i}.sldprt"), (st.st_atime + 7200, st.st_mtime + 7200))   # new modified date
+    z = profile(src, t, "o", tier=0)                                # no hashing: duplicates are found by size + modified date
+    info = {r["key"]: r["value"] for r in csv.DictReader(io.StringIO(zipfile.ZipFile(z).read("Run_info.csv").decode("utf-8-sig")))}
+    check("the profile was made without hashing", info["hashing"], "none")
     c, f, s, rev, asm, ev = comp(z, False, "auto", False)
     flagged = [r for r in rev if r[1] == "possible copy"]
-    check("backup flagged as a probable copy of the original (83%)", (len(flagged), flagged[0][0] if flagged else None, "83%" in (flagged[0][2] if flagged else "")), (1, "Orig backup", True))
+    check("backup that kept its dates is flagged as a probable copy of the original (83%)", ([r[0] for r in flagged], "83%" in flagged[0][2]), (["Orig backup"], True))
+    check("KNOWN LIMIT: a copy whose dates were reset is not recognised without hashing (not flagged)", "Orig restored" in [r[0] for r in flagged], False)
     st = {r[0]: r for r in s}
     check("Project_Stats names the original and the share", (st["Orig backup"][-2], st["Orig backup"][-1], st["Orig"][-2]), ("Orig", "83%", ""))
-    names, rv = cli(z); check("default: copy is flagged but still counted (nothing silently dropped)", sorted(r[0] for r in names), ["Orig", "Orig backup"])
-    names, rv = cli(z, "--copies", "exclude"); check("--copies exclude drops it from Project Compiled", sorted(r[0] for r in names), ["Orig"])
+    names, rv = cli(z); check("default: copy is flagged but still counted (nothing silently dropped)", sorted(r[0] for r in names), ["Orig", "Orig backup", "Orig restored"])
+    names, rv = cli(z, "--copies", "exclude"); check("--copies exclude drops the flagged copy from Project Compiled", sorted(r[0] for r in names), ["Orig", "Orig restored"])
     n_all = {r[0]: int(r[4]) for r in cli(z, "--unique", "--unique-scope", "all")[0]}
     n_proj = {r[0]: int(r[4]) for r in cli(z, "--unique")[0]}
-    check("--unique (per project): both projects keep their parts", n_proj, {"Orig": 30, "Orig backup": 30})
-    check("--unique --unique-scope all: shared content counted once in the whole profile", n_all, {"Orig": 30, "Orig backup": 5})
+    check("--unique (per project): every project keeps its parts", n_proj, {"Orig": 30, "Orig backup": 30, "Orig restored": 25})
+    check("--unique --unique-scope all: matching files counted once in the whole profile (reset dates stay counted)", n_all, {"Orig": 30, "Orig backup": 5, "Orig restored": 25})
     names, rv = cli(z, "--copies", "keep"); check("--copies keep: no detection output", "possible copy" in rv, False)
 sys.exit(1 if any(bad) else 0)

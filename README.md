@@ -1,7 +1,7 @@
 # Folder Profiler
 
 Measures a folder of CAD/engineering projects and writes **metrics only** — file extensions, sizes, dates,
-a SHA-256 fingerprint and a short format tag per file, plus anonymous folder ids. It never copies, uploads or stores
+and a short format tag per file, plus anonymous folder ids (no file is ever hashed). It never copies, uploads or stores
 file contents, folder names, or paths below the project name. The one exception is **assembly files** (`.sldasm .asm
 .iam .catproduct`): their file names are recorded (or replaced by codes `ASM-3F9A1C2B.SLDASM` with
 `--anonymize-assembly-names` / the UI tick box) so the *Assembly Breakdown* tab can be estimated by folder. Standard library only; no network code; files are opened read-only.
@@ -17,24 +17,36 @@ Two pieces:
 
 | Level | Records | Gives the compiler |
 |---|---|---|
-| **0** (default) | extensions, sizes, dates, SHA-256 (smart: only where it can matter), anonymous folder ids, assembly file names | folder-based assembly estimate |
+| **0** (default) | extensions, sizes, dates, format tag, anonymous folder ids, assembly file names | folder-based assembly estimate |
 | **1** | + names and relative paths of every file and folder (`rel_path`, `Dirs.csv` names) | PDF drawings by name, drawings/neutral files matched to parts and assemblies by name, real project names at any depth |
 | **2** | + `Links.csv`: the *names* of files referenced inside assemblies, drawings and STEP files | **real part-to-assembly links** for SolidWorks, Solid Edge and Inventor assemblies and STEP structure |
 
-`--level 0|1|2`, `--project-depth N` (projects = folders N levels down), `--hash smart|all`; in the UI these are on the page.
+`--level 0|1|2`, `--project-depth N` (projects = folders N levels down, any N); in the UI these are on the page.
 Level 2 reads each assembly/drawing/STEP file once and keeps only referenced **file names** (no geometry, text or properties);
 it needs `cad_links.py` next to `file_profiler.py`. Unreadable formats (CATIA, Creo, NX ...) simply fall back to name/folder grouping.
 Levels 1-2 disclose client names, so they need the data owner's agreement.
 
+## Resume, run statistics, scale
+
+- **Streaming + resumable.** Each project is processed in chunks of 5,000 files that are saved to `<out>/.resume/<run id>/` as they finish; stop the run
+  any way you like (even `kill -9`) and start it again with the same settings: finished projects and chunks are skipped, nothing is read twice, and the final
+  output is identical to an uninterrupted run (tested). `--fresh` ignores saved progress. A folder that changed meanwhile is flagged in the log.
+- **No depth limit.** Folders are walked iteratively with no depth cap (tested 150 levels; Windows long paths via `\\?\`); `--project-depth` accepts any N;
+  directory links / junctions are not followed (and counted).
+- **Run statistics** (`run_stats_*.zip`, also inside the profile zip): `Run_phases.csv` (wall time per step + busy seconds per activity), `Run_metrics.csv`
+  (CPU %, memory, files/s, MB/s, process read speed every 5 s), `Run_log.csv` (events, written as they happen so a crash keeps them) and `System_info.csv`
+  (OS, CPU, RAM, disk type, antivirus state on Windows). No host name, user name or paths. Windows probes use ctypes/PowerShell and are untested here;
+  macOS and Linux probes were tested.
+
 ## Archives, duplicates and references across folders
 
 - **Archives** (`--archives full|list|off`, default `full`): `.zip` and `.tar(.gz/.bz2/.xz)` are opened in memory (also zip-in-zip, 2 levels); their
-  CAD files become normal rows (`archive` column = zip/tar; names shown as `<archive>!/<inner path>` at level >= 1) and are fingerprinted like loose
-  files, and at level 2 archived assemblies are searched for references. `.7z` and `.rar` are listed only (names, sizes), through `bsdtar`
+  CAD files become normal rows (`archive` column = zip/tar; names shown as `<archive>!/<inner path>` at level >= 1) and, at level 2, archived assemblies are searched for references. `.7z` and `.rar` are listed only (names, sizes), through `bsdtar`
   (libarchive; Windows 10+ ships it as `tar.exe`; included in the Docker image). Nothing is extracted to disk; `--archive-budget-gb` (default 20) caps
   the decompression per run. An archived file identical to one already in the same project is not counted again.
-- **Smart hashing is run-wide**: a size that occurs only once in the whole run cannot have a copy anywhere, so it is not read; everything else is
-  fingerprinted, which is what makes copies of whole projects in other folders detectable.
+- **No hashing at all** (1.6): file contents are never fingerprinted. The compiler recognises duplicates by **type + size + modified date** (and, for
+  archived files, name + size); older profiles that still carry a `sha256` column keep exact matching. Measured on a real 162,409-file CAD drive: 97.4%
+  of the files it calls duplicates really are, and it finds 94.4% of the true duplicates; copies whose dates were reset are missed.
 - **Whole-project copies** are flagged by the compiler (>= 80% of a project's files identical to a bigger project; `Review.csv` +
   `Project_Stats.csv`). `--copies exclude` drops them from Project Compiled, `--unique --unique-scope all` counts each content once in the whole profile.
 - **References to other folders** (shared standard-parts libraries, sibling projects) now resolve across the whole profile; they are reported as
@@ -75,7 +87,7 @@ macOS: `run.command`.
 
 ## What is in the zip
 
-`Files.csv` (project, file_no, ext, size_bytes, modified_utc, depth, sha256, header_signature, dir_id, asm_name) ·
+`Files.csv` (project, file_no, ext, size_bytes, modified_utc, depth, header_signature, dir_id, asm_name) ·
 `Dirs.csv` (anonymous folder tree) · `Projects.csv` · `Extensions.csv` · `Run_info.csv` (version, OS, mode native/docker, totals, errors) · a plain-language note.
 
 `header_signature` is built only from fixed vocabularies, e.g. `STEP:AP214:SolidWorks`, `IFC:IFC4:Revit`,

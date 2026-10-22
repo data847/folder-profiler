@@ -2,7 +2,7 @@
 recorded METHOD, report how trustworthy that is, and (optionally) split a folder into sub-projects by root assembly.
 Standard library only. Pure functions over the row dicts built by compile_profiles.py.
 
-Row keys used: cls, ext, name, stem, dir, sha, pdfdraw, lk ({"names": {...}, "native": {...stems}, "step": {parent_stem: {kids}}}).
+Row keys used: cls, ext, name, stem, dir, fp, pdfdraw, lk ({"names": {...}, "native": {...stems}, "step": {parent_stem: {kids}}}).
 """
 import collections
 import re
@@ -21,6 +21,12 @@ def stem(name, strip_ext=True):
     n = re.sub(r"[\s_\-]*\(\d+\)$|[\s_\-]*(copy|kopie)( of)?$|^copy of[\s_\-]*", "", n)
     n = re.sub(r"[\s_\-]*(rev|ver|v|r)[\s_\-]*\d+[a-z]?$", "", n)
     return re.sub(r"[\s_\-]+", "", n) or plain        # "R1.par" / "v2.par" / "(1).par": keep the name, never ""
+
+
+def skey(r):
+    """Stable ordering of files that share a name: by their own properties (path, date, size) before the run-specific folder id, so the
+    same data always compiles to the same output."""
+    return (r["name"].lower(), r.get("rel", ""), r.get("modified", ""), r.get("size", 0), r["dir"])
 
 
 def split_evenly(total, k):
@@ -64,7 +70,7 @@ def resolve(rows, parents, universe=None):
     """Resolve the references recorded inside assembly / drawing / STEP files to real files of this project.
 
     A reference is matched by exact file name first, then by comparable name (stem). Several candidates (copies in different
-    folders): the one in the nearest folder wins; if their contents are identical (same sha256) it does not matter which, otherwise
+    folders): the one in the nearest folder wins; if their contents are identical (same size and date, or same hash) it does not matter which, otherwise
     the reference is counted as ambiguous. Returns {"edges": {id(assembly): {id(target): target}}, "info": {id(assembly): stats},
     "model_of": {id(drawing): target}}."""
     models = [r for r in rows if r["cls"] in ("PART", "ASSEMBLY") and r["name"]]
@@ -91,10 +97,10 @@ def resolve(rows, parents, universe=None):
         if len(cands) == 1:
             return cands[0], False
         dist = lambda c: tree_distance(here, c["dir"], parents, cache)
-        best = min(cands, key=lambda c: (dist(c), c["name"].lower(), c["dir"]))
+        best = min(cands, key=lambda c: (dist(c), c["name"].lower(), c.get("rel", ""), c["dir"]))
         tied = [c for c in cands if dist(c) == dist(best)]       # copies equally near: only these make the choice a guess
-        shas = {c["sha"] for c in tied}
-        return best, len(tied) > 1 and not (len(shas) == 1 and "" not in shas)
+        fps = {c.get("fp", "") for c in tied}                 # same size + date (or same hash) = the same file for our purposes
+        return best, len(tied) > 1 and not (len(fps) == 1 and "" not in fps)
 
     step_refs = collections.defaultdict(set)             # id(assembly) -> child stems learned from STEP product structure
     for s in rows:
@@ -153,7 +159,7 @@ def assign_assemblies(proj, counted, parents, universe=None):
       spread  nothing above has one: shared evenly by the nearest assemblies below
       even    no folder ids: an even split over the project's assemblies
     evidence = {"rows": [per assembly dict], "project": dict incl. confidence High/Medium/Low}."""
-    asm = sorted((r for r in counted if r["cls"] == "ASSEMBLY"), key=lambda r: (r["name"] or r["asm"] or "~", r["dir"], r["ext"]))
+    asm = sorted((r for r in counted if r["cls"] == "ASSEMBLY"), key=lambda r: (r["name"] or r["asm"] or "~", r.get("rel", ""), r.get("modified", ""), r.get("size", 0), r["dir"], r["ext"]))
     if not asm:
         return [], "", None
     k = len(asm)
@@ -367,10 +373,10 @@ def split_by_structure(proj, rows, parents, min_files=25, with_reason=False, uni
     comp = _scc(adj)                                                                 # mutual references form one component
     has_in = {comp[t] for i, ts in adj.items() for t in ts if comp[t] != comp[i]}
     reps = {}
-    for a in sorted(asm, key=lambda r: (r["name"].lower(), r["dir"])):
+    for a in sorted(asm, key=skey):
         if comp[id(a)] not in has_in:
             reps.setdefault(comp[id(a)], a)                                            # one root per component (first by name)
-    roots = sorted(reps.values(), key=lambda r: (r["name"].lower(), r["dir"]))
+    roots = sorted(reps.values(), key=skey)
     child_asm = {id(a) for a in asm} - {id(r) for r in roots}
     if len(roots) < 2:
         return none("fewer than two root assemblies")
@@ -454,7 +460,7 @@ def detect_copies(per_project, min_files=20, threshold=0.8, common_limit=20):
     for proj, P in per_project.items():
         rows = [r for r in P["rows"] if r["size"] > 0]
         total[proj] = len(rows)
-        cnt[proj] = collections.Counter(r["sha"] for r in rows if r["sha"] and r["sha"] != EMPTY_SHA)
+        cnt[proj] = collections.Counter(r["fp"] for r in rows if r.get("fp"))
         for h in cnt[proj]:
             holders[h].append(proj)
     overlap = collections.Counter()

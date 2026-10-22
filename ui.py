@@ -61,6 +61,7 @@ li span.n{flex:1}pre{margin:0;max-height:220px;overflow:auto;font-size:13px;whit
 <div style="margin-top:8px"><label>Projects are&nbsp;<input type="number" id="depth" value="1" min="1" max="6" style="width:60px"> level(s) below the chosen folder</label>
 <span class="mut"> (1 = each folder directly inside it; use 2 if it holds containers such as DESIGN)</span></div>
 <label style="display:block;margin-top:8px"><input type="checkbox" id="arch" checked> Look inside archives <span class="mut">(.zip and .tar.gz are opened; .7z and .rar are listed only. Nothing is extracted to disk.)</span></label>
+<label style="display:block;margin-top:8px"><input type="checkbox" id="fresh"> Start from scratch <span class="mut">(normally a stopped run continues where it stopped; tick this to ignore saved progress)</span></label>
 <label style="display:block;margin-top:8px" id="anonrow"><input type="checkbox" id="anon"> Hide assembly file names <span class="mut">(use codes like ASM-3F9A1C2B.SLDASM instead of the real names)</span></label>
 <div class="row" style="margin-top:8px"><button id="go">Start profiling</button></div>
 <div class="bar" id="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100"><i id="barfill"></i></div><div class="mut" id="barlabel" style="margin-top:6px"></div>
@@ -88,7 +89,7 @@ $("up").onclick=()=>ls($("up").dataset.parent);$("p").onchange=()=>ls($("p").val
 $("go").onclick=async()=>{$("res").textContent="";$("bar").style.display="none";$("barlabel").textContent="";
  if(mode=="pick"&&!sel.length){$("res").innerHTML="<span class='er'>Tick at least one folder first.</span>";return}
  $("go").disabled=true;
- const o={anon:$("anon").checked,tier:+$("lvl").value,depth:+$("depth").value,arch:$("arch").checked};
+ const o={anon:$("anon").checked,tier:+$("lvl").value,depth:+$("depth").value,arch:$("arch").checked,fresh:$("fresh").checked};
  const body=mode=="pick"?{t:T,paths:sel,...o}:{t:T,path:$("p").value,...o};
  const r=await fetch("/api/start",{method:"POST",body:JSON.stringify(body)});const j=await r.json();
  if(j.error){$("res").innerHTML="<span class='er'>"+esc(j.error)+"</span>";$("go").disabled=false;return}poll()};
@@ -107,7 +108,8 @@ function bar(j){const p=j.progress,b=$("bar");
 async function poll(){const j=await (await fetch("/api/status?t="+T)).json();bar(j);$("log").textContent=j.log.join("\n");$("log").scrollTop=1e9;
  if(j.state=="running"){setTimeout(poll,700);return}$("go").disabled=false;
  if(j.state=="done")$("res").innerHTML="<span class='ok'>Done: "+j.result.projects+" folders, "+j.result.files.toLocaleString()+" files"+(j.result.errors?", "+j.result.errors+" unreadable":"")+
-  ".</span><br><br><a class='btn' href='/api/download?t="+T+"'>Download metrics zip</a> <span class='mut'>"+esc(j.result.name)+"</span>";
+  ".</span><br><br><a class='btn' href='/api/download?t="+T+"'>Download metrics zip</a> <span class='mut'>"+esc(j.result.name)+"</span><br><br>"+
+  "<a class='btn' style='background:var(--ac)' href='/api/download_log?t="+T+"'>Download run statistics</a> <span class='mut'>timings and your machine's speed - no file or folder names, safe to share</span>";
  else if(j.state=="error")$("res").innerHTML="<span class='er'>"+esc(j.error)+"</span>"}
 const HELP={0:"Records extensions, sizes, dates and fingerprints, anonymous folder ids, and the names of assembly files only (tick below to hide those).",
  1:"Level 0 plus the names and relative paths of every file and folder. No file contents.",
@@ -118,7 +120,7 @@ renderSel();ls("");
 </script></body></html>"""
 
 
-def _run(path, folders=None, anon=False, tier=0, depth=1, arch=True):
+def _run(path, folders=None, anon=False, tier=0, depth=1, arch=True, fresh=False):
     def log(msg):
         with LOCK:
             STATE["log"].append(msg.rstrip())
@@ -130,10 +132,11 @@ def _run(path, folders=None, anon=False, tier=0, depth=1, arch=True):
         label = os.environ.get("PROFILER_FOLDER_NAME") if IN_DOCKER and path == DATA_ROOT else None
         zip_path, nproj, nfiles, errors = fp.profile(path, OUT_DIR, log=log, label=label, folders=folders, progress=progress,
                                                       anonymize_assembly_names=anon, tier=tier, project_depth=depth,
-                                                      archive_mode="full" if arch else "off")
+                                                      archive_mode="full" if arch else "off", resume=not fresh)
+        sz = fp.LAST_RUN.get("stats_zip") or ""
         with LOCK:
-            STATE.update(state="done", result={"path": zip_path, "name": os.path.basename(zip_path),
-                                               "projects": nproj, "files": nfiles, "errors": errors})
+            STATE.update(state="done", result={"path": zip_path, "name": os.path.basename(zip_path), "stats_path": sz,
+                                               "stats_name": os.path.basename(sz), "projects": nproj, "files": nfiles, "errors": errors})
     except SystemExit as e:
         with LOCK:
             STATE.update(state="error", error=str(e))
@@ -142,7 +145,8 @@ def _run(path, folders=None, anon=False, tier=0, depth=1, arch=True):
         with open(os.path.join(OUT_DIR, "error_log.txt"), "w") as f:
             f.write(fp.scrub_paths(traceback.format_exc(), path))
         with LOCK:
-            STATE.update(state="error", error="Something went wrong. Please send us output/error_log.txt")
+            STATE.update(state="error", error="The run stopped. Everything finished so far is saved: click Start profiling again (same settings) and it "
+                                              "continues where it stopped. If it keeps failing, send us output/error_log.txt")
 
 
 def _in_data(p):
@@ -194,14 +198,23 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/status":
             with LOCK:
                 return self._json(STATE)
-        if u.path == "/api/download":
+        if u.path in ("/api/download", "/api/download_log"):
             with LOCK:
                 res = STATE.get("result")
-            if not res:
+            key = ("stats_path", "stats_name") if u.path.endswith("_log") else ("path", "name")
+            if not res or not res.get(key[0]) or not os.path.exists(res[key[0]]):
                 return self._send(404, "no result", "text/plain")
-            with open(res["path"], "rb") as f:
-                return self._send(200, f.read(), "application/zip",
-                                  {"Content-Disposition": f'attachment; filename="{res["name"]}"'})
+            size = os.path.getsize(res[key[0]])
+            self.send_response(200)
+            self.send_header("Content-Type", "application/zip"); self.send_header("Content-Length", str(size))
+            self.send_header("Content-Disposition", f'attachment; filename="{res[key[1]]}"'); self.end_headers()
+            with open(res[key[0]], "rb") as f:                     # streamed: the zip can be hundreds of MB
+                while True:
+                    chunk = f.read(1 << 20)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+            return
         self._send(404, "not found", "text/plain")
 
     def do_POST(self):
@@ -232,7 +245,7 @@ class Handler(BaseHTTPRequestHandler):
             STATE.update(state="running", log=[], result=None, error=None,
                          progress={"phase": "scan", "files": 0, "total_files": 0, "bytes": 0, "total_bytes": 0})
         threading.Thread(target=_run, args=(path, folders or None, bool(body.get("anon")), int(body.get("tier") or 0), int(body.get("depth") or 1),
-                                                          body.get("arch", True) is not False), daemon=True).start()
+                                                          body.get("arch", True) is not False, bool(body.get("fresh"))), daemon=True).start()
         self._json({"ok": True})
 
 

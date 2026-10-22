@@ -28,7 +28,7 @@ with tempfile.TemporaryDirectory() as t1, tempfile.TemporaryDirectory() as t2:
     check("only assembly files carry a name", sorted(r["asm_name"] for r in asm_rows) == ["Sub.sldasm", "Top.sldasm"])
     check("non-assembly rows have an empty asm_name", all(r["asm_name"] == "" for r in files if r["ext"] != "sldasm"))
     check("no folder name or part file name anywhere", not any(m.encode() in blob for m in (TOP, SUB, LOOSE, PART)))
-    check("Run_info says names are real", info["assembly_names"] == "real" and info["tool_version"] == "1.5")
+    check("Run_info says names are real", info["assembly_names"] == "real" and info["tool_version"] == "1.6")
     ids = {r["dir_id"] for r in files}
     check("every file's dir_id exists in Dirs.csv", ids <= {d["dir_id"] for d in dirs})
     by_id = {d["dir_id"]: d for d in dirs}

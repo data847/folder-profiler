@@ -100,9 +100,7 @@ with tempfile.TemporaryDirectory() as t:
     check("project depth 2 -> Big/Alpha and Big/Beta are separate projects", {"Big/Alpha", "Big/Beta"} <= projs, True)
     links = rd2("Links.csv")
     check("links: Main.sldasm -> gear and shaft parts", sorted(l["child"] for l in links if l["project"] == "Big/Alpha" and l["ext"] == "sldasm"), ["gear.sldprt", "shaft.sldprt"])
-    check("smart hashing skipped something, nothing lost", (int(i2["files_hash_skipped"]) > 0, int(i2["files_hashed"]) + int(i2["files_hash_skipped"])), (True, len(rd2("Files.csv"))))
-    _z, rdA, _n, iA = run(tier=2, project_depth=2, hash_mode="all")
-    check("--hash all hashes every file", iA["files_hash_skipped"], "0")
+    check("no hashing: Run_info says so and Files.csv has no sha256 column", (i2["hashing"], "sha256" in rd2("Files.csv")[0]), ("none", False))
 
     # ---------- compiler on the level-2 profile
     if cp is None:

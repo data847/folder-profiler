@@ -13,7 +13,7 @@ description: >-
 
 # Profile Compile (Folder Profiler zips → "Projects Compiled" workbook)
 
-The Folder Profiler collects **raw metrics only** (extension, size, date, SHA-256, a short format
+The Folder Profiler collects **raw metrics only** (extension, size, date, a short format
 tag per file; no names, no contents, no paths below the project). This skill turns those metrics
 into the project-level sheet. Every classification decision (part / assembly / drawing / neutral,
 software, domain) is made here, from editable tables, never in the profiler.
@@ -70,7 +70,7 @@ names are the real file names (level ≥ 1, or assembly files at level 0) or `AS
 Projects with no assembly files get no rows. Also written as `Assembly_Breakdown_ESTIMATE.csv`.
 
 **How references are resolved** (level 2): a reference is matched to a real file by exact name, then by comparable name; if copies
-exist in several folders the one in the nearest folder wins, and identical copies (same hash) are interchangeable. A reference is
+exist in several folders the one in the nearest folder wins, and identical copies (same type, size and date - or same hash in older profiles) are interchangeable. A reference is
 counted *ambiguous* only when differing copies are equally near. References to files that are not in the project (library parts,
 other drives, stale names) are *unresolved* and reported.
 
@@ -78,11 +78,13 @@ other drives, stale names) are *unresolved* and reported.
 sibling projects) resolve across the whole profile (`refs_external` in `Assembly_Evidence.csv` / `Assembly_Confidence.csv`; they count as resolved
 and the part is counted in the project it lives in, not in the referencing one).
 
-**Archives:** files found inside archives are ordinary rows (`in_archive` = zip / tar / 7z / rar in `File_Level.csv`). One identical (same sha256) to a
-file already in the same project is **not counted again** (`archive_duplicate_not_counted`); `Review.csv` says how many. 7z/rar entries are listed only
-(no fingerprint), so they cannot be matched or deduplicated.
+**No hashing (profiler 1.6+):** duplicates are judged by type + size + modified date for loose files and by file name + size for archived files (names needed: level >= 1; at level 0 archived files are never matched). Profiles from older profilers that carry `sha256` still use the exact hash. Say "approximate" whenever you quote unique counts or copy detection from a no-hash profile.
 
-**Copies:** a project with >= 80% of its files identical (same sha256) to a bigger project is flagged `possible copy` in `Review.csv` and
+**Archives:** files found inside archives are ordinary rows (`in_archive` = zip / tar / 7z / rar in `File_Level.csv`). One with the same file name and size as a file already in the same project
+(loose or in an earlier archive; needs names = level >= 1) is **not counted again** (`archive_duplicate_not_counted`); `Review.csv` says how many. At level 0 archived files
+carry no name, so they are always counted. 7z/rar entries are listed only (no read) but are matched by name + size the same way.
+
+**Copies:** a project with >= 80% of its files identical (same type, size and modified date; exact hash in older profiles) to a bigger project is flagged `possible copy` in `Review.csv` and
 `Project_Stats.csv` (`possible_copy_of`, `copy_share`) — counts still include it by default. `--copies exclude` drops such projects from Project Compiled;
 `--unique` counts each content once per project, `--unique --unique-scope all` once in the whole profile. Mention copies whenever the totals look large,
 and ask which treatment the sheet wants.
@@ -106,12 +108,12 @@ from assembly file names and that the number of projects changed versus the fold
 folder ids, assembly file names); **1** + names and relative paths of all files/folders (`rel_path`); **2** + `Links.csv`
 (names of files referenced inside assemblies, drawings and STEP). Higher levels give better results but disclose names — tell
 the user which level a profile has and what that limits. Profiles may also use `--project-depth N` (projects = folders N levels
-down; project names then look like `DESIGN/ProjectA`) and *smart hashing* (blank `sha256` = not hashed because it cannot be a
+down; project names then look like `DESIGN/ProjectA`) and *no hashing* (profiler 1.6+ has no `sha256` column; older profiles with one keep exact matching; a blank `sha256` = not hashed because it cannot be a
 duplicate; the compiler treats blank as unique).
 
 ## Decisions to surface (never pick silently)
 
-1. **Counting rule** — default counts every file; `--unique` counts each content hash once per project
+1. **Counting rule** — default counts every file; `--unique` counts each file once per project, judging duplicates by type + size + modified date (approximate: 97% of what it calls a duplicate is one and it finds 94% of true duplicates on the real D: data; copies with reset dates are missed)
    (identical files repeat across e.g. `1_Pre`/`2_Post`; SET-09 parts: 44 all vs 23 unique). When they
    differ, report both and ask which the sheet should use.
 2. **PDF Drawings** — at level 0 a profile has no file names, so PDFs cannot be told apart and the count is 0 (Review lists
@@ -121,6 +123,16 @@ duplicate; the compiler treats blank as unique).
    appear in `Review` as "other tools seen", not in the column. Quote that line to the user.
 4. **Single-file formats** (`rvt rfa skp 3dm f3d fcstd`) are counted as parts — say so when they occur.
 5. Simulation, document, data, image and archive files are not counted in any sheet column.
+
+## Categorisation and empty tabs
+
+- Classes come from `scripts/mapping/extensions.csv` (140 extensions, built from real CAD folders: Solid Edge `.pwd` weldments are assemblies, `.jt/.sat/.3dxml/.cgr` neutral 3D,
+  `.dgn` drawings, `.bak/.cfg/.dwl/.dwt/.dll/...` data, media as images). Creo version suffixes (`part.prt.7`) are resolved to `.prt`.
+- If an extension is unknown the file is classified by its **content tag** (STEP/IFC/IGES -> neutral 3D, DXF/DWG -> drawing, PDF -> document, ZIP -> archive ...). `Review.csv` has one
+  `categorisation` line (how many by extension / by content / unmapped, and the % of bytes) and `Unmapped_Extensions.csv` lists what is still unknown with the tags seen - propose
+  table rows for it.
+- **Assembly Breakdown is never empty for a project with CAD files:** a project with no assembly file gets one row named `(no assembly file in this project)` holding its parts, drawings, PDF drawings
+  and neutral files, so the tab adds up to the project totals; `Assembly_Confidence.csv` marks it `n/a`. A project with no CAD files at all adds no row.
 
 ## Editing the rules
 

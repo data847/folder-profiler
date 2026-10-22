@@ -18,7 +18,24 @@ In the browser page (run-ui) step 3 has "Detail level":
 Levels 1 and 2 reveal your file and folder names - use them only if you are happy to share those.
 "Projects are N level(s) below the chosen folder": use 2 if your chosen folder contains big container
 folders (for example DESIGN) whose sub-folders are the real projects.
-Command line: --level 0|1|2  --project-depth N  --hash smart|all
+Command line: --level 0|1|2  --project-depth N   (N can be any number)
+
+IF THE RUN STOPS - IT RESUMES
+Big folders take a long time. If the tool stops for any reason (crash, power cut, restart, Ctrl+C), start it again with the same
+settings and the same folder: it continues from the last saved point, not from the beginning. Progress is saved after every few
+thousand files in the "output" folder (a hidden ".resume" folder) and removed when the run finishes. To ignore it and start over,
+tick "Start from scratch" on the page (or use --fresh). If files were added or removed in between, the tool says so in the log.
+
+RUN STATISTICS (safe to share)
+Every run also produces run_stats_...zip (and a "Download run statistics" button on the page). It contains the time each step took,
+a sample of your computer's CPU, memory and reading speed every 5 seconds during the run, and a short description of the machine
+(Windows version, processor, memory, type of disk, whether antivirus real-time scanning is on). It contains no file names, folder
+names, computer name or user name. Send it to us if we ask how your machine performed.
+
+NOTHING IS HASHED
+The tool never computes fingerprints of your files and never reads a file in full (except, at level 2, the assembly, drawing and
+STEP files whose references are listed). Duplicate files are recognised by their size and modified date instead.
+All sub-folders are included, however deeply they are nested.
 
 LOOKING INSIDE ARCHIVES (.zip, .tar.gz, .7z, .rar)
 By default the tool also opens archives to see the CAD files inside, because those are part of your projects.
