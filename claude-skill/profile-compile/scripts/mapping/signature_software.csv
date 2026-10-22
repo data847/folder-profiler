@@ -1,0 +1,6 @@
+sig,software,note
+OLE2:SolidEdge,SolidEdge,verified on real Solid Edge .par/.asm/.dft files
+OLE2:Inventor,Inventor,entry names RSeDb/RSeSegInfo - not yet checked on real Inventor files
+OLE2:Revit,Revit,entry name BasicFileInfo - not yet checked on real Revit files
+CATIA:V5,CATIA,file starts with V5_CFV2 - not yet checked on real CATIA files
+CREO,Creo,file starts with #UGC: - not yet checked on real Creo files

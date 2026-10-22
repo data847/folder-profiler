@@ -68,7 +68,7 @@ except ImportError:
 import sysmetrics
 from sysmetrics import now_utc
 
-VERSION = "1.6"
+VERSION = "1.7"
 HEAD_BYTES = 4096            # header peek for every file
 DXF_SCAN_BYTES = 1_048_576   # DXF only: scan up to 1 MB for 3D entity names (flag only, text discarded)
 
@@ -97,9 +97,9 @@ TEXT_FORMATS = [  # (lowercase pattern in first 4 KB, tag) - first match wins; t
     (b"$meshformat", "MESH:GMSH"),
     (b"<vtkfile", "VTK:XML"),
 ]
-LINK_READ_EXTS = {"sldasm", "asm", "iam", "slddrw", "dft", "idw", "step", "stp"}   # level 2: assemblies, drawings, STEP
+LINK_READ_EXTS = {"sldasm", "asm", "pwd", "iam", "slddrw", "dft", "idw", "step", "stp", "catproduct", "catdrawing", "drw", "prt"}   # level 2: assemblies, drawings, STEP
 ENTRY_LINK_MAX = 128 * 1024 * 1024      # level 2: archived assemblies/drawings/STEP up to this size are searched for references
-ASSEMBLY_EXTS = {"sldasm", "asm", "iam", "catproduct"}   # the only files whose NAME is recorded (Assembly Breakdown tab)
+ASSEMBLY_EXTS = {"sldasm", "asm", "pwd", "iam", "catproduct"}   # the only files whose NAME is recorded (Assembly Breakdown tab)
 SYSTEM_JUNK = {".ds_store", "thumbs.db", "desktop.ini", "ehthumbs.db"}  # OS clutter, not project files
 MAGICS = [  # (prefix, tag)
     (b"%PDF", "PDF"), (b"\x89PNG\r\n\x1a\n", "PNG"), (b"\xff\xd8\xff", "JPEG"), (b"GIF8", "GIF"),
@@ -107,6 +107,14 @@ MAGICS = [  # (prefix, tag)
     (b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1", "OLE2"), (b"SQLite format 3", "SQLITE"),
     (b"MZ", "WINEXE"), (b"\x7fELF", "ELF"), (b"II*\x00", "TIFF"), (b"MM\x00*", "TIFF"),
     (b"RIFF", "RIFF"), (b"<?xml", "XML"), (b"{\\rtf", "RTF"),
+    (b"V5_CFV2", "CATIA:V5"), (b"#UGC:", "CREO"),     # CATIA V5 and Pro/ENGINEER-Creo native files start with these (not yet checked on real files)
+]
+OLE_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+OLE_APPS = [  # (entry names inside an OLE2 compound file, tag): the closed list that tells the CAD / Office applications apart
+    ({"PSMroots", "PSMclustertable", "PSMuserroots", "JSitesList", "PartsLiteData", "DocVersion2", "BuildVersions", "JBlocks"}, "OLE2:SolidEdge"),
+    ({"RSeDb", "RSeSegInfo", "RSeStorage"}, "OLE2:Inventor"),
+    ({"BasicFileInfo", "RevitPreview4.0"}, "OLE2:Revit"),
+    ({"WordDocument", "Workbook", "PowerPoint Document"}, "OLE2:Office"),
 ]
 
 
@@ -131,9 +139,35 @@ def signature_stream(f, ext, size):
         return "UNREADABLE"
 
 
+def _ole_tag(f, head):
+    """Which application wrote an OLE2 compound file: the entry names of its directory (read from the file, only the names are
+    compared with a fixed list; nothing is kept). 'OLE2' when the directory is unreadable or the application is not on the list."""
+    try:
+        shift = int.from_bytes(head[0x1E:0x20], "little")
+        dir_start = int.from_bytes(head[0x30:0x34], "little")
+        if shift not in (9, 12) or dir_start >= 0xFFFFFFF0:
+            return "OLE2"
+        ss = 1 << shift
+        f.seek((dir_start + 1) * ss)
+        raw = f.read(64 * 1024)
+        names = set()
+        for i in range(0, len(raw) - 127, 128):
+            n = int.from_bytes(raw[i + 0x40:i + 0x42], "little")
+            if 2 <= n <= 64:
+                names.add(raw[i:i + n - 2].decode("utf-16le", "ignore"))
+        for wanted, tag in OLE_APPS:
+            if names & wanted or (tag == "OLE2:SolidEdge" and any(x.startswith("JSite") for x in names)):
+                return tag
+    except Exception:
+        pass
+    return "OLE2"
+
+
 def _signature_file(f, ext):
     head = f.read(HEAD_BYTES)
     low = head.lower()
+    if head.startswith(OLE_MAGIC):
+        return _ole_tag(f, head)
     if b"iso-10303-21" in low[:64]:                       # STEP / Part 21
         ap = "AP"
         m = re.search(rb"file_schema\s*\(\s*\(\s*'([^']*)'", low)
@@ -269,6 +303,29 @@ def walk_dirs(base, recurse, on_error, counts):
                 stack.append((e.path, e.name if rel == "." else rel + os.sep + e.name, depth + 1))
 
 
+def chunk_fingerprints(base, recurse, chunk_files):
+    """Stat-only pass (no file is opened): one crc per chunk of files over their relative path, size and modified time. The same
+    formula is used when a chunk is saved, so a resumed run can tell whether a saved project still matches the disk."""
+    fps, cur, n = [], 0, 0
+    for _dirpath, rel, _depth, files in walk_dirs(lp(base), recurse, lambda e: None, collections.Counter()):
+        for e in files:
+            if e.name.lower() in SYSTEM_JUNK or e.name.startswith("._"):
+                continue
+            n += 1
+            try:
+                st = e.stat()
+                relpath = e.name if rel == "." else (rel + os.sep + e.name).replace(os.sep, "/")
+                cur = zlib.crc32(f"{relpath}\0{st.st_size}\0{iso(st.st_mtime)}\n".encode("utf-8", "surrogatepass"), cur)
+            except OSError:
+                pass
+            if n % chunk_files == 0:
+                fps.append(cur)
+                cur = 0
+    if n % chunk_files:
+        fps.append(cur)
+    return fps
+
+
 CHUNK_FILES = 5000           # files per checkpoint: after a crash at most this many files of one project are redone
 _TEST_HOOK = None            # tests set this to a callable(unit_index, chunk_index) to simulate a crash after a chunk is saved
 
@@ -371,7 +428,7 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
     elapsed_before = man["elapsed"]
     salt = man["salt"]
 
-    def ident(*parts, n=10):
+    def ident(*parts, n=16):
         return hashlib.sha256((salt + "\0" + "\0".join(parts)).encode("utf-8", "surrogatepass")).hexdigest()[:n]
     dirs = {}                                           # dir_id -> (project, parent_dir_id, depth, name)
 
@@ -460,14 +517,25 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
                     + (["rel_path"] if tier >= 1 else []) + ["archive"])
 
         def link_rows(proj, n, ext, res):
-            if res[0] == "native":
-                return [[proj, n, ext, "native", "", c] for c in res[1]]
+            if res[0] in ("native", "scan"):
+                return [[proj, n, ext, res[0], "", c] for c in res[1]]
             return [[proj, n, ext, "step", par, c] for par, kids in res[1].items() for c in kids]
 
         # ================================================================= process each project, chunk by chunk
         for ui, (proj, base, recurse) in enumerate(units):
             u = man["units"][proj]
-            if u.get("complete"):
+            if u.get("complete") and resumed and u.get("fps") is not None:
+                t_v = time.time()
+                with act.timer("resume_verify"):
+                    same = chunk_fingerprints(base, recurse, chunk_files) == u["fps"]
+                if not same:
+                    u["complete"] = False                         # changed since it was saved: the chunk check below redoes what differs
+                    C["stale_projects"] += 1
+                    rlog.event("process", f"[{ui + 1}/{len(units)}] {proj}: changed since it was saved in an earlier run - checking it again", "WARN")
+                else:
+                    rlog.event("process", f"[{ui + 1}/{len(units)}] {proj}: unchanged since an earlier run ({time.time() - t_v:.1f}s check) - skipped")
+                    continue
+            elif u.get("complete"):
                 rlog.event("process", f"[{ui + 1}/{len(units)}] {proj}: already done in an earlier run - skipped")
                 continue
             t_unit = time.time()
@@ -477,26 +545,40 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
                 state["files"] += min(u.get("files", 0), chunks_done * chunk_files)
             n = 0
             pending, chunk_idx = [], 0
-            arch_jobs = []                                                    # (relpath, path, dir_id, depth) in walk order
+            arch_jobs = []                                                    # (relpath, path, dir_id, depth, size, mtime) in walk order
             wbase = lp(base)
 
             def flush_chunk():
                 nonlocal pending, chunk_idx
+                fp = 0                                   # what this chunk's files looked like (names, sizes, dates) when seen now
+                for e in pending:
+                    fp = zlib.crc32(f"{e[8]}\0{e[3]}\0{e[4]}\n".encode("utf-8", "surrogatepass"), fp)
+                fps = u.setdefault("fps", [])
                 if chunk_idx < chunks_done:
-                    chunk_idx += 1
-                    pending = []
-                    return
+                    if chunk_idx < len(fps) and fps[chunk_idx] == fp:
+                        chunk_idx += 1                   # same files as when it was saved: keep the saved rows
+                        pending = []
+                        return
+                    C["stale_chunks"] += 1               # the folder changed since this chunk was saved: profile it again
+                    state["files"] -= min(len(pending), state["files"])
+                    rlog.event("process", f"{proj}: chunk {chunk_idx + 1} was saved before the folder changed - profiled again", "WARN")
                 t_c = time.time()
 
                 def work(e):
                     path, name, ext, size, mtime, dir_id, depth, asm, relpath, nn = e
+                    if tier >= 2 and ext in LINK_READ_EXTS and cad_links is not None and size > 0:
+                        try:                                   # ONE open: the format tag and the references come from the same read
+                            with open(path, "rb") as fh:
+                                with act.timer("format_tag_read"):
+                                    sig = signature_stream(fh, ext, size)
+                                fh.seek(0)
+                                with act.timer("reference_read"):
+                                    res = cad_links.read_links_file(fh, ext, name, size)
+                        except OSError:
+                            return "UNREADABLE", None, True
+                        return sig, res, True
                     with act.timer("format_tag_read"):
                         sig = signature(path, ext, size)
-                    res = None
-                    if tier >= 2 and ext in LINK_READ_EXTS and cad_links is not None:
-                        with act.timer("reference_read"):
-                            res = cad_links.read_links(path, ext)
-                        return sig, res, True
                     return sig, None, False
 
                 rows, lrows = [], []
@@ -517,7 +599,9 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
                 with act.timer("write_checkpoint"):
                     _write_csv_atomic(os.path.join(state_dir, "rows", f"u{ui}_c{chunk_idx:06d}.csv"), rows)
                     _write_csv_atomic(os.path.join(state_dir, "links", f"u{ui}_c{chunk_idx:06d}.csv"), lrows)
-                    u["chunks_done"] = chunk_idx + 1
+                    del fps[chunk_idx:chunk_idx + 1]
+                    fps.insert(chunk_idx, fp)
+                    u["chunks_done"] = max(u.get("chunks_done", 0), chunk_idx + 1)
                     save_manifest()
                 rlog.event("process", f"{proj}: chunk {chunk_idx + 1} saved ({len(rows):,} files, {time.time() - t_c:.1f}s)")
                 if _TEST_HOOK:
@@ -532,27 +616,33 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
                     if name.lower() in SYSTEM_JUNK or name.startswith("._"):
                         continue
                     n += 1
-                    skip = (n - 1) // chunk_files < chunks_done
+                    relpath = name if rel == "." else (rel + os.sep + name).replace(os.sep, "/")
+                    try:
+                        st = e.stat()
+                    except OSError:
+                        C["errors"] += 1
+                        st = None
                     if archive_mode != "off" and archives.kind_of(name):
-                        relp = name if rel == "." else (rel + os.sep + name).replace(os.sep, "/")
-                        arch_jobs.append((relp, e.path, dir_id, depth))
-                    if not skip:
-                        try:
-                            st = e.stat()
-                        except OSError:
-                            C["errors"] += 1
-                            st = None
-                        if st is not None:
-                            ext = ext_of(name)
-                            asm = ""
-                            if ext in ASSEMBLY_EXTS:
-                                asm = (f"ASM-{ident(proj, rel, name, n=8).upper()}.{ext.upper()}" if anonymize_assembly_names else name)
-                            relpath = name if rel == "." else (rel + os.sep + name).replace(os.sep, "/")
-                            pending.append((e.path, name, ext, st.st_size, iso(st.st_mtime), dir_id, depth, asm, relpath, n))
+                        arch_jobs.append((relpath, e.path, dir_id, depth, st.st_size if st else -1, iso(st.st_mtime) if st else ""))
+                    if st is not None:
+                        ext = ext_of(name)
+                        asm = ""
+                        if ext in ASSEMBLY_EXTS:
+                            asm = (f"ASM-{ident(proj, rel, name, n=8).upper()}.{ext.upper()}" if anonymize_assembly_names else name)
+                        pending.append((e.path, name, ext, st.st_size, iso(st.st_mtime), dir_id, depth, asm, relpath, n))
                     if n % chunk_files == 0:
                         flush_chunk()
             if pending or (n and n % chunk_files):
                 flush_chunk()
+            if chunk_idx < u.get("chunks_done", 0):             # the project shrank: drop saved chunks past its new end
+                for k in range(chunk_idx, u["chunks_done"]):
+                    for sub in ("rows", "links"):
+                        try:
+                            os.remove(os.path.join(state_dir, sub, f"u{ui}_c{k:06d}.csv"))
+                        except OSError:
+                            pass
+                u["chunks_done"] = chunk_idx
+                del u.setdefault("fps", [])[chunk_idx:]
             n_loose = n
             if n != u.get("files", n):
                 C["changed_projects"] += 1
@@ -561,6 +651,19 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
             # ---- archives of this project (processed in batches, saved one archive at a time)
             a_done = u.get("archives_done", 0)
             counts_list = u.setdefault("arch_counts", [])
+            afp = zlib.crc32((f"{n_loose}\n" + "\n".join(f"{j[0]}\0{j[4]}\0{j[5]}" for j in arch_jobs)).encode("utf-8", "surrogatepass"))
+            if a_done and u.get("arch_fp") != afp:                            # archives changed since they were read: read them all again
+                C["stale_archives"] += 1
+                rlog.event("process", f"{proj}: the archives changed since they were saved - reading them again", "WARN")
+                for sub in ("rows", "links", "dirs"):
+                    for j in range(a_done):
+                        try:
+                            os.remove(os.path.join(state_dir, sub, f"u{ui}_a{j:06d}.csv"))
+                        except OSError:
+                            pass
+                a_done, u["archives_done"] = 0, 0
+                counts_list.clear()
+            u["arch_fp"] = afp
             base_n = n_loose + sum(counts_list[:a_done])
             for j in range(a_done):                                           # re-register folders of archives finished earlier
                 fpath = os.path.join(state_dir, "dirs", f"u{ui}_a{j:06d}.csv")
@@ -568,7 +671,7 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
                     for d in csv.reader(open(fpath, newline="", encoding="utf-8")):
                         dirs.setdefault(d[0], (proj, d[1], int(d[2]), d[3]))
             def arch_worker(job):
-                relp, apath, adir, adepth = job
+                relp, apath, adir, adepth = job[:4]
                 with act.timer("archive_listing"):
                     ents = archives.list_archive(apath)
                 if ents is None:
@@ -603,7 +706,7 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
             for b in range(0, len(todo), workers):
                 batch = todo[b:b + workers]
                 for job, ents, reads in pool.map(arch_worker, batch):
-                    relp, apath, adir, adepth = job
+                    relp, apath, adir, adepth = job[:4]
                     j = a_done
                     rows, lrows, adirs = [], [], {}
                     if ents is None:
@@ -763,7 +866,8 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
                 ["link_files_unreadable", C["link_unreadable"]], ["read_errors", C["errors"]],
                 ["unreadable_folders", C["dir_errors"]], ["linked_folders_skipped", walk_counts["links_skipped"]],
                 ["ignored_system_files", C["junk"] + sum(u.get("junk", 0) for u in man["units"].values())],
-                ["projects_changed_during_run", C["changed_projects"]], ["restarts_resumed", man["restarts"]],
+                ["projects_changed_during_run", C["changed_projects"]], ["projects_changed_between_restarts", C["stale_projects"]], ["chunks_redone_after_change", C["stale_chunks"]],
+                ["archive_sets_redone_after_change", C["stale_archives"]], ["restarts_resumed", man["restarts"]],
                 ["seconds", round(active, 1)], ["seconds_scan", round(man["prescan_s"], 1)], ["seconds_process", round(proc_s, 1)],
                 ["seconds_finalize", round(fin_s, 1)],
                 ["avg_MB_per_s", round(bytes_out / 1e6 / max(1.0, proc_s + man["prescan_s"]), 1)],

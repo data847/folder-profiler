@@ -23,7 +23,7 @@ ARCHIVES: .zip/.tar.gz files are opened to see the CAD files inside (nothing is 
 Untick "Look inside archives" on the page or use --archives off to skip them.
 
 IF IT STOPS (crash, power cut, Ctrl+C): just start it again with the same settings - it continues from the last saved point (progress is kept in
-output\.resume and deleted when the run finishes). Tick "Start from scratch" / use --fresh to ignore it.
+output\.resume and deleted when the run finishes). Tick "Start from scratch" / use --fresh to ignore it. Changed files are noticed and redone.
 
 RUN STATISTICS: every run also makes run_stats_*.zip (time per step, CPU / memory / read speed every 5 seconds, what machine it ran on - no file or
 folder names). Send it with your results if we ask how your machine performed.

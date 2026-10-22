@@ -47,6 +47,7 @@ with tempfile.TemporaryDirectory() as t:
     check("confidence High (9 of 10 parts by reference, 11 of 12 references resolve)", (p["confidence"], p["parts_link"], p["parts"], p["refs_resolved"], p["refs_total"]), ("High", 9, 10, 11, 12))
     check("unresolved reference reported by name", ("ghost.sldprt" in p["unresolved_examples"], p["refs_unresolved"]), (True, 1))
     check("shared library part is counted once and reported", p["shared_parts"], 1)
+    check("folder rule re-checked on the linked parts: here it agrees every time (8 of 8 with a folder to look in)", p["folder_rule_agrees"], "100% of 8 linked parts")
     check("orphan placed by folder, not by reference", p["parts_folder"], 1)
     check("copies in own folders are NOT ambiguous (nearest copy wins)", p["refs_ambiguous"], 0)
     evrow = {e["assembly"]: e for e in ev["rows"]}
@@ -113,6 +114,15 @@ with tempfile.TemporaryDirectory() as t:
     z, *_ = fp.profile(src, os.path.join(t, "out2"), log=lambda *_: None, workers=1, tier=2)
     names, has_asm, rev, _r = cli(z, "--min-project-files", "1")
     check("poor resolution (2 of 8 references): folder kept, reason reported", ("G" in names, any("G / R1" in n for n in names), "only 2 of 8 references resolve" in rev), (True, False, True))
+# ---- drafts / templates referenced from an assembly or drawing are not model references (seen in real Solid Edge drawings)
+with tempfile.TemporaryDirectory() as t:
+    src = os.path.join(t, "parent")
+    put(src, "P/Top.sldasm", sw_file(["a.sldprt", "ISO Draft.dft", "Template Sheet.dft"])); put(src, "P/a.sldprt", "part a")
+    z, *_ = fp.profile(src, os.path.join(t, "out"), log=lambda *_: None, workers=1, tier=2)
+    runs = cp.load_profiles([z]); ext_map, soft = cp.load_mapping(os.path.join(ROOT, "claude-skill", "profile-compile", "scripts", "mapping"))
+    *_x, ev = cp.compile_runs(runs, ext_map, soft, False, "auto", True)
+    e = ev["projects"][0]
+    check("references to drawings/templates are ignored: 1 real reference, resolved, High confidence", (e["refs_total"], e["refs_resolved"], e["confidence"]), (1, 1, "High"))
 # ---- edge cases found by review (each of these was wrong before)
 import stat
 with tempfile.TemporaryDirectory() as t:
@@ -166,4 +176,17 @@ with tempfile.TemporaryDirectory() as t:
         subprocess.run([sys.executable, os.path.join(ROOT, "claude-skill", "profile-compile", "scripts", "compile_profiles.py"), z, "--out", o, "--min-project-files", "1"], capture_output=True)
         outs.append([open(os.path.join(o, n), "rb").read() for n in ("Project_Compiled.csv", "Assembly_Breakdown_ESTIMATE.csv")])
     check("same data, two profiles, two compiles: identical Project Compiled and Assembly Breakdown", outs[0] == outs[1], True)
+
+# ---- the folder rule is measured against the references, and the number is honest when the folder rule would be wrong
+with tempfile.TemporaryDirectory() as t:
+    src = os.path.join(t, "parent")
+    Q = lambda rel, body=b"x": put(src, "Q/" + rel, body)
+    Q("X/X.sldasm", sw_file(["a1.sldprt", "a2.sldprt", "far.sldprt"])); Q("X/a1.sldprt", "a1"); Q("X/a2.sldprt", "a2!")
+    Q("Y/Z.sldasm", sw_file(["z1.sldprt"])); Q("Y/z1.sldprt", "z1"); Q("Y/far.sldprt", "far - lives next to Z but belongs to X")
+    z, *_ = fp.profile(src, os.path.join(t, "out"), log=lambda *_: None, workers=1, tier=2)
+    runs = cp.load_profiles([z]); ext_map, soft = cp.load_mapping(os.path.join(ROOT, "claude-skill", "profile-compile", "scripts", "mapping"))
+    _c, _f, _s, review, asm, ev = cp.compile_runs(runs, ext_map, soft, False, "auto", True)
+    p = ev["projects"][0]
+    check("a part that lives away from its assembly is assigned by reference (X has 3 parts)", {r[1]: r[2] for r in asm}, {"X.sldasm": 3, "Z.sldasm": 1})
+    check("folder rule would have got 3 of 4 right: reported as 75%", p["folder_rule_agrees"], "75% of 4 linked parts")
 sys.exit(1 if any(bad) else 0)

@@ -13,6 +13,8 @@ Output: Project_Compiled.csv, File_Level.csv, Project_Stats.csv, Review.csv, and
                                 --estimate-assemblies, ESTIMATED rows (see below)
           "File Level", "Project Stats", "Review"   supporting detail
 Local only: no network, no credentials. Reads zips, writes files.
+Scale: the profile is streamed one project at a time (memory = the biggest project, not the whole profile); File_Level, Assembly_Breakdown and
+Assembly_Evidence are split into parts of 1,000,000 rows (Excel's sheet limit is 1,048,576) and compiled.xlsx holds the first --xlsx-max-sheets of them.
 
 All classification lives in mapping/*.csv (next to this script) - edit those, not this file.
 Counting: every file by default; --unique counts each content hash once per project.
@@ -35,6 +37,7 @@ import argparse
 import collections
 import csv
 import io
+import itertools
 import re
 import sys
 import zipfile
@@ -43,6 +46,7 @@ from pathlib import Path
 
 try:
     from openpyxl import Workbook
+    from openpyxl.cell import WriteOnlyCell
     from openpyxl.styles import Font, PatternFill
     from openpyxl.utils import get_column_letter
 except ImportError:  # xlsx is a convenience; CSVs are always written
@@ -50,7 +54,7 @@ except ImportError:  # xlsx is a convenience; CSVs are always written
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))          # structure.py sits next to this file (also under `python -I`)
-from structure import (assign_assemblies, build_universe, detect_copies, split_by_structure, split_evenly, stem)  # noqa: E402,F401
+from structure import (assign_assemblies, build_universe, detect_copies, detect_copies_from, split_by_structure, split_evenly, stem)  # noqa: E402,F401
 
 HEADINGS = ["Project Name", "Project Description", "Domain", "Native CAD Software", "Part Files",
             "Assembly Files", "Native 2D Drawings", "PDF Drawings", "Neutral 3D Files",
@@ -112,6 +116,29 @@ def dedupe_keys(size, mtime, sha, name, archive, ext=""):
     return f"sd:{ext}:{size}:{mtime}", sec           # two different file types are never duplicates of each other
 
 
+class Row:
+    """One file of a profile. A __slots__ object instead of a dict: about a fifth of the memory per file, which is what lets a profile
+    with millions of files compile. Behaves like the dict the structure code was written for (r["x"], r.get("x"), r["x"] = v)."""
+    __slots__ = ("project", "ext", "cls", "sw", "tool", "domain", "size", "modified", "sha", "keys", "fp", "sig", "dup", "dir", "asm",
+                 "name", "stem", "rel", "pdfdraw", "archive", "adup", "lk")
+
+    def __init__(self, **kw):
+        for k, v in kw.items():
+            setattr(self, k, v)
+
+    def __getitem__(self, k):
+        return getattr(self, k)
+
+    def __setitem__(self, k, v):
+        setattr(self, k, v)
+
+    def get(self, k, default=None):
+        return getattr(self, k, default)
+
+
+_I = sys.intern
+
+
 def read_csv(text_or_path):
     text = text_or_path.read_text("utf-8-sig") if isinstance(text_or_path, Path) else text_or_path
     return list(csv.DictReader(io.StringIO(text)))
@@ -124,20 +151,23 @@ def load_mapping(map_dir):
         raise SystemExit("extensions.csv has an unknown class (allowed: " + ", ".join(sorted(CLASSES)) + "): "
                          + "; ".join(bad))
     soft = {r["tag"].strip(): r for r in read_csv(Path(map_dir) / "software_domain.csv")}
+    sigp = Path(map_dir) / "signature_software.csv"          # which program wrote a file, judged by what is INSIDE it
+    soft[BY_SIGNATURE] = {r["sig"].strip(): r["software"].strip() for r in read_csv(sigp)} if sigp.exists() else {}
     return ext_map, soft
 
 
-def tool_in_tag(tag):
-    """Tool named by a profiler header tag (closed vocabulary), or ''. Used for review notes and as a
-    domain fallback only - never for 'Native CAD Software'."""
-    p = tag.split(":")
-    if p[0] in ("STEP", "IFC") and len(p) == 3 and p[2] not in ("other", ""):
-        return p[2]
-    if p[0] == "IGES" and len(p) == 2 and p[1] not in ("other", ""):
-        return p[1]
-    if p[0] == "SIM" and len(p) == 2 and p[1] not in ("FRD", "INP"):
-        return p[1]
-    return ""
+BY_SIGNATURE = "__by_signature__"
+
+
+class CsvSource:
+    """A CSV inside a profile zip. Iterating streams it row by row (never loaded whole) and can be repeated."""
+
+    def __init__(self, zip_path, member):
+        self.zip_path, self.member = str(zip_path), member
+
+    def __iter__(self):
+        with zipfile.ZipFile(self.zip_path) as zf, zf.open(self.member) as raw:
+            yield from csv.DictReader(io.TextIOWrapper(raw, encoding="utf-8-sig", newline=""))
 
 
 def load_profiles(paths):
@@ -153,117 +183,329 @@ def load_profiles(paths):
                 print(f"skip {z.name}: not a profiler zip", file=sys.stderr)
                 continue
             info = {r["key"]: r["value"] for r in read_csv(zf.read("Run_info.csv").decode("utf-8-sig"))}
-            files = read_csv(zf.read("Files.csv").decode("utf-8-sig"))
-            links = read_csv(zf.read("Links.csv").decode("utf-8-sig")) if "Links.csv" in names else []
             parents = {}
             if "Dirs.csv" in names:  # profiler >= 1.2: anonymous folder tree (ids only)
-                parents = {d["dir_id"]: d["parent_dir_id"] for d in read_csv(zf.read("Dirs.csv").decode("utf-8-sig"))}
-        runs.append({"zip": z.name, "info": info, "files": files, "parents": parents, "links": links})
+                with zf.open("Dirs.csv") as raw:
+                    for d in csv.DictReader(io.TextIOWrapper(raw, encoding="utf-8-sig", newline="")):
+                        parents[_I(d["dir_id"])] = _I(d["parent_dir_id"])
+            counts = None
+            if "Projects.csv" in names:
+                counts = {r["project"]: int(r["file_count"]) for r in read_csv(zf.read("Projects.csv").decode("utf-8-sig"))}
+        runs.append({"zip": z.name, "info": info, "files": CsvSource(z, "Files.csv"), "parents": parents, "projects": counts,
+                     "links": CsvSource(z, "Links.csv") if "Links.csv" in names else []})
     if not runs:
         raise SystemExit("No profiler zips found.")
-    keys = collections.Counter((r["info"].get("folder_name"), p) for r in runs for p in {f["project"] for f in r["files"]})
+    for r in runs:
+        if r["projects"] is None:                       # older zip without Projects.csv: one streaming pass for the names
+            c = collections.Counter(f["project"] for f in r["files"])
+            r["projects"] = dict(c)
+    keys = collections.Counter((r["info"].get("folder_name"), p) for r in runs for p in r["projects"])
     dup = sorted(f"{k[0]}/{k[1]}" for k, n in keys.items() if n > 1)
     if dup:  # same folder profiled twice would be silently double-counted
         raise SystemExit("Same project appears in more than one zip (would double-count): " + ", ".join(dup))
     return runs
 
 
-def compile_runs(runs, ext_map, soft, unique, pdf_mode, estimate=False, project_by="folder", min_project_files=25,
-                 unique_scope="project", copies="flag"):
-    names = collections.Counter(p for r in runs for p in {f["project"] for f in r["files"]})
-    per_project, unmapped = {}, collections.Counter()
-    sig_classified = collections.Counter()
-    unmapped_info = collections.defaultdict(lambda: [0, 0, set(), collections.Counter()])
-    for ri, run in enumerate(runs):
-        lk = collections.defaultdict(lambda: {"native": set(), "names": set(), "step": collections.defaultdict(set)})
-        for l in run.get("links", []):
-            e = lk[(l["project"], int(l["file_no"]))]
-            if l["kind"] == "native":
-                e["native"].add(stem(l["child"]))
-                e["names"].add(l["child"].lower())
-            else:
-                e["step"][stem(l["parent"], False)].add(stem(l["child"], False))
-        folder = run["info"].get("folder_name", run["zip"])
-        for f in run["files"]:
-            proj = f["project"] if names[f["project"]] == 1 else f"{folder}/{f['project']}"
-            rel = f.get("rel_path", "")
-            ext = derive_ext(f["ext"].lower(), rel)
-            m = ext_map.get(ext)
-            cls = m["class"] if m else "UNMAPPED"
-            by_signature = False
-            if not m:
-                fb = class_from_signature(f["header_signature"])
-                if fb:
-                    cls, by_signature = fb, True
-                    sig_classified[ext] += 1
-                else:
-                    unmapped[(proj, ext)] += 1
-                    unmapped_info[ext][0] += 1
-                    unmapped_info[ext][1] += int(f["size_bytes"])
-                    unmapped_info[ext][2].add(proj)
-                    unmapped_info[ext][3][f["header_signature"]] += 1
-            sw = (m["software"] if m else "") if cls in NATIVE else ""
-            tool = tool_in_tag(f["header_signature"]) if cls in ("NEUTRAL3D", "SIM") else ""
-            domain = (m["domain"] if m else "") or (soft[sw]["domain"] if sw in soft else "")
-            P = per_project.setdefault(proj, {"hashes": set(), "rows": [], "parents": {}})
-            P["parents"] = run.get("parents", {})
-            sha = f.get("sha256", "")
-            size = int(f["size_bytes"])
-            rel_name = rel.rsplit("/", 1)[-1] if rel else ""
-            prim, sec = dedupe_keys(size, f["modified_utc"], sha, rel_name.lower(), f.get("archive", ""), ext)
-            dup = bool(prim) and prim in P["hashes"]
-            P["hashes"].update(k for k in (prim, sec) if k)
-            nm = rel_name if rel else (f.get("asm_name", "") or "")
-            P["rows"].append(dict(project=proj, ext=ext, cls=cls, sw=sw, tool=tool, domain=domain,
-                                  size=size, modified=f["modified_utc"], sha=sha, keys=(prim, sec), fp=prim if prim.startswith(("sha:", "sd:")) else "",
-                                  sig=f["header_signature"], dup=dup, dir=f.get("dir_id", ""), asm=f.get("asm_name", ""),
-                                  name=nm, stem=stem(nm) if nm else "", rel=rel, pdfdraw=False, archive=f.get("archive", ""),
-                                  adup=dup and bool(f.get("archive", "")),
-                                  lk=lk.get((f["project"], int(f["file_no"])))))
+def stream_projects(run, make_builder):
+    """Yield (project, builder) in file order. Every CSV row goes straight into its project's builder (a compact Row object), so the raw
+    rows are never held; a project is handed on as soon as its last row has been read (Projects.csv says how many rows it has). Rows of
+    one project that are not contiguous simply keep their builder open."""
+    counts = run.get("projects") or {}
+    open_ = {}
+    for f in run["files"]:
+        p = f["project"]
+        b = open_.get(p)
+        if b is None:
+            b = open_[p] = make_builder(p)
+        b.add(f)
+        if len(b.rows) >= counts.get(p, 1 << 60):
+            b = None
+            yield p, open_.pop(p)
+    for p, b in open_.items():
+        yield p, b
 
-    review, evidence_rows, confidence_rows = [], [], []
-    universe = build_universe([r for P in per_project.values() for r in P["rows"]])    # references may point to other folders
-    if project_by in ("structure", "auto"):             # split folder-projects into sub-projects by root assembly
-        for proj in list(per_project):
-            P = per_project[proj]
-            groups, why = split_by_structure(proj, P["rows"], P["parents"], min_project_files, with_reason=True, universe=universe)
-            if not groups:
-                if project_by == "auto" and any(r.get("lk") for r in P["rows"]):
-                    review.append([proj, "project split", f"kept as one folder-project: {why}"])
-                continue
-            del per_project[proj]
-            if why:
-                review.append([proj, "project split", why])
-            for gname, grows in groups.items():
-                G = per_project.setdefault(gname, {"hashes": set(), "rows": [], "parents": P["parents"]})
-                for r in grows:
-                    r["project"] = gname
-                    r["dup"] = bool(r["keys"][0]) and r["keys"][0] in G["hashes"]
-                    r["adup"] = r["dup"] and bool(r["archive"])
-                    G["hashes"].update(k for k in r["keys"] if k)
-                    G["rows"].append(r)
-            review.append([proj, "project split", f"split into {len(groups)} sub-projects by root assembly (an assembly no other assembly "
-                           f"references, plus everything it references): " + ", ".join(sorted(g.split(" / ", 1)[-1] for g in groups)[:12])
-                           + (" ..." if len(groups) > 12 else "")])
-    copy_of = detect_copies(per_project) if copies != "keep" else {}
-    if unique and unique_scope == "all":                # each content counted once in the WHOLE profile (biggest project keeps it)
-        seen_all = set()
-        for proj in sorted(per_project, key=lambda p: (-len(per_project[p]["rows"]), p.lower())):
-            mine = set()
-            for r in per_project[proj]["rows"]:
-                if r["fp"]:
-                    if r["fp"] in seen_all:
-                        r["dup"] = True
-                    mine.add(r["fp"])
-            seen_all |= mine
-    compiled, file_rows, stats, assemblies = [], [], [], []
-    for proj in sorted(per_project, key=str.lower):
-        rows = per_project[proj]["rows"]
-        file_rows += rows
-        if proj in copy_of and copies == "exclude":
-            orig, share, nfiles = copy_of[proj]
-            review.append([proj, "possible copy", f"EXCLUDED from Project Compiled: {share:.0%} of its {nfiles} files match files in '{orig}'"])
-            continue
+
+class LinkIndex:
+    """Links.csv rows of one project at a time. The profiler writes them in the same project order as Files.csv, so this reads the file
+    once, in step with the projects; rows that arrive out of that order are counted in `unmatched`."""
+
+    def __init__(self, links):
+        self.it = iter(links)
+        self.ahead = None
+        self.asked = set()
+        self.unmatched = 0
+
+    def take(self, project):
+        self.asked.add(project)
+        out = []
+        while True:
+            if self.ahead is None:
+                self.ahead = next(self.it, None)
+                if self.ahead is None:
+                    break
+            if self.ahead["project"] == project:
+                out.append(self.ahead)
+            elif self.ahead["project"] in self.asked:      # a row of a project that was already handled: out of order, cannot be used
+                self.unmatched += 1
+            else:
+                break                                      # belongs to a later project
+            self.ahead = None
+        return out
+
+    def rest(self):
+        n = self.unmatched + (1 if self.ahead is not None else 0)
+        return n + sum(1 for _ in self.it)
+
+
+def _lk_map(link_rows):
+    lk = collections.defaultdict(lambda: {"native": set(), "names": set(), "step": collections.defaultdict(set), "scan": False})
+    for l in link_rows:
+        e = lk[int(l["file_no"])]
+        if l["kind"] in ("native", "scan"):
+            e["native"].add(stem(l["child"]))
+            e["names"].add(l["child"].lower())
+            if l["kind"] == "scan":
+                e["scan"] = True
+        else:
+            e["step"][stem(l["parent"], False)].add(stem(l["child"], False))
+    return lk
+
+
+# ---------------------------------------------------------------------------------------------------- where rows go
+class MemorySink:
+    """Rows are kept in a list (small runs, tests)."""
+
+    def __init__(self):
+        self.rows = []
+
+    def add(self, row):
+        self.rows.append(row)
+
+    def close(self, keep_empty=True):
+        pass
+
+
+class CsvSink:
+    """Rows go straight to disk, in parts of at most `part_rows` rows (Excel cannot hold more than 1,048,576 rows in a tab, and a CSV
+    that big cannot be opened in it either): <stem>.csv, <stem>_2.csv, ..."""
+
+    def __init__(self, out, stem_name, header, part_rows=1_000_000):
+        self.out, self.stem_name, self.header, self.part_rows = Path(out), stem_name, header, part_rows
+        self.parts, self.n, self.f, self.w, self.total = [], 0, None, None, 0
+
+    def _open(self):
+        path = self.out / (f"{self.stem_name}.csv" if not self.parts else f"{self.stem_name}_{len(self.parts) + 1}.csv")
+        self.parts.append(path)
+        self.f = open(path, "w", newline="", encoding="utf-8-sig")
+        self.w = csv.writer(self.f)
+        self.w.writerow(self.header)
+        self.n = 0
+
+    def add(self, row):
+        if self.f is None or self.n >= self.part_rows:
+            if self.f:
+                self.f.close()
+            self._open()
+        self.w.writerow(row)
+        self.n += 1
+        self.total += 1
+
+    def close(self, keep_empty=True):
+        if self.f:
+            self.f.close()
+            self.f = None
+        if not self.parts and keep_empty:               # a tab with headings only is still a tab
+            self._open()
+            self.f.close()
+            self.f = None
+
+    def rows(self, part):
+        with open(self.parts[part], newline="", encoding="utf-8-sig") as f:
+            r = csv.reader(f)
+            next(r)
+            yield from r
+
+
+class Sinks:
+    def __init__(self, files=None, assemblies=None, evidence=None):
+        self.files = files or MemorySink()
+        self.assemblies = assemblies or MemorySink()
+        self.evidence = evidence or MemorySink()
+
+    def close(self):
+        for s in (self.files, self.assemblies, self.evidence):
+            s.close()
+
+
+def file_row(r):
+    return [r["project"], r["ext"], r["cls"], r["sw"], r["domain"], r["size"], r["modified"], r["sha"], r["sig"],
+            "yes" if r["dup"] else "", r["archive"], "yes" if r["adup"] else "", r["fp"] or r["keys"][0]]
+
+
+class RowBuilder:
+    """Turns the CSV rows of ONE project into Row objects one at a time (classification, software, duplicate flags)."""
+
+    def __init__(self, eng, proj, lk, count=True):
+        self.e, self.proj, self.lk, self.count = eng, proj, lk, count
+        self.hashes, self.rows = set(), []
+
+    def add(self, f):
+        e, proj, count = self.e, self.proj, self.count
+        rel = f.get("rel_path", "")
+        ext = derive_ext(f["ext"].lower(), rel)
+        m = e.ext_map.get(ext)
+        cls = m["class"] if m else "UNMAPPED"
+        sig = f["header_signature"]
+        sigsw = e.sig_soft.get(sig, "")
+        if not m:
+            fb = class_from_signature(sig)
+            if fb:
+                cls = fb
+                if count:
+                    e.sig_classified[ext] += 1
+            elif count:
+                e.unmapped[(proj, ext)] += 1
+                ui = e.unmapped_info[ext]
+                ui[0] += 1
+                ui[1] += int(f["size_bytes"])
+                ui[2].add(proj)
+                ui[3][sig] += 1
+        sw = (m["software"] if m else "") if cls in NATIVE else ""
+        if sigsw and cls not in NATIVE and count:        # CAD content under an extension that is not a native CAD one
+            e.native_unknown_ext[(proj, sigsw)] += 1
+        if cls in NATIVE and sigsw and sw != sigsw:     # what is inside the file decides; the extension may be shared or wrong
+            if count:
+                e.sw_by_content[(proj, sw or "-", sigsw)] += 1
+            sw = sigsw
+        tool = tool_in_tag(sig) if cls in ("NEUTRAL3D", "SIM") else ""
+        domain = (m["domain"] if m else "") or (e.soft[sw]["domain"] if sw in e.soft else "")
+        size = int(f["size_bytes"])
+        sha = f.get("sha256", "")
+        archive = f.get("archive", "")
+        rel_name = rel.rsplit("/", 1)[-1] if rel else ""
+        prim, sec = dedupe_keys(size, f["modified_utc"], sha, rel_name.lower(), archive, ext)
+        dup = bool(prim) and prim in self.hashes
+        self.hashes.update(k for k in (prim, sec) if k)
+        nm = rel_name if rel else (f.get("asm_name", "") or "")
+        self.rows.append(Row(project=_I(proj), ext=_I(ext), cls=_I(cls), sw=_I(sw), tool=_I(tool), domain=_I(domain), size=size,
+                             modified=f["modified_utc"], sha=sha, keys=(prim, sec),
+                             fp=prim if prim.startswith(("sha:", "sd:")) else "", sig=_I(sig), dup=dup, dir=_I(f.get("dir_id", "")),
+                             asm=f.get("asm_name", ""), name=nm, stem=stem(nm) if nm else "", rel=rel, pdfdraw=False, archive=_I(archive),
+                             adup=dup and bool(archive),
+                             lk=self.lk.get(int(f["file_no"])) if self.lk is not None else None))
+
+
+# ---------------------------------------------------------------------------------------------------- the compiler
+class Engine:
+    """Compiles a profile one project at a time. Memory is the biggest single project plus small per-project summaries, not the whole
+    profile (the old compiler held every row of every project: about 5 KB per file)."""
+
+    def __init__(self, ext_map, soft, unique, pdf_mode, sinks, estimate=False, project_by="folder", min_project_files=25,
+                 unique_scope="project", copies="flag"):
+        self.ext_map, self.soft, self.unique, self.pdf_mode, self.sinks = ext_map, soft, unique, pdf_mode, sinks
+        self.estimate, self.project_by, self.min_files, self.unique_scope, self.copies = estimate, project_by, min_project_files, unique_scope, copies
+        self.sig_soft = soft.get(BY_SIGNATURE, {})
+        self.unmapped = collections.Counter()
+        self.unmapped_info = collections.defaultdict(lambda: [0, 0, set(), collections.Counter()])
+        self.sig_classified = collections.Counter()
+        self.sw_by_content = collections.Counter()       # (project, extension's software or "-", software seen inside)
+        self.native_unknown_ext = collections.Counter()  # (project, software): native-looking content under an extension we do not know
+        self.total_n = self.total_b = 0
+        self.compiled, self.stats, self.confidence = {}, {}, []
+        self.review_split, self.review_proj = [], collections.defaultdict(list)
+        self.fp_total, self.fp_cnt = {}, {}
+        self.deferred = {}                                # exclude mode: per-project outputs held back until copies are known
+        self.universe = None
+        self.lost_links = 0
+
+    # ------------------------------------------------------------------------------------------ rows
+    def builder(self, proj, lk, count=True):
+        return RowBuilder(self, proj, lk, count)
+
+    def build_rows(self, proj, folder, files, lk, count=True):
+        b = RowBuilder(self, proj, lk, count)
+        for f in files:
+            b.add(f)
+        return b.rows
+
+    def build_universe(self, runs, names):
+        """References may point into OTHER folder-projects (shared standard-parts libraries, sibling projects). One light pass indexes only
+        the model files that some reference names - nothing else of any other project is kept in memory."""
+        ref_names, ref_stems = set(), set()
+        for run in runs:
+            for l in run["links"]:
+                if l["kind"] in ("native", "scan"):
+                    ref_names.add(l["child"].lower())
+                    ref_stems.add(stem(l["child"]))
+                else:
+                    ref_stems.add(stem(l["child"], False))
+        if not ref_names and not ref_stems:
+            return None
+        by_name, by_stem = collections.defaultdict(list), collections.defaultdict(list)
+        for run in runs:
+            folder = run["info"].get("folder_name", run["zip"])
+            disp = lambda raw: raw if names[raw] == 1 else f"{folder}/{raw}"
+            for raw, b in stream_projects(run, lambda raw: self.builder(disp(raw), None, count=False)):
+                for r in b.rows:
+                    if r["cls"] in ("PART", "ASSEMBLY") and r["name"] and not r["adup"]:
+                        e = Row(cls=r["cls"], name=r["name"], stem=r["stem"], dir=r["dir"], rel=r["rel"], fp=r["fp"], adup=False)
+                        if r["name"].lower() in ref_names:
+                            by_name[r["name"].lower()].append(e)
+                        if r["stem"] in ref_stems:
+                            by_stem[r["stem"]].append(e)
+        return {"by_name": by_name, "by_stem": by_stem}
+
+    # ------------------------------------------------------------------------------------------ one folder-project -> final projects
+    def split(self, proj, rows, parents):
+        if self.project_by not in ("structure", "auto"):
+            return [(proj, rows)]
+        groups, why = split_by_structure(proj, rows, parents, self.min_files, with_reason=True, universe=self.universe)
+        if not groups:
+            if self.project_by == "auto" and any(r.get("lk") for r in rows):
+                self.review_split.append([proj, "project split", f"kept as one folder-project: {why}"])
+            return [(proj, rows)]
+        if why:
+            self.review_split.append([proj, "project split", why])
+        out = []
+        for gname, grows in groups.items():
+            hashes = set()
+            for r in grows:
+                r["project"] = gname
+                r["dup"] = bool(r["keys"][0]) and r["keys"][0] in hashes
+                r["adup"] = r["dup"] and bool(r["archive"])
+                hashes.update(k for k in r["keys"] if k)
+            out.append((gname, grows))
+        self.review_split.append([proj, "project split", f"split into {len(groups)} sub-projects by root assembly (an assembly no other assembly "
+                                  f"references, plus everything it references): " + ", ".join(sorted(g.split(" / ", 1)[-1] for g in groups)[:12])
+                                  + (" ..." if len(groups) > 12 else "")])
+        return out
+
+    def groups(self, runs, names):
+        for run in runs:
+            folder = run["info"].get("folder_name", run["zip"])
+            parents = run.get("parents", {})
+            links = LinkIndex(run["links"]) if run["links"] else None
+            disp = lambda raw: raw if names[raw] == 1 else f"{folder}/{raw}"
+            make = lambda raw: self.builder(disp(raw), _lk_map(links.take(raw)) if links else None)
+            for raw, b in stream_projects(run, make):
+                proj, rows = disp(raw), b.rows
+                b = None
+                self.total_n += len(rows)
+                self.total_b += sum(r["size"] for r in rows)
+                for gname, grows in self.split(proj, rows, parents):
+                    yield gname, grows, parents
+            if links:
+                self.lost_links += links.rest()
+
+    # ------------------------------------------------------------------------------------------ one final project -> its output rows
+    def finish(self, proj, rows, parents):
+        rev = self.review_proj[proj]
+        for r in rows:
+            self.sinks.files.add(r if isinstance(self.sinks.files, MemorySink) else file_row(r))
+        rne = [r for r in rows if r["size"] > 0]
+        self.fp_total[proj] = len(rne)
+        self.fp_cnt[proj] = collections.Counter(hash(r["fp"]) for r in rne if r.get("fp"))
+        unique, pdf_mode, estimate, soft = self.unique, self.pdf_mode, self.estimate, self.soft
         counted = [r for r in rows if not ((unique and r["dup"]) or r["adup"])]
         n = collections.Counter(r["cls"] for r in counted)
         models = {r["stem"] for r in counted if r["cls"] in ("DRAWING", "PART", "ASSEMBLY") and r["stem"]}
@@ -293,136 +535,256 @@ def compile_runs(runs, ext_map, soft, unique, pdf_mode, estimate=False, project_
                                       if r["cls"] == "NEUTRAL3D" and r["tool"] in soft)
         domain = dom.most_common(1)[0][0] if dom else "Unclassified"
 
-        compiled.append([proj, "", domain, sw_names, n["PART"], n["ASSEMBLY"], n["DRAWING"], pdf_drawings,
-                         n["NEUTRAL3D"], t2d, t3d])
-        stats.append([proj, len(rows), len({r["keys"][0] for r in rows if r["keys"][0]}) + sum(1 for r in rows if not r["keys"][0]), sum(r["dup"] for r in rows), n["PART"],
-                      n["ASSEMBLY"], n["DRAWING"], n["NEUTRAL3D"], n["PDF"], n["SIM"], n["DOC"], n["DATA"],
-                      n["IMG"], n["ARCHIVE"] + n["OTHER"], n["UNMAPPED"], sum(r["size"] for r in rows),
-                      ("unique hashes (whole profile)" if unique_scope == "all" else "unique hashes (per project)") if unique else "all files",
-                      sum(1 for r in rows if r["archive"]), sum(1 for r in rows if r["adup"]),
-                      copy_of[proj][0] if proj in copy_of else "", f"{copy_of[proj][1]:.0%}" if proj in copy_of else ""])
+        self.compiled[proj] = [proj, "", domain, sw_names, n["PART"], n["ASSEMBLY"], n["DRAWING"], pdf_drawings,
+                               n["NEUTRAL3D"], t2d, t3d]
+        self.stats[proj] = [proj, len(rows), len({r["keys"][0] for r in rows if r["keys"][0]}) + sum(1 for r in rows if not r["keys"][0]),
+                            sum(r["dup"] for r in rows), n["PART"], n["ASSEMBLY"], n["DRAWING"], n["NEUTRAL3D"], n["PDF"], n["SIM"],
+                            n["DOC"], n["DATA"], n["IMG"], n["ARCHIVE"] + n["OTHER"], n["UNMAPPED"], sum(r["size"] for r in rows),
+                            ("unique hashes (whole profile)" if self.unique_scope == "all" else "unique hashes (per project)") if unique else "all files",
+                            sum(1 for r in rows if r["archive"]), sum(1 for r in rows if r["adup"]), "", ""]
         n_arch = sum(1 for r in rows if r["archive"])
         if n_arch:
-            review.append([proj, "archives", f"{n_arch} files found inside archives ({sum(1 for r in rows if r['adup'])} identical to files "
-                           "already present in this project, so not counted again; 7z/rar are listed only and have no fingerprint)"])
-        if proj in copy_of and copies == "flag":
-            orig, share, nfiles = copy_of[proj]
-            review.append([proj, "possible copy", f"{share:.0%} of its {nfiles} files match files in '{orig}' (same size and modified date, or identical content when the profile has hashes) - likely a "
-                           "backup or copy; counts include it (use --copies exclude to drop it, --unique --unique-scope all to count each content once)"])
+            rev.append([proj, "archives", f"{n_arch} files found inside archives ({sum(1 for r in rows if r['adup'])} identical to files "
+                        "already present in this project, so not counted again; 7z/rar are listed only and have no fingerprint)"])
+        copy_slot = [proj, "possible copy", None]
+        rev.append(copy_slot)                           # filled in (or removed) once every project is known
 
         if domain == "Unclassified":
-            review.append([proj, "domain", "No native or neutral model maps to a domain - set it by hand"])
+            rev.append([proj, "domain", "No native or neutral model maps to a domain - set it by hand"])
         elif len(dom) > 1:
-            review.append([proj, "domain", "Mixed domains: " + ", ".join(f"{d} ({k})" for d, k in dom.most_common())])
+            rev.append([proj, "domain", "Mixed domains: " + ", ".join(f"{d} ({k})" for d, k in dom.most_common())])
         if sw_names == "Unknown":
-            review.append([proj, "software", "No native CAD file identifies the software (only neutral/other files)"])
+            rev.append([proj, "software", "No native CAD file identifies the software (only neutral/other files)"])
         elif len(sw) > 1:
-            review.append([proj, "software", "Several native tools: " + ", ".join(f"{t} ({k})" for t, k in sw.most_common())])
+            rev.append([proj, "software", "Several native tools: " + ", ".join(f"{t} ({k})" for t, k in sw.most_common())])
         tools = collections.Counter(r["tool"] for r in counted if r["tool"])
         if tools:
-            review.append([proj, "other tools seen", "Named in STEP/IGES/IFC/simulation headers (not counted as native CAD "
-                           "software): " + ", ".join(f"{t} ({k})" for t, k in tools.most_common())])
+            rev.append([proj, "other tools seen", "Named in STEP/IGES/IFC/simulation headers (not counted as native CAD "
+                        "software): " + ", ".join(f"{t} ({k})" for t, k in tools.most_common())])
         if n["PDF"] and pdf_mode == "none":
-            review.append([proj, "PDF drawings", f"{n['PDF']} PDF file(s) NOT counted as drawings (PDF Drawings = 0; --pdf-drawings none)"])
+            rev.append([proj, "PDF drawings", f"{n['PDF']} PDF file(s) NOT counted as drawings (PDF Drawings = 0; --pdf-drawings none)"])
         elif n["PDF"] and pdf_mode == "auto" and not any(r["name"] for r in counted if r["cls"] == "PDF"):
-            review.append([proj, "PDF drawings", f"{n['PDF']} PDF file(s) NOT counted: the profile has no file names (detail level 0), so "
-                           "drawings cannot be told from reports. Re-profile at level 1+, or use --pdf-drawings all"])
+            rev.append([proj, "PDF drawings", f"{n['PDF']} PDF file(s) NOT counted: the profile has no file names (detail level 0), so "
+                        "drawings cannot be told from reports. Re-profile at level 1+, or use --pdf-drawings all"])
         elif n["PDF"] and pdf_mode == "auto":
-            review.append([proj, "PDF drawings", f"{pdf_drawings} of {n['PDF']} PDFs counted as drawings by name (same name as a model or "
-                           "drawing, or drawing-like wording without report-like wording); the rest treated as documents"])
+            rev.append([proj, "PDF drawings", f"{pdf_drawings} of {n['PDF']} PDFs counted as drawings by name (same name as a model or "
+                        "drawing, or drawing-like wording without report-like wording); the rest treated as documents"])
+        n_scan = sum(1 for r in counted if r.get("lk") and r["lk"].get("scan"))
+        if n_scan:
+            rev.append([proj, "references by text scan", f"{n_scan} assembly/drawing file(s) of this project are CATIA / Creo / NX files whose "
+                        "references were found by searching the file for CAD file names (no format reader exists for them): treat "
+                        "their assignments as lower confidence than SolidWorks / Solid Edge / STEP"])
+        outs = {"asm": [], "ev": [], "conf": []}
         if n["ASSEMBLY"] and estimate:
-            rows_a, note, ev = assign_assemblies(proj, counted, per_project[proj]["parents"], universe)
-            assemblies += rows_a
-            review.append([proj, "assembly breakdown", f"ESTIMATE - {note}"])
+            rows_a, note, ev = assign_assemblies(proj, counted, parents, self.universe)
+            outs["asm"] += rows_a
+            rev.append([proj, "assembly breakdown", f"ESTIMATE - {note}"])
             if ev:
-                evidence_rows += ev["rows"]
-                confidence_rows.append(ev["project"])
+                outs["ev"] += ev["rows"]
+                outs["conf"].append(ev["project"])
         elif n["ASSEMBLY"]:
-            review.append([proj, "assembly breakdown", f"{n['ASSEMBLY']} assembly file(s): Assembly Breakdown tab left empty "
-                           "(needs assembly file names and which parts belong to each; --estimate-assemblies gives an even-split estimate)"])
+            rev.append([proj, "assembly breakdown", f"{n['ASSEMBLY']} assembly file(s): Assembly Breakdown tab left empty "
+                        "(needs assembly file names and which parts belong to each; --estimate-assemblies gives an even-split estimate)"])
         elif estimate and (n["PART"] or n["DRAWING"] or n["NEUTRAL3D"] or pdf_drawings):
-            assemblies.append([proj, NO_ASSEMBLY_ROW, n["PART"], n["DRAWING"], pdf_drawings, n["NEUTRAL3D"]])
-            review.append([proj, "assembly breakdown", f"this project has no assembly file, so ONE summary row ('{NO_ASSEMBLY_ROW}') carries its "
-                           f"{n['PART']} parts, {n['DRAWING']} drawings, {pdf_drawings} PDF drawings and {n['NEUTRAL3D']} neutral files; the tab adds "
-                           "up to the project totals"])
-            confidence_rows.append({"project": proj, "confidence": "n/a", "why": "no assembly file in this project: one summary row, no assembly structure",
-                                    **{h: 0 for h in CONFIDENCE_HEADER[3:19]}, "unresolved_examples": ""})
-    for (proj, ext), k in sorted(unmapped.items()):
-        review.append([proj, "unmapped extension", f".{ext} x{k} - add it to extensions.csv"])
-    total_n = sum(len(P["rows"]) for P in per_project.values())
-    unm_n = sum(v[0] for v in unmapped_info.values())
-    unm_b = sum(v[1] for v in unmapped_info.values())
-    tot_b = sum(r["size"] for P in per_project.values() for r in P["rows"]) or 1
-    sig_n = sum(sig_classified.values())
-    review.insert(0, ["(all projects)", "categorisation",
-                      f"{total_n - sig_n - unm_n:,} of {total_n:,} files ({100 * (total_n - sig_n - unm_n) / max(1, total_n):.1f}%) classified by extension, "
-                      f"{sig_n:,} by file content (unknown extension but a recognisable STEP/DXF/DWG/PDF/ZIP/... start), {unm_n:,} unmapped "
-                      f"({100 * unm_b / tot_b:.1f}% of bytes) - see Unmapped_Extensions.csv"
-                      + (f"; by content: {', '.join(f'.{e} x{k}' for e, k in sig_classified.most_common(5))}" if sig_n else "")])
-    unm_rows = [[e, v[0], round(v[1] / 1e6, 1), len(v[2]), "; ".join(f"{t} x{k}" for t, k in v[3].most_common(3))]
-                for e, v in sorted(unmapped_info.items(), key=lambda kv: -kv[1][0])]
-    return compiled, file_rows, stats, review, assemblies, {"rows": evidence_rows, "projects": confidence_rows, "unmapped": unm_rows}
+            outs["asm"].append([proj, NO_ASSEMBLY_ROW, n["PART"], n["DRAWING"], pdf_drawings, n["NEUTRAL3D"]])
+            rev.append([proj, "assembly breakdown", f"this project has no assembly file, so ONE summary row ('{NO_ASSEMBLY_ROW}') carries its "
+                        f"{n['PART']} parts, {n['DRAWING']} drawings, {pdf_drawings} PDF drawings and {n['NEUTRAL3D']} neutral files; the tab adds "
+                        "up to the project totals"])
+            outs["conf"].append({"project": proj, "confidence": "n/a", "why": "no assembly file in this project: one summary row, no assembly structure",
+                                 **{h: 0 for h in CONFIDENCE_HEADER[3:19]}, "unresolved_examples": "", "folder_rule_agrees": "n/a"})
+        if self.copies == "exclude":
+            self.deferred[proj] = outs                   # may still be dropped when the project turns out to be a copy
+        else:
+            self._emit(outs)
+
+    def _emit(self, outs):
+        for r in outs["asm"]:
+            self.sinks.assemblies.add(r)
+        for r in outs["ev"]:
+            self.sinks.evidence.add(r if isinstance(self.sinks.evidence, MemorySink) else [r[h] for h in EVIDENCE_HEADER])
+        self.confidence += outs["conf"]
+
+    # ------------------------------------------------------------------------------------------ the whole profile
+    def run(self, runs):
+        names = collections.Counter(p for r in runs for p in r["projects"])
+        if any(r["links"] for r in runs):
+            self.universe = self.build_universe(runs, names)
+        if self.unique and self.unique_scope == "all":   # needs every project at once (biggest keeps the content): not streamable
+            groups = [g for g in self.groups(runs, names)]
+            seen_all = set()
+            for gname, grows, _p in sorted(groups, key=lambda g: (-len(g[1]), g[0].lower())):
+                mine = set()
+                for r in grows:
+                    if r["fp"]:
+                        if r["fp"] in seen_all:
+                            r["dup"] = True
+                        mine.add(r["fp"])
+                seen_all |= mine
+            for gname, grows, parents in sorted(groups, key=lambda g: g[0].lower()):
+                self.finish(gname, grows, parents)
+        else:
+            for gname, grows, parents in self.groups(runs, names):
+                self.finish(gname, grows, parents)
+        copy_of = detect_copies_from(self.fp_total, self.fp_cnt) if self.copies != "keep" else {}
+        for proj, (orig, share, nfiles) in copy_of.items():
+            rev = self.review_proj[proj]
+            slot = next((x for x in rev if x[1] == "possible copy" and x[2] is None), None)
+            if self.copies == "exclude":
+                self.review_proj[proj] = [[proj, "possible copy", f"EXCLUDED from Project Compiled: {share:.0%} of its {nfiles} files match files in '{orig}'"]]
+                self.compiled.pop(proj, None)
+                self.stats.pop(proj, None)
+                self.deferred.pop(proj, None)
+            else:
+                self.stats[proj][19:21] = [orig, f"{share:.0%}"]
+                if self.copies == "flag" and slot is not None:
+                    slot[2] = (f"{share:.0%} of its {nfiles} files match files in '{orig}' (same size and modified date, or identical content when the profile has hashes) - likely a "
+                               "backup or copy; counts include it (use --copies exclude to drop it, --unique --unique-scope all to count each content once)")
+        for proj in sorted(self.deferred, key=str.lower):
+            self._emit(self.deferred[proj])
+        for proj, rev in self.review_proj.items():
+            rev[:] = [x for x in rev if x[2] is not None]
+        review = []
+        for proj in sorted(self.review_proj, key=str.lower):
+            review += self.review_proj[proj]
+        review = self.review_split + review
+        for (proj, ext), k in sorted(self.unmapped.items()):
+            review.append([proj, "unmapped extension", f".{ext} x{k} - add it to extensions.csv"])
+        for (proj, was, now), k in sorted(self.sw_by_content.items()):
+            review.append([proj, "software by content", f"{k} file(s) {('with an extension that does not name one program (.asm .prt ...)' if was == '-' else 'whose extension says ' + was)}"
+                           f" are {now} files judging by what is inside them: counted as {now}"])
+        for (proj, now), k in sorted(self.native_unknown_ext.items()):
+            review.append([proj, "native file, other extension", f"{k} file(s) look like {now} native files by content but their extension is not a native CAD "
+                           "extension in extensions.csv, so they are NOT counted as parts / assemblies - rename them or add the extension"])
+        if self.lost_links:
+            review.append(["(all projects)", "references", f"{self.lost_links} reference row(s) in Links.csv could not be matched to a project "
+                           "(out of order) and were ignored"])
+        total_n, unm_n = self.total_n, sum(v[0] for v in self.unmapped_info.values())
+        unm_b = sum(v[1] for v in self.unmapped_info.values())
+        tot_b = self.total_b or 1
+        sig_n = sum(self.sig_classified.values())
+        review.insert(0, ["(all projects)", "categorisation",
+                          f"{total_n - sig_n - unm_n:,} of {total_n:,} files ({100 * (total_n - sig_n - unm_n) / max(1, total_n):.1f}%) classified by extension, "
+                          f"{sig_n:,} by file content (unknown extension but a recognisable STEP/DXF/DWG/PDF/ZIP/... start), {unm_n:,} unmapped "
+                          f"({100 * unm_b / tot_b:.1f}% of bytes) - see Unmapped_Extensions.csv"
+                          + (f"; by content: {', '.join(f'.{e} x{k}' for e, k in self.sig_classified.most_common(5))}" if sig_n else "")])
+        unm_rows = [[e, v[0], round(v[1] / 1e6, 1), len(v[2]), "; ".join(f"{t} x{k}" for t, k in v[3].most_common(3))]
+                    for e, v in sorted(self.unmapped_info.items(), key=lambda kv: -kv[1][0])]
+        order = sorted(self.compiled, key=str.lower)
+        return ([self.compiled[p] for p in order], [self.stats[p] for p in order], review, unm_rows, total_n)
+
+
+def compile_runs(runs, ext_map, soft, unique, pdf_mode, estimate=False, project_by="folder", min_project_files=25,
+                 unique_scope="project", copies="flag"):
+    """In-memory convenience wrapper (tests, small profiles): -> (compiled, file_rows, stats, review, assemblies, evidence)."""
+    sinks = Sinks()
+    eng = Engine(ext_map, soft, unique, pdf_mode, sinks, estimate, project_by, min_project_files, unique_scope, copies)
+    compiled, stats, review, unm_rows, _n = eng.run(runs)
+    key = lambda p: p.lower()
+    file_rows = sorted(sinks.files.rows, key=lambda r: key(r["project"]))
+    assemblies = sorted(sinks.assemblies.rows, key=lambda r: key(r[0]))
+    ev_rows = sorted(sinks.evidence.rows, key=lambda r: key(r["project"]))
+    conf = sorted(eng.confidence, key=lambda r: key(r["project"]))
+    return compiled, file_rows, stats, review, assemblies, {"rows": ev_rows, "projects": conf, "unmapped": unm_rows}
 
 
 EVIDENCE_HEADER = ["project", "assembly", "refs_total", "refs_resolved", "refs_external", "refs_ambiguous", "refs_unresolved", "parts_link", "parts_folder",
                    "parts_spread", "parts_even", "other_by_link", "other_by_name", "other_by_folder"]
 CONFIDENCE_HEADER = ["project", "confidence", "why", "assemblies", "parts", "parts_link", "parts_folder", "parts_spread", "parts_even",
                      "refs_total", "refs_resolved", "refs_external", "refs_ambiguous", "refs_unresolved", "shared_parts", "assemblies_without_refs",
-                     "others_link", "others_name", "others_folder_or_even", "unresolved_examples"]
+                     "others_link", "others_name", "others_folder_or_even", "unresolved_examples", "folder_rule_agrees"]
 
 
 UNMAPPED_HEADER = ["ext", "files", "MB", "projects", "header_tags_seen"]
 
 
-def file_row(r):
-    return [r["project"], r["ext"], r["cls"], r["sw"], r["domain"], r["size"], r["modified"], r["sha"], r["sig"],
-            "yes" if r["dup"] else "", r["archive"], "yes" if r["adup"] else "", r["fp"] or r["keys"][0]]
 
 
-def write_csvs(out, compiled, file_rows, stats, review, assemblies=(), evidence=None):
+def tool_in_tag(tag):
+    """Tool named by a profiler header tag (closed vocabulary), or ''. Used for review notes and as a
+    domain fallback only - never for 'Native CAD Software'."""
+    p = tag.split(":")
+    if p[0] in ("STEP", "IFC") and len(p) == 3 and p[2] not in ("other", ""):
+        return p[2]
+    if p[0] == "IGES" and len(p) == 2 and p[1] not in ("other", ""):
+        return p[1]
+    if p[0] == "SIM" and len(p) == 2 and p[1] not in ("FRD", "INP"):
+        return p[1]
+    return ""
+
+
+
+
+def write_small_csvs(out, compiled, stats, review, confidence, unmapped):
     def dump(name, header, rows):
         with open(out / name, "w", newline="", encoding="utf-8-sig") as f:
-            w = csv.writer(f); w.writerow(header); w.writerows(rows)
+            w = csv.writer(f)
+            w.writerow(header)
+            w.writerows(rows)
     dump("Project_Compiled.csv", HEADINGS, compiled)
-    dump("File_Level.csv", FILE_HEADER, [file_row(r) for r in file_rows])
     dump("Project_Stats.csv", STATS_HEADER, stats)
     dump("Review.csv", ["project", "topic", "detail"], review)
-    if assemblies:
-        dump("Assembly_Breakdown_ESTIMATE.csv", ASSEMBLY_HEADINGS, assemblies)
-    if evidence and evidence.get("unmapped"):
-        dump("Unmapped_Extensions.csv", UNMAPPED_HEADER, evidence["unmapped"])
-    if evidence and evidence["projects"]:
-        dump("Assembly_Evidence.csv", EVIDENCE_HEADER, [[r[h] for h in EVIDENCE_HEADER] for r in evidence["rows"]])
-        dump("Assembly_Confidence.csv", CONFIDENCE_HEADER, [[r[h] for h in CONFIDENCE_HEADER] for r in evidence["projects"]])
+    if unmapped:
+        dump("Unmapped_Extensions.csv", UNMAPPED_HEADER, unmapped)
+    if confidence:
+        dump("Assembly_Confidence.csv", CONFIDENCE_HEADER, [[r[h] for h in CONFIDENCE_HEADER] for r in confidence])
 
 
-def style(ws, color="FF181F34"):
-    for c in ws[1]:
-        c.font = Font(bold=True, color="FFFFFF"); c.fill = PatternFill("solid", fgColor=color)
-    for j in range(1, ws.max_column + 1):
-        w = max(len(str(c.value or "")) for c in list(ws[get_column_letter(j)])[:200])
+def _num(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return v
+
+
+def _sheet(wb, title, header, rows, color="FF181F34", numeric=()):
+    """One write-only sheet (rows are streamed to disk by openpyxl, not held in memory). Column widths come from the first 200 rows."""
+    ws = wb.create_sheet(title)
+    first, it = [], iter(rows)
+    for r in it:
+        first.append(r)
+        if len(first) >= 200:
+            break
+    for j, h in enumerate(header, 1):
+        w = max([len(str(h))] + [len(str(r[j - 1])) for r in first if j - 1 < len(r)])
         ws.column_dimensions[get_column_letter(j)].width = min(max(w + 2, 12), 60)
+    head = []
+    for h in header:
+        c = WriteOnlyCell(ws, value=h)
+        c.font, c.fill = Font(bold=True, color="FFFFFF"), PatternFill("solid", fgColor=color)
+        head.append(c)
+    ws.append(head)
+    for r in itertools.chain(first, it):
+        ws.append([_num(v) if j in numeric and v != "" else v for j, v in enumerate(r)])
 
 
-def write_workbook(path, compiled, file_rows, stats, review, assemblies=(), evidence=None):
-    wb = Workbook()
-    ws = wb.active; ws.title = "Project Compiled"
-    ws.append(HEADINGS); [ws.append(r) for r in compiled]; style(ws)
-    wa = wb.create_sheet("Assembly Breakdown"); wa.append(ASSEMBLY_HEADINGS); [wa.append(r) for r in assemblies]; style(wa)
-    wf = wb.create_sheet("File Level"); wf.append(FILE_HEADER)
-    for r in file_rows:
-        wf.append(file_row(r))
-    style(wf)
-    wst = wb.create_sheet("Project Stats"); wst.append(STATS_HEADER); [wst.append(r) for r in stats]; style(wst)
-    if evidence and evidence["projects"]:
-        wc = wb.create_sheet("Assembly Confidence"); wc.append(CONFIDENCE_HEADER)
-        [wc.append([r[h] for h in CONFIDENCE_HEADER]) for r in evidence["projects"]]; style(wc)
-        we = wb.create_sheet("Assembly Evidence"); we.append(EVIDENCE_HEADER)
-        [we.append([r[h] for h in EVIDENCE_HEADER]) for r in evidence["rows"]]; style(we)
-    if evidence and evidence.get("unmapped"):
-        wu = wb.create_sheet("Unmapped Extensions"); wu.append(UNMAPPED_HEADER)
-        [wu.append(r) for r in evidence["unmapped"]]; style(wu)
-    wr = wb.create_sheet("Review"); wr.append(["project", "topic", "detail"]); [wr.append(r) for r in review]; style(wr)
+def _sheets(wb, title, header, sink, max_sheets, numeric=()):
+    """A big tab: one sheet per CSV part (Excel holds at most 1,048,576 rows per sheet), at most `max_sheets` of them; returns how many
+    parts did not fit (they are only in the CSV files)."""
+    for k in range(min(len(sink.parts), max_sheets)):
+        _sheet(wb, title if k == 0 else f"{title} ({k + 1})", header, sink.rows(k), numeric=numeric)
+    return max(0, len(sink.parts) - max_sheets)
+
+
+def write_workbook(path, compiled, stats, review, confidence, unmapped, sinks, max_sheets=3):
+    wb = Workbook(write_only=True)
+    _sheet(wb, "Project Compiled", HEADINGS, compiled, numeric=set(range(4, 9)))
+    left = {}
+    left["Assembly Breakdown"] = _sheets(wb, "Assembly Breakdown", ASSEMBLY_HEADINGS, sinks.assemblies, max_sheets, numeric={2, 3, 4, 5})
+    left["File Level"] = _sheets(wb, "File Level", FILE_HEADER, sinks.files, max_sheets, numeric={5})
+    _sheet(wb, "Project Stats", STATS_HEADER, stats)
+    if confidence:
+        _sheet(wb, "Assembly Confidence", CONFIDENCE_HEADER, [[r[h] for h in CONFIDENCE_HEADER] for r in confidence])
+        left["Assembly Evidence"] = _sheets(wb, "Assembly Evidence", EVIDENCE_HEADER, sinks.evidence, max_sheets, numeric=set(range(2, 14)))
+    if unmapped:
+        _sheet(wb, "Unmapped Extensions", UNMAPPED_HEADER, unmapped)
+    for tab, n in left.items():
+        if n:
+            review.append(["(all projects)", "excel row limit", f"'{tab}' has more rows than {max_sheets} Excel sheets hold: the last {n} part(s) are only in the "
+                           f"CSV files ({tab.replace(' ', '_')}_*.csv); raise --xlsx-max-sheets to put them in the workbook too"])
+    _sheet(wb, "Review", ["project", "topic", "detail"], review)
     wb.save(path)
 
 
@@ -431,7 +793,8 @@ def main():
     ap.add_argument("inputs", nargs="+")
     ap.add_argument("--unique", action="store_true", help="count each content hash once (per project, or see --unique-scope)")
     ap.add_argument("--unique-scope", choices=["project", "all"], default="project",
-                    help="with --unique: 'project' (default) or 'all' = once in the whole profile (copies of a project elsewhere vanish)")
+                    help="with --unique: 'project' (default) or 'all' = once in the whole profile (copies of a project elsewhere vanish; "
+                         "this one needs memory for the whole profile)")
     ap.add_argument("--copies", choices=["flag", "exclude", "keep"], default="flag",
                     help="projects that are mostly (>= 80%%) identical to a bigger project: flag them in Review (default), exclude them "
                          "from Project Compiled, or keep = do not look")
@@ -446,28 +809,41 @@ def main():
                          "folder: never split")
     ap.add_argument("--min-project-files", type=int, default=25,
                     help="with --project-by structure: sub-projects smaller than this are merged into '<project> / (other)'")
+    ap.add_argument("--xlsx-max-sheets", type=int, default=3,
+                    help="File Level / Assembly Breakdown / Assembly Evidence are split into sheets of 1,000,000 rows (Excel's limit is 1,048,576); "
+                         "at most this many sheets per tab go into compiled.xlsx, the rest stay in the CSV parts (default 3)")
+    ap.add_argument("--csv-part-rows", type=int, default=1_000_000, help=argparse.SUPPRESS)
     ap.add_argument("--map-dir", default=str(HERE / "mapping"))
     ap.add_argument("--out", help="output dir (default: ./compile-profiles/<timestamp> under the current folder)")
     a = ap.parse_args()
 
     ext_map, soft = load_mapping(a.map_dir)
     runs = load_profiles(a.inputs)
-    compiled, file_rows, stats, review, assemblies, evidence = compile_runs(
-        runs, ext_map, soft, a.unique, a.pdf_drawings, not a.no_assembly_breakdown, a.project_by, a.min_project_files, a.unique_scope, a.copies)
-
     out = Path(a.out) if a.out else Path.cwd() / "compile-profiles" / datetime.now().strftime("%Y%m%d-%H%M%S")
     out.mkdir(parents=True, exist_ok=True)
-    write_csvs(out, compiled, file_rows, stats, review, assemblies, evidence)
+    sinks = Sinks(CsvSink(out, "File_Level", FILE_HEADER, a.csv_part_rows),
+                  CsvSink(out, "Assembly_Breakdown_ESTIMATE", ASSEMBLY_HEADINGS, a.csv_part_rows),
+                  CsvSink(out, "Assembly_Evidence", EVIDENCE_HEADER, a.csv_part_rows))
+    eng = Engine(ext_map, soft, a.unique, a.pdf_drawings, sinks, not a.no_assembly_breakdown, a.project_by, a.min_project_files,
+                 a.unique_scope, a.copies)
+    compiled, stats, review, unmapped, n_files = eng.run(runs)
+    sinks.files.close()
+    sinks.assemblies.close(keep_empty=False)
+    sinks.evidence.close(keep_empty=bool(eng.confidence))
+    write_small_csvs(out, compiled, stats, review, eng.confidence, unmapped)
     if Workbook:
-        write_workbook(out / "compiled.xlsx", compiled, file_rows, stats, review, assemblies, evidence)
+        write_workbook(out / "compiled.xlsx", compiled, stats, review, eng.confidence, unmapped, sinks, a.xlsx_max_sheets)
     else:
         print("(openpyxl not installed - wrote CSVs only)")
+    n_asm = sinks.assemblies.total
 
-    print(f"{len(runs)} profile zip(s) -> {len(compiled)} project(s), {len(file_rows)} files "
+    print(f"{len(runs)} profile zip(s) -> {len(compiled)} project(s), {n_files} files "
           f"({'unique hashes' if a.unique else 'all files'} counted; PDF drawings: {a.pdf_drawings}; "
-          f"assembly rows: {'ESTIMATED, ' + str(len(assemblies)) if not a.no_assembly_breakdown else 'not produced'})")
-    for r in compiled:
+          f"assembly rows: {'ESTIMATED, ' + str(n_asm) if not a.no_assembly_breakdown else 'not produced'})")
+    for r in compiled[:200]:
         print("  ", r)
+    if len(compiled) > 200:
+        print(f"   ... and {len(compiled) - 200} more projects (see Project_Compiled.csv)")
     print(f"Review items: {len(review)}  (see Review)\nWrote files in {out}")
 
 

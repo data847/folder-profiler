@@ -24,7 +24,8 @@ IF THE RUN STOPS - IT RESUMES
 Big folders take a long time. If the tool stops for any reason (crash, power cut, restart, Ctrl+C), start it again with the same
 settings and the same folder: it continues from the last saved point, not from the beginning. Progress is saved after every few
 thousand files in the "output" folder (a hidden ".resume" folder) and removed when the run finishes. To ignore it and start over,
-tick "Start from scratch" on the page (or use --fresh). If files were added or removed in between, the tool says so in the log.
+tick "Start from scratch" on the page (or use --fresh). If files were added, removed or replaced in between, the tool notices (it compares what it saved
+with what is on the disk), profiles the affected part again and says so in the log.
 
 RUN STATISTICS (safe to share)
 Every run also produces run_stats_...zip (and a "Download run statistics" button on the page). It contains the time each step took,

@@ -5,7 +5,7 @@
 # filesystem and no extra privileges. The metrics zip appears in ./output.
 set -euo pipefail
 cd "$(dirname "$0")"
-IMAGE="folder-profiler:1.6"
+IMAGE="folder-profiler:1.7"
 SRC="${1:-}"
 shift || true          # anything after the folder is passed to the profiler, e.g. --level 2 --project-depth 2
 [ -n "$SRC" ] || read -r -p "Drag the folder here and press Enter: " SRC

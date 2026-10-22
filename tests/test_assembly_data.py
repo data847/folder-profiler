@@ -28,7 +28,7 @@ with tempfile.TemporaryDirectory() as t1, tempfile.TemporaryDirectory() as t2:
     check("only assembly files carry a name", sorted(r["asm_name"] for r in asm_rows) == ["Sub.sldasm", "Top.sldasm"])
     check("non-assembly rows have an empty asm_name", all(r["asm_name"] == "" for r in files if r["ext"] != "sldasm"))
     check("no folder name or part file name anywhere", not any(m.encode() in blob for m in (TOP, SUB, LOOSE, PART)))
-    check("Run_info says names are real", info["assembly_names"] == "real" and info["tool_version"] == "1.6")
+    check("Run_info says names are real", info["assembly_names"] == "real" and info["tool_version"] == "1.7")
     ids = {r["dir_id"] for r in files}
     check("every file's dir_id exists in Dirs.csv", ids <= {d["dir_id"] for d in dirs})
     by_id = {d["dir_id"]: d for d in dirs}
@@ -36,7 +36,7 @@ with tempfile.TemporaryDirectory() as t1, tempfile.TemporaryDirectory() as t2:
     check("Sub's folder is a child of Top's folder", by_id[sub]["parent_dir_id"] == top)
     check("files in the same folder share a dir_id", len({r["dir_id"] for r in files if r["ext"] == "slddrw"} | {top}) == 1)
     check("project root folder has an empty parent", sum(1 for d in dirs if d["parent_dir_id"] == "") == 1)
-    check("dir_id is 10 hex chars", all(re.fullmatch(r"[0-9a-f]{10}", i) for i in ids))
+    check("dir_id is 16 hex chars (64 bits: no collisions at millions of folders)", all(re.fullmatch(r"[0-9a-f]{16}", i) for i in ids))
 
     files_a, dirs_a, info_a, blob_a = run(t2, anon=True)
     names = sorted(r["asm_name"] for r in files_a if r["asm_name"])

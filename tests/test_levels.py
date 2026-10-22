@@ -72,6 +72,18 @@ with tempfile.TemporaryDirectory() as t:
         "#20=NEXT_ASSEMBLY_USAGE_OCCURRENCE('n1','','',#10,#11,$);\n#21=NEXT_ASSEMBLY_USAGE_OCCURRENCE('n2','','',#10,#12,$);\nENDSEC;\n")
     st = cl.step_structure(stp)["parents"]; check("STEP parent -> children (by product id and name)", sorted(st.get("top", [])), ["b", "c", "foot", "leg"])
 
+# ---------- patterns seen in REAL Solid Edge files (a hinge assembly and three drawings from public sources)
+with tempfile.TemporaryDirectory() as t:
+    u16 = lambda x: x.encode("utf-16le") + b"\x00\x00"
+    blob = (u16("FILE NAME: self.dft") + u16("Ansi Inch Draft.dft") + u16("C:\\proj\\Real Part.par") + u16("ez9-28~1.asm")
+            + u16("0-ev-assy-04.asm") + u16("\\\\server\\wip\\ez9-280-ev-assy-04.asm") + b"\x00bracket.psm\x00")
+    p = os.path.join(t, "self.dft"); open(p, "wb").write(cfb_file({"PSMcluster0": blob}))
+    check("real-file noise removed: labels, own name, Windows 8.3 aliases and cut-off fragments are not references",
+          cl.ole_refs(p), ["ansi inch draft.dft", "bracket.psm", "ez9-280-ev-assy-04.asm", "real part.par"])
+    w = os.path.join(t, "weld.pwd"); open(w, "wb").write(cfb_file({"Occurrences": u16("C:\\x\\Rail.par") + u16("Plate.psm")}))
+    check("Solid Edge weldment (.pwd) is read like an assembly", cl.ole_refs(w), ["plate.psm", "rail.par"])
+    check("the profiler records names of .pwd files and reads their references", ("pwd" in fp.ASSEMBLY_EXTS, "pwd" in fp.LINK_READ_EXTS), (True, True))
+
 # ---------- end to end: levels, depth, smart hash, links
 with tempfile.TemporaryDirectory() as t:
     src = os.path.join(t, "parent")

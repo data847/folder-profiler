@@ -69,6 +69,19 @@ were matched by name. **Only "file references" are real CAD links**; everything 
 names are the real file names (level ≥ 1, or assembly files at level 0) or `ASM-xxxxxxxx` codes if the data owner hid them.
 Projects with no assembly files get no rows. Also written as `Assembly_Breakdown_ESTIMATE.csv`.
 
+**Scale and Excel's row limit:** the compiler streams the profile one project at a time (memory is the biggest single project, about 1.4 KB per file in
+that project; measured 120 MB for a 300,000-file profile of 300 projects, where the earlier whole-profile compiler needed 1.65 GB). `File_Level`,
+`Assembly_Breakdown_ESTIMATE` and `Assembly_Evidence` are written in parts of 1,000,000 rows (`File_Level.csv`, `File_Level_2.csv`, ...) because Excel
+holds at most 1,048,576 rows per sheet; `compiled.xlsx` gets the first `--xlsx-max-sheets` (default 3) parts of each as sheets `File Level`, `File Level (2)`, ...
+and `Review.csv` says when parts only exist as CSV. `--unique --unique-scope all` is the one option that needs the whole profile in memory. File_Level rows are in
+processing order (the folder order of the profile), not sorted by project.
+
+**Which formats are proven:** references were verified on real SolidWorks assemblies, real STEP files and real Solid Edge files (one assembly, three drawings). Inventor uses the same container reader but has not been tested on a real file. CATIA V5, Creo and NX have no container reader: their references are found by searching the file for CAD file names (`kind = scan` in Links.csv), tested only on synthetic files - `Review.csv` says "references by text scan" for those projects; treat them as weaker than SolidWorks / Solid Edge / STEP. Revit and AutoCAD xrefs are not read. References to drawings / templates (`.dft`, `.idw`, `.slddrw`, ...) are never counted.
+
+**Software from content, not only from the extension (profiler 1.7+):** the profiler's `header_signature` names the program inside some files (`OLE2:SolidEdge` - verified on 7 real files; `OLE2:Inventor`, `OLE2:Revit`, `CATIA:V5`, `CREO` - not yet seen on real files). `mapping/signature_software.csv` maps those tags to software. It decides `Native CAD Software` for the shared extensions `.asm` / `.prt` (which the extension table leaves blank) and overrides a wrong extension; `Review.csv` topic "software by content" counts both. A file with CAD content under a non-CAD extension is NOT counted as a part or assembly but is listed under "native file, other extension".
+
+**How reliable is the folder fallback on this project?** Where references place parts for certain, the compiler re-places the same parts by the folder rule alone and reports the agreement (`folder_rule_agrees` in Assembly_Confidence.csv and in the Review note, e.g. "75% of 4 linked parts"). That is the empirical trust level for the parts the folder rule had to place; low numbers mean the project's folders do not follow its assemblies.
+
 **How references are resolved** (level 2): a reference is matched to a real file by exact name, then by comparable name; if copies
 exist in several folders the one in the nearest folder wins, and identical copies (same type, size and date - or same hash in older profiles) are interchangeable. A reference is
 counted *ambiguous* only when differing copies are equally near. References to files that are not in the project (library parts,

@@ -22,21 +22,42 @@ Two pieces:
 | **2** | + `Links.csv`: the *names* of files referenced inside assemblies, drawings and STEP files | **real part-to-assembly links** for SolidWorks, Solid Edge and Inventor assemblies and STEP structure |
 
 `--level 0|1|2`, `--project-depth N` (projects = folders N levels down, any N); in the UI these are on the page.
-Level 2 reads each assembly/drawing/STEP file once and keeps only referenced **file names** (no geometry, text or properties);
-it needs `cad_links.py` next to `file_profiler.py`. Unreadable formats (CATIA, Creo, NX ...) simply fall back to name/folder grouping.
+Level 2 opens each assembly/drawing/STEP file **once** (the format tag and the references come from the same read) and keeps only referenced
+**file names** (no geometry, text or properties); it needs `cad_links.py` next to `file_profiler.py`. STEP files are streamed in 16 MB blocks and only
+their PRODUCT / ASSEMBLY entities are parsed (about 12x faster than line-by-line, identical result, flat memory). SolidWorks, Solid Edge and Inventor
+files have real container readers. **CATIA V5, Creo and NX have none:** for `.catproduct`, `.catdrawing`, `.prt`, `.drw` and non-OLE `.asm` the file is
+searched for CAD file names written as plain text (`kind = scan` in `Links.csv`); the compiler marks those assignments as weaker evidence. Revit and
+AutoCAD xrefs are not read (an xref links a drawing to a drawing, which does not change part / assembly counts).
 Levels 1-2 disclose client names, so they need the data owner's agreement.
 
 ## Resume, run statistics, scale
 
 - **Streaming + resumable.** Each project is processed in chunks of 5,000 files that are saved to `<out>/.resume/<run id>/` as they finish; stop the run
   any way you like (even `kill -9`) and start it again with the same settings: finished projects and chunks are skipped, nothing is read twice, and the final
-  output is identical to an uninterrupted run (tested). `--fresh` ignores saved progress. A folder that changed meanwhile is flagged in the log.
+  output is identical to an uninterrupted run (tested). `--fresh` ignores saved progress.
+  **Saved progress is checked against the disk.** Every saved chunk stores a fingerprint (relative path, size, modified time of its files); on a restart
+  a chunk whose files changed is profiled again (a replaced file with the same file count is caught), finished projects get a stat-only check
+  (no file is opened), changed archives are re-read, and each of these is said in the log and counted in `Run_info.csv`.
+  Folder ids are 16 hex characters (64 bits; the earlier 10 collided with ~37% probability at 1M folders).
 - **No depth limit.** Folders are walked iteratively with no depth cap (tested 150 levels; Windows long paths via `\\?\`); `--project-depth` accepts any N;
   directory links / junctions are not followed (and counted).
 - **Run statistics** (`run_stats_*.zip`, also inside the profile zip): `Run_phases.csv` (wall time per step + busy seconds per activity), `Run_metrics.csv`
   (CPU %, memory, files/s, MB/s, process read speed every 5 s), `Run_log.csv` (events, written as they happen so a crash keeps them) and `System_info.csv`
   (OS, CPU, RAM, disk type, antivirus state on Windows). No host name, user name or paths. Windows probes use ctypes/PowerShell and are untested here;
   macOS and Linux probes were tested.
+
+## What has been verified on real files
+
+| Format | Verified on real files? |
+|---|---|
+| SolidWorks assemblies (`.sldasm`) | yes - a real assembly: all 22 parts found (SET-09) |
+| STEP product structure | yes - real STEP files (SET-09) |
+| **Solid Edge** (`.asm`, `.dft`) | **yes** - a real hinge assembly gives exactly its 3 parts; 3 real drawings give the models they document (Engine1.dft -> engine1.asm, carb1.par, ...). Real files from public sources (SolidEdgeCommunity/SEU14, an MIT-licensed hinge example). Real `.par` parts and `.pwd` weldments were not read for references |
+| Solid Edge **content tag** (`OLE2:SolidEdge`) | **yes** - all 7 real files (3 `.dft`, 1 `.asm`, 3 `.par`) are recognised from the names inside the OLE directory, whatever their extension |
+| Inventor / Revit content tags, CATIA `V5_CFV2`, Creo `#UGC:` headers | **no real files seen** - the tags follow documented/remembered file signatures and are tested only on synthetic files |
+| CATIA / Creo / NX references (text scan) | **no real files seen** - mechanics tested on synthetic files only; expect false negatives, treat as weaker evidence |
+| Inventor, Revit, AutoCAD xrefs (references) | no real files seen; Inventor shares the OLE reader and is untested; Revit and AutoCAD xrefs are not read |
+| Windows system probes (metrics) | no - macOS and Linux only |
 
 ## Archives, duplicates and references across folders
 

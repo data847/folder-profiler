@@ -8,6 +8,7 @@ import collections
 import re
 
 STEP_EXTS = ("step", "stp")
+NON_MODEL_REF_EXTS = ("dft", "idw", "slddrw", "catdrawing", "drw", "dwg", "dxf", "dwf", "psm_template")   # drafts / templates, never a part or assembly
 
 
 # ------------------------------------------------------------------ names and folders
@@ -113,6 +114,8 @@ def resolve(rows, parents, universe=None):
     for a in (r for r in models if r["cls"] == "ASSEMBLY"):
         keys = {}                                         # distinct referenced thing -> candidate list
         for n in (a["lk"]["names"] if a.get("lk") else ()):
+            if n.rsplit(".", 1)[-1] in NON_MODEL_REF_EXTS:
+                continue
             keys.setdefault(stem(n), (n, by_name.get(n) or by_stem.get(stem(n), []), True))
         for st in step_refs.get(id(a), ()):
             keys.setdefault(st, (st, by_stem.get(st, []), False))
@@ -219,6 +222,23 @@ def assign_assemblies(proj, counted, parents, universe=None):
             if tgt is not None:
                 add(tgt, r, method)
 
+    # ---- how good is the folder rule on THIS project? Parts a file reference placed for certain are re-placed by the folder rule alone
+    # and compared: an empirical agreement rate on the project's own data, reported next to the parts the folder rule had to place.
+    fold_n, fold_credit = 0, 0.0
+    if part_asm and parents and all(r["dir"] for r in counted):
+        by_dir_ = collections.defaultdict(list)
+        for i, r in enumerate(asm):
+            by_dir_[r["dir"]].append(i)
+        for r in items:
+            if r["cls"] != "PART" or id(r) not in part_asm:
+                continue
+            targets, x, seen = by_dir_.get(r["dir"]), r["dir"], set()
+            while not targets and x and x not in seen:
+                seen.add(x); x = parents.get(x, ""); targets = by_dir_.get(x)
+            if targets:
+                fold_n += 1
+                fold_credit += (1.0 / len(targets)) if part_asm[id(r)] in targets else 0.0     # an even split among several is right 1 time in len
+
     left = [r for r in items if id(r) not in done]
     need = collections.defaultdict(collections.Counter)
     for r in left:
@@ -307,12 +327,15 @@ def assign_assemblies(proj, counted, parents, universe=None):
                   "refs_ambiguous": refs_amb, "refs_external": refs_ext, "refs_unresolved": refs_total - refs_ok, "shared_parts": shared,
                   "assemblies_without_refs": asm_no_refs, "others_link": other["link"], "others_name": other["name"],
                   "others_folder_or_even": other["folder"] + other["spread"] + other["even"], "confidence": conf, "why": why,
-                  "unresolved_examples": "; ".join(unresolved_names[:5])}
+                  "unresolved_examples": "; ".join(unresolved_names[:5]),
+                  "folder_rule_agrees": f"{100 * fold_credit / fold_n:.0f}% of {fold_n} linked parts" if fold_n else "n/a"}
     note = (f"{k} assemblies, confidence {conf} ({why}); parts: {pct('link')} from file references, {pct('folder')} by folder, "
             f"{pct('spread')} spread, {pct('even')} even split; drawings/PDFs/neutral files: {other['link']} by reference, "
             f"{other['name']} by name, {other['folder'] + other['spread'] + other['even']} by folder/even; "
             f"references resolved {refs_ok}/{refs_total}" + (f" ({refs_ext} to files in other projects, {refs_amb} ambiguous)" if refs_ext or refs_amb else "") +
             (f"; {shared} parts shared by several assemblies counted once" if shared else "") +
+            (f"; checked on this project, the folder rule alone agrees with the file references for {100 * fold_credit / fold_n:.0f}% of the {fold_n} linked parts"
+             f" - that is roughly how far to trust the {pm('folder') + pm('spread') + pm('even')} folder-placed parts" if fold_n and (pm('folder') + pm('spread') + pm('even')) else "") +
             ". Only 'file references' are real CAD links; the rest are estimates")
     return rows, note, {"rows": ev_rows, "project": project_ev}
 
@@ -456,11 +479,20 @@ def detect_copies(per_project, min_files=20, threshold=0.8, common_limit=20):
     (or, when equal, the alphabetically first) project. Files the profiler did not need to fingerprint (their size is unique in the
     whole run, so they cannot have a copy anywhere) count against the share. Contents held by more than `common_limit` projects
     (standard files that appear everywhere) are ignored."""
-    cnt, total, holders = {}, {}, collections.defaultdict(list)
+    total, cnt = {}, {}
     for proj, P in per_project.items():
         rows = [r for r in P["rows"] if r["size"] > 0]
         total[proj] = len(rows)
         cnt[proj] = collections.Counter(r["fp"] for r in rows if r.get("fp"))
+    return detect_copies_from(total, cnt, min_files, threshold, common_limit)
+
+
+def detect_copies_from(total, cnt, min_files=20, threshold=0.8, common_limit=20):
+    """Same as detect_copies() from per-project summaries: total[proj] = non-empty files, cnt[proj] = Counter of their fingerprints
+    (any hashable). Lets the compiler keep only these summaries instead of every row of every project. Ties between equally good
+    originals go to the larger project, then the alphabetically first, so the answer never depends on processing order."""
+    holders = collections.defaultdict(list)
+    for proj in sorted(cnt, key=str.lower):
         for h in cnt[proj]:
             holders[h].append(proj)
     overlap = collections.Counter()
@@ -471,11 +503,12 @@ def detect_copies(per_project, min_files=20, threshold=0.8, common_limit=20):
                     if a != b:
                         overlap[(a, b)] += cnt[a][h]
     out = {}
-    for (a, b), k in overlap.items():
+    for (a, b), k in sorted(overlap.items(), key=lambda kv: (kv[0][0].lower(), kv[0][1].lower())):
         if total[a] < min_files:
             continue
         share = k / total[a]
         bigger = total[b] > total[a] or (total[b] == total[a] and b.lower() < a.lower())
-        if share >= threshold and bigger and (a not in out or share > out[a][1]):
-            out[a] = (b, share, total[a])
+        if share >= threshold and bigger:
+            if a not in out or (share, total[b]) > (out[a][1], total[out[a][0]]):
+                out[a] = (b, share, total[a])
     return out

@@ -60,7 +60,7 @@ with tempfile.TemporaryDirectory() as t:
     check("resumed run did not re-read anything that was already saved", c1 + c2, total_calls)
     check("resumed output is identical to the uninterrupted output", rows_of(z) == base, True)
     log = zipfile.ZipFile(z).read("Run_log.csv").decode("utf-8")
-    check("log tells the story (resumed, finished projects skipped)", ("RESUMED" in log, "already done in an earlier run" in log, info_of(z)["restarts_resumed"]), (True, True, "1"))
+    check("log tells the story (resumed, finished projects skipped)", ("RESUMED" in log, "unchanged since an earlier run" in log, info_of(z)["restarts_resumed"]), (True, True, "1"))
     check("saved progress is removed after a successful run", os.path.exists(os.path.join(out, ".resume")), False)
     # ---- 2. crash in the middle of a chunk (nothing of that chunk was saved)
     out = os.path.join(t, "o2"); seen = [0]
@@ -127,5 +127,39 @@ with tempfile.TemporaryDirectory() as t:
     z = run(src, out); os.remove(extra)
     log = zipfile.ZipFile(z).read("Run_log.csv").decode("utf-8")
     check("a folder that changed between restarts is flagged (WARN in the log, counted in Run_info)", ("changed while profiling" in log, info_of(z)["projects_changed_during_run"]), (True, "1"))
+    # ---- 7. a file is REPLACED while the run is down (same file count): the stale saved rows are not kept
+    out = os.path.join(t, "o8")
+    fp._TEST_HOOK = boom_after_chunk
+    try: run(src, out)
+    except Boom: pass
+    fp._TEST_HOOK = None
+    gone = os.path.join(src, "P0", "sub0", "f00.sldprt"); newf = os.path.join(src, "P0", "sub0", "f00_replacement.sldprt")
+    keep = open(gone, "rb").read(); os.remove(gone); open(newf, "wb").write(b"REPLACEMENT")
+    z = run(src, out)
+    names = [r["rel_path"] for r in rows_of(z) if r["project"] == "P0"]
+    log = zipfile.ZipFile(z).read("Run_log.csv").decode("utf-8")
+    check("replaced file (in a project finished before the stop): the new one is listed, the removed one is not",
+          (any(n.endswith("f00_replacement.sldprt") for n in names), "sub0/f00.sldprt" in names), (True, False))
+    check("replaced file: stale chunks are redone, said in the log and counted",
+          ("profiled again" in log, int(info_of(z)["chunks_redone_after_change"]) > 0), (True, True))
+    os.remove(newf); open(gone, "wb").write(keep)
+    # ---- 8. an archive is replaced while the run is down
+    out = os.path.join(t, "o9")
+    stop_at_archive = lambda ui, ch: (_ for _ in ()).throw(Boom()) if str(ch).startswith("a") else None
+    fp._TEST_HOOK = stop_at_archive
+    try: run(src, out)
+    except Boom: pass
+    fp._TEST_HOOK = None
+    zp = os.path.join(src, "P1", "bk0.zip")
+    old = open(zp, "rb").read()
+    with zipfile.ZipFile(zp, "w") as zz:
+        zz.writestr("old/swapped_in.sldprt", b"s" * 9)
+    z = run(src, out)
+    names = [r["rel_path"] for r in rows_of(z)]
+    check("replaced archive: its new content is listed", (any("swapped_in" in n for n in names), any(n.endswith("old/a0.sldprt") for n in names)), (True, False))
+    open(zp, "wb").write(old)
+    # ---- 9. folder ids are long enough that two folders never share one
+    ids = {r["dir_id"] for r in csv.DictReader(io.StringIO(zipfile.ZipFile(z).read("Files.csv").decode("utf-8-sig")))}
+    check("folder ids are 16 hex characters", {len(i) for i in ids}, {16})
 fp.signature = _orig_sig
 sys.exit(1 if any(bad) else 0)
