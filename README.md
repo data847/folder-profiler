@@ -13,22 +13,22 @@ Two pieces:
 | **Profiler** — produces `profile_<folder>_<date>.zip` | `file_profiler.py` (+ Docker / launchers) | the data owner, on their machine |
 | **Compiler skill** — turns those zips into the "Projects Compiled" workbook | `claude-skill/profile-compile/` | you, after receiving the zips |
 
-## Detail levels (the data owner chooses)
+## Detail levels (default 2 - everything; the UI has no selector)
 
 | Level | Records | Gives the compiler |
 |---|---|---|
-| **0** (default) | extensions, sizes, dates, format tag, anonymous folder ids, assembly file names | folder-based assembly estimate |
+| **0** | extensions, sizes, dates, format tag, anonymous folder ids, assembly file names | folder-based assembly estimate |
 | **1** | + names and relative paths of every file and folder (`rel_path`, `Dirs.csv` names) | PDF drawings by name, drawings/neutral files matched to parts and assemblies by name, real project names at any depth |
-| **2** | + `Links.csv`: the *names* of files referenced inside assemblies, drawings and STEP files | **real part-to-assembly links** for SolidWorks, Solid Edge and Inventor assemblies and STEP structure |
+| **2** (default) | + `Links.csv`: the *names* of files referenced inside assemblies, drawings and STEP files | **real part-to-assembly links** for SolidWorks, Solid Edge and Inventor assemblies and STEP structure |
 
-`--level 0|1|2`, `--project-depth N` (projects = folders N levels down, any N); in the UI these are on the page.
+`--level 0|1|2` (default 2), `--project-depth N` (projects = folders N levels down, default 1) are command-line options only; the UI always uses level 2.
 Level 2 opens each assembly/drawing/STEP file **once** (the format tag and the references come from the same read) and keeps only referenced
 **file names** (no geometry, text or properties); it needs `cad_links.py` next to `file_profiler.py`. STEP files are streamed in 16 MB blocks and only
 their PRODUCT / ASSEMBLY entities are parsed (about 12x faster than line-by-line, identical result, flat memory). SolidWorks, Solid Edge and Inventor
 files have real container readers. **CATIA V5, Creo and NX have none:** for `.catproduct`, `.catdrawing`, `.prt`, `.drw` and non-OLE `.asm` the file is
 searched for CAD file names written as plain text (`kind = scan` in `Links.csv`); the compiler marks those assignments as weaker evidence. Revit and
 AutoCAD xrefs are not read (an xref links a drawing to a drawing, which does not change part / assembly counts).
-Levels 1-2 disclose client names, so they need the data owner's agreement.
+Because the default is level 2, the output contains client file and folder names: get the data owner's agreement first (`--level 0` records metrics only).
 
 ## Resume, run statistics, scale
 

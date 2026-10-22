@@ -3,22 +3,17 @@ FOLDER PROFILER - STEP-BY-STEP GUIDE (no technical knowledge needed)
 
 WHAT THIS DOES
 It counts and measures the files in a folder (types, sizes, dates) and makes ONE small zip file
-with the numbers. By default (detail level 0) it does NOT copy, read out, store or send your files or folder names. The only
-file names it records are those of ASSEMBLY files (the .sldasm, .asm, .iam, .catproduct files),
-which we need to group parts under their assembly - you can hide even these (see below).
-You can choose to record more (levels 1 and 2, see "HOW MUCH IT RECORDS" below); that is always your decision.
+with the numbers. It never copies, stores or sends your files or their contents - only information ABOUT them (see "WHAT IT RECORDS").
 It does not use the internet. Your files are never changed.
 
-HOW MUCH IT RECORDS (DETAIL LEVEL) - YOUR CHOICE
-In the browser page (run-ui) step 3 has "Detail level":
-  0 = metrics only (default). No folder names. Only assembly file names are recorded (see below).
-  1 = also the names and paths of files and folders inside each project. No file contents.
-  2 = level 1 plus the NAMES of the files that assemblies/drawings/STEP files refer to, so parts can be
-      grouped under their real assembly. Nothing else is read out of your files (no geometry, no text).
-Levels 1 and 2 reveal your file and folder names - use them only if you are happy to share those.
-"Projects are N level(s) below the chosen folder": use 2 if your chosen folder contains big container
-folders (for example DESIGN) whose sub-folders are the real projects.
-Command line: --level 0|1|2  --project-depth N   (N can be any number)
+WHAT IT RECORDS
+For every file at any folder depth: its type, size, modified date, a short format tag, and its file name and
+folder path. For assembly, drawing and STEP files it also reads out the NAMES of the other files they point to,
+so that parts can be grouped under their real assembly. Nothing else is read out of your files: no geometry, no
+text, no properties, and no file is ever copied or sent. THE ZIP THEREFORE CONTAINS YOUR FILE AND FOLDER NAMES -
+only send it if you are happy to share those.
+There are no settings to choose: the tool always records all of this and always includes every sub-folder.
+(Expert command line only: --level 0|1|2 records less, --project-depth N sets which folder level counts as a project.)
 
 IF THE RUN STOPS - IT RESUMES
 Big folders take a long time. If the tool stops for any reason (crash, power cut, restart, Ctrl+C), start it again with the same
@@ -34,7 +29,7 @@ a sample of your computer's CPU, memory and reading speed every 5 seconds during
 names, computer name or user name. Send it to us if we ask how your machine performed.
 
 NOTHING IS HASHED
-The tool never computes fingerprints of your files and never reads a file in full (except, at level 2, the assembly, drawing and
+The tool never computes fingerprints of your files and never reads a file in full (except the assembly, drawing and
 STEP files whose references are listed). Duplicate files are recognised by their size and modified date instead.
 All sub-folders are included, however deeply they are nested.
 
@@ -44,11 +39,6 @@ By default the tool also opens archives to see the CAD files inside, because tho
 LISTED (names and sizes). A file inside an archive that is identical to a file already in the same project is
 not counted twice. Untick "Look inside archives" on the page (or use --archives off) to skip this. It can add
 time on folders with many large archives (there is a built-in limit of 20 GB read from archives per run).
-
-HIDING ASSEMBLY FILE NAMES (level 0 only)
-In the browser page (run-ui) tick "Hide assembly file names": they are replaced by codes like
-ASM-3F9A1C2B.SLDASM. On the command line use --anonymize-assembly-names (or set PROFILER_ANON_ASM=1).
-Folders are only ever recorded as anonymous ids (random each run, cannot be turned back into names).
 
 WHAT YOU NEED
 - A Windows computer (Mac: see the Mac section at the bottom).
@@ -93,12 +83,6 @@ STEP 3. Choose what to measure. At the top of the page you see two options:
     folder's NAME to open it and look inside.
 
 STEP 4. Run it.
-  - "Detail level": 0 = metrics only (default), 1 = also file and folder names, 2 = also the names of
-    files that assemblies refer to (see "HOW MUCH IT RECORDS" at the top). Levels 1 and 2 reveal names.
-  - "Projects are N level(s) below the chosen folder": leave at 1 unless your folder holds big
-    container folders (for example DESIGN) whose sub-folders are the real projects; then use 2.
-  - Optional (level 0 only): tick "Hide assembly file names" if you do not want real assembly file
-    names recorded; they are replaced by codes such as ASM-3F9A1C2B.SLDASM.
   - Click the "Start profiling" button.
   - Text appears showing progress, such as "scanned 1,200 files". Wait until it says
     "Done", with the number of folders and files. Do not close the black window yet.

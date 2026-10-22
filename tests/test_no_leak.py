@@ -16,8 +16,14 @@ with tempfile.TemporaryDirectory() as t:
     out = os.path.join(t, "out")
     sys.path.insert(0, here)
     import file_profiler
-    zip_path, *_ = file_profiler.profile(t, out, log=lambda *_: None)
+    zip_path, *_ = file_profiler.profile(t, out, log=lambda *_: None, tier=0)
     blob = b"".join(zipfile.ZipFile(zip_path).read(n) for n in zipfile.ZipFile(zip_path).namelist())
     bad = [m for m in (M, F, D) if m.encode() in blob]
-    print("FAIL - leaked:", bad) if bad else print("PASS - no marker, file name or sub-folder name in output")
-    sys.exit(1 if bad else 0)
+    print("FAIL - level 0 leaked:", bad) if bad else print("PASS - level 0: no marker, file name or sub-folder name in output")
+    # default level (2): names are recorded on purpose, but file CONTENT never is
+    zip2, *_ = file_profiler.profile(t, os.path.join(t, "out2"), log=lambda *_: None)
+    blob2 = b"".join(zipfile.ZipFile(zip2).read(n) for n in zipfile.ZipFile(zip2).namelist())
+    bad2 = [m for m in (M,) if m.encode() in blob2]
+    print("FAIL - default level leaked file content:", bad2) if bad2 else print("PASS - default level: names recorded, file content never")
+    print("PASS - default level records names as documented" if F.encode() in blob2 else "FAIL - default level did not record names")
+    sys.exit(1 if (bad or bad2 or F.encode() not in blob2) else 0)

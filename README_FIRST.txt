@@ -8,16 +8,14 @@ FOLDER PROFILER (Windows)  -  full guide: HOW_TO_RUN.pdf
      run.bat          otherwise (Python is included)
 3. When it says Done, send us the ONE zip in the "output" folder.
 
-It collects metrics only: extensions, sizes, dates, short format tags. No file is ever hashed or read in full (except, at level 2, the assemblies
-whose references are listed). All sub-folders at any depth are included.
-It never copies, uploads or stores file contents or folder names/paths. The only file names recorded are those of
-ASSEMBLY files (.sldasm .asm .iam .catproduct); hide them with the tick box in run-ui or --anonymize-assembly-names.
-Folders appear only as anonymous ids. No internet use.
+It records, for every file at any folder depth: type, size, date, short format tag, file name and folder path, and (for assembly,
+drawing and STEP files) the NAMES of the files they reference. No file is ever copied, hashed or read in full except to list those
+references, and no file contents are stored. The zip therefore contains file and folder names: share it only if that is acceptable.
+No internet use. There are no options to choose.
 You can open file_profiler.py in Notepad to read everything it does, and the CSVs in the zip to check.
 If something fails, send us output\error_log.txt (your name and paths are removed from it).
 
-DETAIL LEVELS: 0 (default) = metrics only; 1 = + file/folder names; 2 = + links inside assemblies. Choose on the run-ui page,
-or --level 2 --project-depth 2 on the command line. Levels 1-2 disclose names; see CLIENT_GUIDE.txt.
+(Experts only: --level 0|1|2 records less; --project-depth N sets which folder level is a project.)
 
 ARCHIVES: .zip/.tar.gz files are opened to see the CAD files inside (nothing is extracted to disk; 7z/rar are listed only).
 Untick "Look inside archives" on the page or use --archives off to skip them.

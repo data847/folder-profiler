@@ -357,7 +357,7 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
     workers = max(1, workers or default_workers())
     chunk_files = int(chunk_files or CHUNK_FILES)
     env_int = lambda k, d: int(os.environ[k]) if os.environ.get(k, "").isdigit() else d
-    tier = env_int("PROFILER_TIER", 0) if tier is None else int(tier)
+    tier = env_int("PROFILER_TIER", 2) if tier is None else int(tier)
     if tier not in (0, 1, 2):
         raise SystemExit("detail level must be 0, 1 or 2")
     if tier == 2 and cad_links is None:
@@ -979,8 +979,8 @@ def main(argv=None):
     ap.add_argument("--anonymize-assembly-names", action="store_true",
                     help="write codes like ASM-3F9A1C2B.SLDASM instead of the real assembly file names")
     ap.add_argument("--level", "--tier", dest="level", type=int, choices=[0, 1, 2], default=None,
-                    help="detail level: 0 = metrics only (default), 1 = + file/folder names and paths, "
-                         "2 = + names of files referenced inside assemblies/drawings/STEP (env PROFILER_TIER)")
+                    help="detail level: 0 = metrics only, 1 = + file/folder names and paths, "
+                         "2 (default) = + names of files referenced inside assemblies/drawings/STEP (env PROFILER_TIER)")
     ap.add_argument("--project-depth", type=int, default=None,
                     help="projects are the folders this many levels below the chosen one (default 1; env PROFILER_PROJECT_DEPTH)")
     ap.add_argument("--archives", choices=["off", "list", "full"], default=None,

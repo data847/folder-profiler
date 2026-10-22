@@ -28,7 +28,7 @@ with tempfile.TemporaryDirectory() as t:
                 "Lib/l1.sldprt", "Lib/l2.sldprt", "Lib/l3.sldprt", "Lib/l4.sldprt"):
         put(src, f"M/{rel}", rel)                      # distinct content so --unique would not merge anything
     put(src, "N/only.sldprt")                           # project without assemblies
-    zip_path, *_ = fp.profile(src, os.path.join(t, "out"), log=lambda *_: None, workers=1)
+    zip_path, *_ = fp.profile(src, os.path.join(t, "out"), log=lambda *_: None, workers=1, tier=0)
     runs = cp.load_profiles([zip_path]); ext_map, soft = cp.load_mapping(os.path.join(ROOT, "claude-skill", "profile-compile", "scripts", "mapping"))
     compiled, _f, _s, review, asm, _ev = cp.compile_runs(runs, ext_map, soft, False, "none", True)
     rows = {r[1]: r for r in asm if r[0] == "M"}

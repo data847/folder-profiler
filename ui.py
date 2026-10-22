@@ -55,14 +55,8 @@ li span.n{flex:1}pre{margin:0;max-height:220px;overflow:auto;font-size:13px;whit
 <ul id="ls"></ul>
 <div id="selbox" style="display:none;margin-top:12px"><span class="mut" id="selcount"></span><ul id="sel" style="max-height:150px"></ul></div></div>
 <div class="card"><b>3. Run</b>
-<div style="margin-top:8px"><label>Detail level&nbsp;
-<select id="lvl"><option value="0">0 - metrics only (no folder names)</option><option value="1">1 - plus file and folder names</option><option value="2">2 - plus links inside assemblies</option></select></label>
-<div class="mut" id="lvlhelp" style="margin-top:4px"></div></div>
-<div style="margin-top:8px"><label>Projects are&nbsp;<input type="number" id="depth" value="1" min="1" max="6" style="width:60px"> level(s) below the chosen folder</label>
-<span class="mut"> (1 = each folder directly inside it; use 2 if it holds containers such as DESIGN)</span></div>
 <label style="display:block;margin-top:8px"><input type="checkbox" id="arch" checked> Look inside archives <span class="mut">(.zip and .tar.gz are opened; .7z and .rar are listed only. Nothing is extracted to disk.)</span></label>
 <label style="display:block;margin-top:8px"><input type="checkbox" id="fresh"> Start from scratch <span class="mut">(normally a stopped run continues where it stopped; tick this to ignore saved progress)</span></label>
-<label style="display:block;margin-top:8px" id="anonrow"><input type="checkbox" id="anon"> Hide assembly file names <span class="mut">(use codes like ASM-3F9A1C2B.SLDASM instead of the real names)</span></label>
 <div class="row" style="margin-top:8px"><button id="go">Start profiling</button></div>
 <div class="bar" id="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100"><i id="barfill"></i></div><div class="mut" id="barlabel" style="margin-top:6px"></div>
 <pre id="log" class="mut" style="margin-top:10px"></pre><div id="res" style="margin-top:10px"></div></div>
@@ -89,7 +83,7 @@ $("up").onclick=()=>ls($("up").dataset.parent);$("p").onchange=()=>ls($("p").val
 $("go").onclick=async()=>{$("res").textContent="";$("bar").style.display="none";$("barlabel").textContent="";
  if(mode=="pick"&&!sel.length){$("res").innerHTML="<span class='er'>Tick at least one folder first.</span>";return}
  $("go").disabled=true;
- const o={anon:$("anon").checked,tier:+$("lvl").value,depth:+$("depth").value,arch:$("arch").checked,fresh:$("fresh").checked};
+ const o={arch:$("arch").checked,fresh:$("fresh").checked};
  const body=mode=="pick"?{t:T,paths:sel,...o}:{t:T,path:$("p").value,...o};
  const r=await fetch("/api/start",{method:"POST",body:JSON.stringify(body)});const j=await r.json();
  if(j.error){$("res").innerHTML="<span class='er'>"+esc(j.error)+"</span>";$("go").disabled=false;return}poll()};
@@ -111,16 +105,11 @@ async function poll(){const j=await (await fetch("/api/status?t="+T)).json();bar
   ".</span><br><br><a class='btn' href='/api/download?t="+T+"'>Download metrics zip</a> <span class='mut'>"+esc(j.result.name)+"</span><br><br>"+
   "<a class='btn' style='background:var(--ac)' href='/api/download_log?t="+T+"'>Download run statistics</a> <span class='mut'>timings and your machine's speed - no file or folder names, safe to share</span>";
  else if(j.state=="error")$("res").innerHTML="<span class='er'>"+esc(j.error)+"</span>"}
-const HELP={0:"Records extensions, sizes, dates and fingerprints, anonymous folder ids, and the names of assembly files only (tick below to hide those).",
- 1:"Level 0 plus the names and relative paths of every file and folder. No file contents.",
- 2:"Level 1 plus the NAMES of files that assemblies, drawings and STEP files point to (so parts can be grouped under their real assembly). Nothing else is read out of the files."};
-function lv(){const v=+$("lvl").value;$("lvlhelp").textContent=HELP[v];$("anon").disabled=v>0;$("anonrow").style.opacity=v>0?.5:1}
-$("lvl").onchange=lv;lv();
 renderSel();ls("");
 </script></body></html>"""
 
 
-def _run(path, folders=None, anon=False, tier=0, depth=1, arch=True, fresh=False):
+def _run(path, folders=None, anon=False, tier=2, depth=1, arch=True, fresh=False):
     def log(msg):
         with LOCK:
             STATE["log"].append(msg.rstrip())
@@ -244,7 +233,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "A run is already in progress"})
             STATE.update(state="running", log=[], result=None, error=None,
                          progress={"phase": "scan", "files": 0, "total_files": 0, "bytes": 0, "total_bytes": 0})
-        threading.Thread(target=_run, args=(path, folders or None, bool(body.get("anon")), int(body.get("tier") or 0), int(body.get("depth") or 1),
+        threading.Thread(target=_run, args=(path, folders or None, bool(body.get("anon")), 2, 1,
                                                           body.get("arch", True) is not False, bool(body.get("fresh"))), daemon=True).start()
         self._json({"ok": True})
 

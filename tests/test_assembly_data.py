@@ -16,7 +16,7 @@ def build(t):
     put(f"{TOP}/{SUB}/Sub.sldasm"); put(f"{TOP}/{SUB}/{PART}3.sldprt"); put(f"{LOOSE}/{PART}4.sldprt")
 
 def run(t, anon):
-    z, *_ = fp.profile(t, os.path.join(t, "out"), log=lambda *_: None, anonymize_assembly_names=anon, workers=1)
+    z, *_ = fp.profile(t, os.path.join(t, "out"), log=lambda *_: None, anonymize_assembly_names=anon, workers=1, tier=0)
     zf = zipfile.ZipFile(z)
     rd = lambda n: list(csv.DictReader(io.StringIO(zf.read(n).decode("utf-8-sig"))))
     return rd("Files.csv"), rd("Dirs.csv"), {r["key"]: r["value"] for r in rd("Run_info.csv")}, b"\n".join(zf.read(n) for n in zf.namelist())
