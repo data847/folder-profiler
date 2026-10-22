@@ -67,7 +67,18 @@ class _Win:
                         ("OtherOperationCount", ctypes.c_ulonglong), ("ReadTransferCount", ctypes.c_ulonglong),
                         ("WriteTransferCount", ctypes.c_ulonglong), ("OtherTransferCount", ctypes.c_ulonglong)]
         self.FILETIME, self.MEMSTAT, self.PMC, self.IOC = FILETIME, MEMSTAT, PMC, IOC
+        # 64-bit safe signatures: without argtypes a handle (a large Python int) is passed as a 32-bit int and raises, which made the
+        # process memory / read-speed columns come out empty on a real Windows run
         self.k32.GetCurrentProcess.restype = wintypes.HANDLE
+        self.k32.GetCurrentProcess.argtypes = []
+        self.psapi.GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD]
+        self.psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
+        self.k32.GetProcessIoCounters.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+        self.k32.GetProcessIoCounters.restype = wintypes.BOOL
+        self.k32.GetSystemTimes.argtypes = [ctypes.c_void_p] * 3
+        self.k32.GetSystemTimes.restype = wintypes.BOOL
+        self.k32.GlobalMemoryStatusEx.argtypes = [ctypes.c_void_p]
+        self.k32.GlobalMemoryStatusEx.restype = wintypes.BOOL
 
     @staticmethod
     def _ft(f):

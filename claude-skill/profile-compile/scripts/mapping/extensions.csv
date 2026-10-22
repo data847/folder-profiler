@@ -99,6 +99,7 @@ x3d,NEUTRAL3D,,,
 dgn,DRAWING,,,MicroStation drawing
 dwfx,DRAWING,AutoCAD,,
 bak,DATA,,,backup copy (often of a DWG) - not counted as a drawing
+skb,DATA,,,SketchUp backup - not counted as a model
 old,DATA,,,backup copy
 cfg,DATA,,,configuration / settings (OLE storage in Solid Edge folders), not a model
 dwl,DATA,,,AutoCAD lock file

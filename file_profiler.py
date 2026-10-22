@@ -448,6 +448,15 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
     mon = sysmetrics.Monitor(os.path.join(state_dir, "Run_metrics.csv"), state,
                              interval=metrics_interval or env_int("PROFILER_METRICS_INTERVAL", 5), t0=t0)
     mon.start()
+    si_box = [None]                                      # machine facts (PowerShell on Windows takes seconds): gathered while the run works
+    si_thread = None
+    if system_info:
+        os.makedirs(out_dir, exist_ok=True)
+        def _si():
+            si_box[0] = sysmetrics.system_info(data_paths, out_dir, {"workers": workers, "detail_level": tier, "archives_mode": archive_mode,
+                                                                      "hashing": "none"}, deep=True)
+        si_thread = threading.Thread(target=_si, daemon=True)
+        si_thread.start()
     rlog.event("start", ("RESUMED run (restart #%d) " % man["restarts"] if resumed else "started ") +
                f"v{VERSION}: level {tier}, project depth {project_depth}, archives {archive_mode}, {workers} workers, "
                f"{len(units)} projects, hashing: none")
@@ -884,8 +893,9 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
         phases += [["", "", "", "", "", "", ""], ["activity (busy seconds summed over all workers)", "busy_seconds", "calls", "", "", "", "share of process wall time x workers"]]
         for k in sorted(busy, key=lambda k: -busy[k]):
             phases.append([k, round(busy[k], 1), calls[k], "", "", "", f"{100 * busy[k] / max(0.1, proc_s * workers):.0f}%"])
-        sysrows = sysmetrics.system_info(data_paths, out_dir, {"workers": workers, "detail_level": tier, "archives_mode": archive_mode,
-                                                                "hashing": "none"}, deep=system_info) if system_info else [("system_info", "skipped")]
+        if si_thread is not None:
+            si_thread.join(timeout=60)
+        sysrows = si_box[0] or [("system_info", "skipped" if not system_info else "not finished in time")]
         rlog.event("finalize", f"done: {nfiles_out:,} files, {bytes_out / 1e9:.1f} GB, scan {man['prescan_s']:.0f}s + process {proc_s:.0f}s + finalize {fin_s:.0f}s")
         mon.stop(); rlog.close()
         log_files = {"Run_log.csv": open(os.path.join(state_dir, "Run_log.csv"), "rb").read(),
