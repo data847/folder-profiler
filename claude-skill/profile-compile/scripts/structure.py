@@ -174,9 +174,13 @@ def assign_assemblies(proj, counted, parents, universe=None):
     tot = collections.Counter()
     done = set()
 
+    assign = {}                                              # id(file) -> (assembly index, method) for files placed one by one
+    dir_targets = {}                                         # folder id -> (method, candidate assemblies) for files placed by folder
+
     def add(i, r, method):
         rows[i][col_of(r)] += 1
         done.add(id(r))
+        assign[id(r)] = (i, method)
         meth[i][(r["cls"], method)] += 1
         tot[(r["cls"], method)] += 1
 
@@ -280,6 +284,7 @@ def assign_assemblies(proj, counted, parents, universe=None):
                     seen.add(x); x = parents.get(x, "")
                 targets = below.get(x)
             if targets:
+                dir_targets[d] = (method, targets)
                 give(targets, counts, int(d, 16) % len(targets) if d else 0, method)
 
     # ---- evidence / confidence
@@ -337,7 +342,21 @@ def assign_assemblies(proj, counted, parents, universe=None):
             (f"; checked on this project, the folder rule alone agrees with the file references for {100 * fold_credit / fold_n:.0f}% of the {fold_n} linked parts"
              f" - that is roughly how far to trust the {pm('folder') + pm('spread') + pm('even')} folder-placed parts" if fold_n and (pm('folder') + pm('spread') + pm('even')) else "") +
             ". Only 'file references' are real CAD links; the rest are estimates")
-    return rows, note, {"rows": ev_rows, "project": project_ev}
+    even_split = bool(left) and not (parents and all(r["dir"] for r in counted))
+    draw_assign = {}                                         # id(drawing) -> (assembly name or "", how it was decided)
+    for r in items:
+        if r["cls"] == "DRAWING" or (r["cls"] == "PDF" and r["pdfdraw"]):
+            if id(r) in assign:
+                i, m = assign[id(r)]
+                draw_assign[id(r)] = (rows[i][1], m)
+            elif even_split:
+                draw_assign[id(r)] = ("", "even split (no folder information)")
+            elif r["dir"] in dir_targets:
+                m, tg = dir_targets[r["dir"]]
+                draw_assign[id(r)] = (rows[tg[0]][1], m) if len(tg) == 1 else ("", f"{m}: {len(tg)} candidate assemblies")
+            else:
+                draw_assign[id(r)] = ("", "not placed")
+    return rows, note, {"rows": ev_rows, "project": project_ev, "drawing_assign": draw_assign}
 
 
 # ------------------------------------------------------------------ project split by root assembly

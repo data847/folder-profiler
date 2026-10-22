@@ -8,6 +8,9 @@ Input : profile_*.zip written by the Folder Profiler (Files.csv, Run_info.csv, .
 Output: Project_Compiled.csv, File_Level.csv, Project_Stats.csv, Review.csv, and compiled.xlsx
         (needs `openpyxl`; skipped with a notice if it is not installed) with tabs
           "Project Compiled"    11 columns, exactly the template's headings
+          "Drawing Breakdown"   one row per drawing file (native 2D drawing or PDF counted as a drawing): format, software, sheets
+                                (AutoCAD, with confidence), the assembly it belongs to and HOW that was decided (reference / name / folder /
+                                several candidates / none); rows add up to Native 2D Drawings + PDF Drawings
           "Assembly Breakdown"  template headings only - see Review (needs file names + assembly structure,
                                 which the profiler deliberately does not collect) - or, with
                                 --estimate-assemblies, ESTIMATED rows (see below)
@@ -59,6 +62,8 @@ from structure import (assign_assemblies, build_universe, detect_copies, detect_
 HEADINGS = ["Project Name", "Project Description", "Domain", "Native CAD Software", "Part Files",
             "Assembly Files", "Native 2D Drawings", "PDF Drawings", "Neutral 3D Files",
             "2D Files (file types)", "3D Files (file types)"]
+DRAWING_HEADINGS = ["Project Name", "Drawing File Name", "Format", "Native CAD Software", "Sheets", "Sheets Confidence", "Assembly",
+                    "Assembly Method", "In Archive"]
 ASSEMBLY_HEADINGS = ["Project Name", "Assembly File Name", "Part Files", "Native 2D Drawings",
                      "PDF Drawings", "Neutral 3D Files"]
 FILE_HEADER = ["project", "ext", "class", "native_software", "domain", "size_bytes", "modified_utc", "sha256",
@@ -329,13 +334,14 @@ class CsvSink:
 
 
 class Sinks:
-    def __init__(self, files=None, assemblies=None, evidence=None):
+    def __init__(self, files=None, assemblies=None, evidence=None, drawings=None):
         self.files = files or MemorySink()
         self.assemblies = assemblies or MemorySink()
         self.evidence = evidence or MemorySink()
+        self.drawings = drawings or MemorySink()
 
     def close(self):
-        for s in (self.files, self.assemblies, self.evidence):
+        for s in (self.files, self.assemblies, self.evidence, self.drawings):
             s.close()
 
 
@@ -601,9 +607,11 @@ class Engine:
             rev.append([proj, "references by text scan", f"{n_scan} assembly/drawing file(s) of this project are CATIA / Creo / NX files whose "
                         "references were found by searching the file for CAD file names (no format reader exists for them): treat "
                         "their assignments as lower confidence than SolidWorks / Solid Edge / STEP"])
-        outs = {"asm": [], "ev": [], "conf": []}
+        outs = {"asm": [], "ev": [], "conf": [], "dr": []}
+        _assign_map = []
         if n["ASSEMBLY"] and estimate:
             rows_a, note, ev = assign_assemblies(proj, counted, parents, self.universe)
+            _assign_map.append(ev["drawing_assign"] if ev else {})
             outs["asm"] += rows_a
             rev.append([proj, "assembly breakdown", f"ESTIMATE - {note}"])
             if ev:
@@ -619,6 +627,33 @@ class Engine:
                         "up to the project totals"])
             outs["conf"].append({"project": proj, "confidence": "n/a", "why": "no assembly file in this project: one summary row, no assembly structure",
                                  **{h: 0 for h in CONFIDENCE_HEADER[3:19]}, "unresolved_examples": "", "folder_rule_agrees": "n/a"})
+        # ---- drawing level: one row per drawing file (native 2D drawings and PDFs counted as drawings)
+        assign_map = _assign_map[0] if _assign_map else {}
+        for r in counted:
+            if r["cls"] != "DRAWING" and not (r["cls"] == "PDF" and r["pdfdraw"]):
+                continue
+            if id(r) in assign_map:
+                a_name, a_how = assign_map[id(r)]
+            elif not n["ASSEMBLY"]:
+                a_name, a_how = "", "no assembly file in this project"
+            elif not estimate:
+                a_name, a_how = "", "assembly breakdown switched off"
+            else:
+                a_name, a_how = "", "not placed"
+            outs["dr"].append([proj, r["name"] or "(name not recorded: level 0 profile)", r["ext"].upper(),
+                               (soft[r["sw"]]["display"] if r["sw"] in soft else r["sw"]) if r["cls"] == "DRAWING" else "",
+                               "" if r["sheets"] is None else r["sheets"], "" if r["sheets_conf"] is None else r["sheets_conf"],
+                               a_name, a_how, r["archive"]])
+        outs["dr"].sort(key=lambda x: (x[1].lower(), x[2]))
+        if outs["dr"]:
+            def how_of(x):
+                name, h = x[6], x[7]
+                return ("by reference" if h == "link" else "by name" if h == "name" else "by folder" if (h in ("folder", "spread") and name)
+                        else "no assembly" if h.startswith(("no assembly", "assembly breakdown")) else "unplaced" if h.startswith("not placed")
+                        else "estimate only (several candidates)")
+            how = collections.Counter(how_of(x) for x in outs["dr"])
+            rev.append([proj, "drawing breakdown", f"{len(outs['dr'])} drawing rows (= Native 2D Drawings {n['DRAWING']} + PDF Drawings {pdf_drawings}); which assembly: "
+                        + ", ".join(f"{k}: {v}" for k, v in how.most_common())])
         if self.copies == "exclude":
             self.deferred[proj] = outs                   # may still be dropped when the project turns out to be a copy
         else:
@@ -627,6 +662,8 @@ class Engine:
     def _emit(self, outs):
         for r in outs["asm"]:
             self.sinks.assemblies.add(r)
+        for r in outs["dr"]:
+            self.sinks.drawings.add(r)
         for r in outs["ev"]:
             self.sinks.evidence.add(r if isinstance(self.sinks.evidence, MemorySink) else [r[h] for h in EVIDENCE_HEADER])
         self.confidence += outs["conf"]
@@ -711,7 +748,8 @@ def compile_runs(runs, ext_map, soft, unique, pdf_mode, estimate=False, project_
     assemblies = sorted(sinks.assemblies.rows, key=lambda r: key(r[0]))
     ev_rows = sorted(sinks.evidence.rows, key=lambda r: key(r["project"]))
     conf = sorted(eng.confidence, key=lambda r: key(r["project"]))
-    return compiled, file_rows, stats, review, assemblies, {"rows": ev_rows, "projects": conf, "unmapped": unm_rows}
+    drawings = sorted(sinks.drawings.rows, key=lambda r: key(r[0]))
+    return compiled, file_rows, stats, review, assemblies, {"rows": ev_rows, "projects": conf, "unmapped": unm_rows, "drawings": drawings}
 
 
 EVIDENCE_HEADER = ["project", "assembly", "refs_total", "refs_resolved", "refs_external", "refs_ambiguous", "refs_unresolved", "parts_link", "parts_folder",
@@ -800,6 +838,7 @@ def write_workbook(path, compiled, stats, review, confidence, unmapped, sinks, m
     _sheet(wb, "Project Compiled", HEADINGS, compiled, numeric=set(range(4, 9)))
     left = {}
     left["Assembly Breakdown"] = _sheets(wb, "Assembly Breakdown", ASSEMBLY_HEADINGS, sinks.assemblies, max_sheets, numeric={2, 3, 4, 5})
+    left["Drawing Breakdown"] = _sheets(wb, "Drawing Breakdown", DRAWING_HEADINGS, sinks.drawings, max_sheets, numeric={4, 5})
     left["File Level"] = _sheets(wb, "File Level", FILE_HEADER, sinks.files, max_sheets, numeric={5})
     _sheet(wb, "Project Stats", STATS_HEADER, stats)
     if confidence:
@@ -850,13 +889,15 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     sinks = Sinks(CsvSink(out, "File_Level", FILE_HEADER, a.csv_part_rows),
                   CsvSink(out, "Assembly_Breakdown_ESTIMATE", ASSEMBLY_HEADINGS, a.csv_part_rows),
-                  CsvSink(out, "Assembly_Evidence", EVIDENCE_HEADER, a.csv_part_rows))
+                  CsvSink(out, "Assembly_Evidence", EVIDENCE_HEADER, a.csv_part_rows),
+                  CsvSink(out, "Drawing_Breakdown", DRAWING_HEADINGS, a.csv_part_rows))
     eng = Engine(ext_map, soft, a.unique, a.pdf_drawings, sinks, not a.no_assembly_breakdown, a.project_by, a.min_project_files,
                  a.unique_scope, a.copies)
     compiled, stats, review, unmapped, n_files = eng.run(runs)
     sinks.files.close()
     sinks.assemblies.close(keep_empty=False)
     sinks.evidence.close(keep_empty=bool(eng.confidence))
+    sinks.drawings.close(keep_empty=False)
     write_small_csvs(out, compiled, stats, review, eng.confidence, unmapped)
     if Workbook:
         write_workbook(out / "compiled.xlsx", compiled, stats, review, eng.confidence, unmapped, sinks, a.xlsx_max_sheets)

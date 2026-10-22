@@ -54,7 +54,7 @@ the object map and class table, DWG R2004-R2018 by decompressing the page-based 
 must equal the one the map gave it, the layout count must be plausible; DXF 99, DWG at most 95). **Not supported:** AutoCAD 2007 (AC1021) files and
 binary DXF (reported as not counted, confidence 0); R13/R14 have no layouts. Archived drawings are counted too.
 Validated against the DXF twin of 21 public drawings (21 of 21 identical) and run on 99 public DWG files of R2000-R2018. Not yet compared
-with AutoCAD's own count on a client's drawings. The compiler adds `sheets`, `sheets_confidence` to File Level and `drawing_sheets`,
+with AutoCAD's own count on a client's drawings. The compiler adds a **Drawing Breakdown** tab (one row per drawing file: format, software, sheets, confidence, the assembly it belongs to and how that was decided - by reference, by name, by folder, or several candidates) and `sheets`, `sheets_confidence` to File Level and `drawing_sheets`,
 `sheet_files_counted`, `sheet_files_not_counted`, `sheets_confidence_avg`, `sheets_confidence_min` to Project Stats; the 11-column Project
 Compiled tab is unchanged.
 
