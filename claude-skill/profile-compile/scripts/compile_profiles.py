@@ -62,11 +62,13 @@ HEADINGS = ["Project Name", "Project Description", "Domain", "Native CAD Softwar
 ASSEMBLY_HEADINGS = ["Project Name", "Assembly File Name", "Part Files", "Native 2D Drawings",
                      "PDF Drawings", "Neutral 3D Files"]
 FILE_HEADER = ["project", "ext", "class", "native_software", "domain", "size_bytes", "modified_utc", "sha256",
-               "header_signature", "duplicate_of_earlier_file", "in_archive", "archive_duplicate_not_counted", "dedupe_key"]
+               "header_signature", "duplicate_of_earlier_file", "in_archive", "archive_duplicate_not_counted", "dedupe_key",
+               "sheets", "sheets_confidence"]
 STATS_HEADER = ["project", "files_total", "unique_hashes", "duplicate_files", "parts", "assemblies",
                 "native_2d_drawings", "neutral_3d", "pdf", "simulation", "documents", "data", "images",
                 "archive_other", "unmapped", "total_bytes", "counted_as", "files_in_archives", "archive_duplicates_not_counted",
-                "possible_copy_of", "copy_share"]
+                "possible_copy_of", "copy_share", "drawing_sheets", "sheet_files_counted", "sheet_files_not_counted",
+                "sheets_confidence_avg", "sheets_confidence_min"]
 CLASSES = {"PART", "ASSEMBLY", "DRAWING", "NEUTRAL3D", "PDF", "SIM", "DOC", "DATA", "IMG", "ARCHIVE", "OTHER"}
 NATIVE = {"PART", "ASSEMBLY", "DRAWING"}      # only these name the "Native CAD Software"
 REPORT_WORDS = re.compile(r"report|spec|manual|datasheet|data.?sheet|catalog|brochure|invoice|quot|certificate|summary|presentation|"
@@ -120,7 +122,7 @@ class Row:
     """One file of a profile. A __slots__ object instead of a dict: about a fifth of the memory per file, which is what lets a profile
     with millions of files compile. Behaves like the dict the structure code was written for (r["x"], r.get("x"), r["x"] = v)."""
     __slots__ = ("project", "ext", "cls", "sw", "tool", "domain", "size", "modified", "sha", "keys", "fp", "sig", "dup", "dir", "asm",
-                 "name", "stem", "rel", "pdfdraw", "archive", "adup", "lk")
+                 "name", "stem", "rel", "pdfdraw", "archive", "adup", "lk", "sheets", "sheets_conf")
 
     def __init__(self, **kw):
         for k, v in kw.items():
@@ -339,7 +341,15 @@ class Sinks:
 
 def file_row(r):
     return [r["project"], r["ext"], r["cls"], r["sw"], r["domain"], r["size"], r["modified"], r["sha"], r["sig"],
-            "yes" if r["dup"] else "", r["archive"], "yes" if r["adup"] else "", r["fp"] or r["keys"][0]]
+            "yes" if r["dup"] else "", r["archive"], "yes" if r["adup"] else "", r["fp"] or r["keys"][0],
+            "" if r["sheets"] is None else r["sheets"], "" if r["sheets_conf"] is None else r["sheets_conf"]]
+
+
+def _to_int(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
 
 
 class RowBuilder:
@@ -392,7 +402,8 @@ class RowBuilder:
                              fp=prim if prim.startswith(("sha:", "sd:")) else "", sig=_I(sig), dup=dup, dir=_I(f.get("dir_id", "")),
                              asm=f.get("asm_name", ""), name=nm, stem=stem(nm) if nm else "", rel=rel, pdfdraw=False, archive=_I(archive),
                              adup=dup and bool(archive),
-                             lk=self.lk.get(int(f["file_no"])) if self.lk is not None else None))
+                             lk=self.lk.get(int(f["file_no"])) if self.lk is not None else None,
+                             sheets=_to_int(f.get("sheets")), sheets_conf=_to_int(f.get("sheets_conf"))))
 
 
 # ---------------------------------------------------------------------------------------------------- the compiler
@@ -537,11 +548,27 @@ class Engine:
 
         self.compiled[proj] = [proj, "", domain, sw_names, n["PART"], n["ASSEMBLY"], n["DRAWING"], pdf_drawings,
                                n["NEUTRAL3D"], t2d, t3d]
+        sh_rows = [r for r in counted if r["cls"] == "DRAWING" and r["ext"] in ("dwg", "dxf")]
+        sh_ok = [r for r in sh_rows if r["sheets"] is not None]
+        sh_no = [r for r in sh_rows if r["sheets"] is None]
+        if sh_rows and any(r["sheets_conf"] is not None for r in sh_rows):
+            sheet_stats = [sum(r["sheets"] for r in sh_ok), len(sh_ok), len(sh_no),
+                           round(sum(r["sheets_conf"] for r in sh_ok) / len(sh_ok)) if sh_ok else "", min((r["sheets_conf"] for r in sh_ok), default="")]
+            why = collections.Counter(("AutoCAD 2007 format (not supported)" if r["sig"] == "DWG:AC1021" else
+                                       "older than AutoCAD 2000 (has no layouts)" if r["sig"] in ("DWG:AC1012", "DWG:AC1014") else
+                                       "no layouts in this DXF" if r["ext"] == "dxf" else "could not be read") for r in sh_no)
+            rev.append([proj, "drawing sheets",
+                        f"{sheet_stats[0]} sheets (layouts) in {len(sh_ok)} of {len(sh_rows)} AutoCAD drawing files; confidence average {sheet_stats[3]}, lowest {sheet_stats[4]} (0-100, "
+                        "computed on each file from checks on its own structure)" + (f"; not counted: {', '.join(f'{k} x{v}' for k, v in why.most_common())}" if sh_no else "")])
+        else:
+            sheet_stats = ["", "", "", "", ""]
+            if sh_rows:
+                rev.append([proj, "drawing sheets", f"{len(sh_rows)} AutoCAD drawing files, sheets not counted: needs a level 2 profile"])
         self.stats[proj] = [proj, len(rows), len({r["keys"][0] for r in rows if r["keys"][0]}) + sum(1 for r in rows if not r["keys"][0]),
                             sum(r["dup"] for r in rows), n["PART"], n["ASSEMBLY"], n["DRAWING"], n["NEUTRAL3D"], n["PDF"], n["SIM"],
                             n["DOC"], n["DATA"], n["IMG"], n["ARCHIVE"] + n["OTHER"], n["UNMAPPED"], sum(r["size"] for r in rows),
                             ("unique hashes (whole profile)" if self.unique_scope == "all" else "unique hashes (per project)") if unique else "all files",
-                            sum(1 for r in rows if r["archive"]), sum(1 for r in rows if r["adup"]), "", ""]
+                            sum(1 for r in rows if r["archive"]), sum(1 for r in rows if r["adup"]), "", "", *sheet_stats]
         n_arch = sum(1 for r in rows if r["archive"])
         if n_arch:
             rev.append([proj, "archives", f"{n_arch} files found inside archives ({sum(1 for r in rows if r['adup'])} identical to files "

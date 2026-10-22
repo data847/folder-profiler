@@ -23,7 +23,8 @@ ASM-3F9A1C2B.SLDASM with --anonymize-assembly-names. No other file name is writt
 How the file contents are touched (and nothing else):
   * header_signature - computed from the first few KB of certain file types and reduced to a tag from the fixed lists in this
     file (e.g. "STEP:AP214:SolidWorks", "DXF:AC1027:3D", "PDF"). The raw header text is never kept.
-  * level 2 only: assembly / drawing / STEP files are read to list the FILE NAMES they reference.
+  * level 2 only: assembly / drawing / STEP files are read to list the FILE NAMES they reference, and AutoCAD drawings (.dwg / .dxf) to
+    count their sheets (layouts) - a number only.
 
 Resumable: progress is saved in <out>/.resume/ after every chunk of files; if the run stops for any reason, start it again with the
 same settings and it continues from the last saved chunk (--fresh ignores saved progress). No depth limit on folders.
@@ -65,6 +66,10 @@ try:
     import archives
 except ImportError:
     archives = None
+try:
+    import dwg_sheets
+except ImportError:
+    dwg_sheets = None
 import sysmetrics
 from sysmetrics import now_utc
 
@@ -97,6 +102,7 @@ TEXT_FORMATS = [  # (lowercase pattern in first 4 KB, tag) - first match wins; t
     (b"$meshformat", "MESH:GMSH"),
     (b"<vtkfile", "VTK:XML"),
 ]
+SHEET_EXTS = {"dwg", "dxf"}               # level 2: AutoCAD drawings - the number of sheets (layouts) is counted, with a confidence
 LINK_READ_EXTS = {"sldasm", "asm", "pwd", "iam", "slddrw", "dft", "idw", "step", "stp", "catproduct", "catdrawing", "drw", "prt"}   # level 2: assemblies, drawings, STEP
 ENTRY_LINK_MAX = 128 * 1024 * 1024      # level 2: archived assemblies/drawings/STEP up to this size are searched for references
 ASSEMBLY_EXTS = {"sldasm", "asm", "pwd", "iam", "catproduct"}   # the only files whose NAME is recorded (Assembly Breakdown tab)
@@ -523,7 +529,15 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
 
         def columns():
             return (["project", "file_no", "ext", "size_bytes", "modified_utc", "depth", "header_signature", "dir_id", "asm_name"]
-                    + (["rel_path"] if tier >= 1 else []) + ["archive"])
+                    + (["rel_path"] if tier >= 1 else []) + ["archive"] + (["sheets", "sheets_conf"] if tier >= 2 else []))
+
+        def sheet_cols(sh):
+            """Row cells for the sheet count: '' = not attempted (not a drawing / level < 2); confidence 0 with no count = attempted, failed."""
+            if tier < 2:
+                return []
+            if sh is None:
+                return ["", ""]
+            return [sh["sheets"] if sh["sheets"] is not None else "", sh["confidence"]]
 
         def link_rows(proj, n, ext, res):
             if res[0] in ("native", "scan"):
@@ -575,6 +589,17 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
 
                 def work(e):
                     path, name, ext, size, mtime, dir_id, depth, asm, relpath, nn = e
+                    if tier >= 2 and ext in SHEET_EXTS and dwg_sheets is not None and size > 0:
+                        try:                                   # ONE open: format tag and sheet count from the same read
+                            with open(path, "rb") as fh:
+                                with act.timer("format_tag_read"):
+                                    sig = signature_stream(fh, ext, size)
+                                fh.seek(0)
+                                with act.timer("sheet_count"):
+                                    sh = dwg_sheets.count_sheets_file(fh, ext, size)
+                        except OSError:
+                            return "UNREADABLE", None, False, None
+                        return sig, None, False, sh
                     if tier >= 2 and ext in LINK_READ_EXTS and cad_links is not None and size > 0:
                         try:                                   # ONE open: the format tag and the references come from the same read
                             with open(path, "rb") as fh:
@@ -584,18 +609,20 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
                                 with act.timer("reference_read"):
                                     res = cad_links.read_links_file(fh, ext, name, size)
                         except OSError:
-                            return "UNREADABLE", None, True
-                        return sig, res, True
+                            return "UNREADABLE", None, True, None
+                        return sig, res, True, None
                     with act.timer("format_tag_read"):
                         sig = signature(path, ext, size)
-                    return sig, None, False
+                    return sig, None, False, None
 
                 rows, lrows = [], []
-                for e, (sig, res, was_link) in zip(pending, pool.map(work, pending)):
+                for e, (sig, res, was_link, sh) in zip(pending, pool.map(work, pending)):
                     path, name, ext, size, mtime, dir_id, depth, asm, relpath, nn = e
                     if "UNREADABLE" in sig:
                         C["errors"] += 1
-                    rows.append([proj, nn, ext, size, mtime, depth, sig, dir_id, asm] + ([relpath] if tier >= 1 else []) + [""])
+                    if sh is not None:
+                        C["sheets_counted" if sh["sheets"] is not None else "sheets_not_counted"] += 1
+                    rows.append([proj, nn, ext, size, mtime, depth, sig, dir_id, asm] + ([relpath] if tier >= 1 else []) + [""] + sheet_cols(sh if ext in SHEET_EXTS else None))
                     if was_link:
                         if res is None:
                             C["link_unreadable"] += 1
@@ -688,7 +715,7 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
                 reads = {}
                 if archive_mode == "full" and tier >= 2 and cad_links is not None and archives.kind_of(apath) in ("zip", "tar"):
                     want = [(e["chain"], e["inner"]) for e in ents
-                            if e["readable"] and ext_of(e["inner"].rsplit("/", 1)[-1]) in LINK_READ_EXTS and e["size"] <= ENTRY_LINK_MAX]
+                            if e["readable"] and ext_of(e["inner"].rsplit("/", 1)[-1]) in (LINK_READ_EXTS | SHEET_EXTS) and e["size"] <= ENTRY_LINK_MAX]
                     if want:
                         for chain, inner, f in archives.read_entries(apath, want):
                             ext = ext_of(inner.rsplit("/", 1)[-1])
@@ -705,10 +732,12 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
                             with act.timer("archive_entry_read"):
                                 try:
                                     data = f.read()
+                                    sh = dwg_sheets.count_sheets_bytes(data, ext) if (ext in SHEET_EXTS and dwg_sheets is not None) else None
                                     reads[(chain, inner)] = (signature_stream(io.BytesIO(data), ext, size),
-                                                             cad_links.read_links_bytes(data, ext, inner.rsplit("/", 1)[-1]), size)
+                                                             cad_links.read_links_bytes(data, ext, inner.rsplit("/", 1)[-1]) if ext in LINK_READ_EXTS else None,
+                                                             size, sh)
                                 except Exception:
-                                    reads[(chain, inner)] = ("UNREADABLE", None, size)
+                                    reads[(chain, inner)] = ("UNREADABLE", None, size, None)
                 return job, ents, reads
 
             todo = arch_jobs[a_done:]
@@ -751,18 +780,20 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
                         asm = ""
                         if ext in ASSEMBLY_EXTS:
                             asm = (f"ASM-{ident(proj, rel_base, bname, n=8).upper()}.{ext.upper()}" if anonymize_assembly_names else bname)
-                        sig, lres = "ARCHIVED", None
+                        sig, lres, ash = "ARCHIVED", None, None
                         rd = reads.get((e["chain"], inner))
                         if rd == "BUDGET":
                             C["arch_budget_hit"] += 1
                         elif rd:
-                            sig, lres = rd[0], rd[1]
+                            sig, lres, ash = rd[0], rd[1], rd[3]
+                            if ash is not None:
+                                C["sheets_counted" if ash["sheets"] is not None else "sheets_not_counted"] += 1
                             C["arch_read"] += 1
                             C["arch_spent"] += rd[2]
                             if lres is not None:
                                 C["link_read"] += 1
                                 lrows += link_rows(proj, nn, ext, lres)
-                        rows.append([proj, nn, ext, e["size"], e["mtime"], d + 1, sig, cur, asm] + ([rel_base + "/" + bname] if tier >= 1 else []) + [kind])
+                        rows.append([proj, nn, ext, e["size"], e["mtime"], d + 1, sig, cur, asm] + ([rel_base + "/" + bname] if tier >= 1 else []) + [kind] + sheet_cols(ash))
                         state["files"] += 1
                         state["bytes"] += e["size"]
                     C["arch_entries"] += cnt
@@ -836,7 +867,9 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
                     for row in csv.reader(io.StringIO(text)):
                         proj_, ext_, size_, mod_ = row[0], row[2], int(row[3]), row[4]
                         p = proj_stats.setdefault(proj_, [0, 0, mod_, mod_, set()])
-                        p[0] += 1; p[1] += size_; p[2] = min(p[2], mod_); p[3] = max(p[3], mod_); p[4].add(ext_)
+                        p[0] += 1; p[1] += size_; p[4].add(ext_)
+                        if mod_:                                   # entries of rar / 7z listings have no date: they must not blank the project's range
+                            p[2] = min(p[2], mod_) if p[2] else mod_; p[3] = max(p[3], mod_)
                         e = ext_stats.setdefault((proj_, ext_), [0, 0])
                         e[0] += 1; e[1] += size_
                         nfiles_out += 1; bytes_out += size_
@@ -876,7 +909,7 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
                 ["unreadable_folders", C["dir_errors"]], ["linked_folders_skipped", walk_counts["links_skipped"]],
                 ["ignored_system_files", C["junk"] + sum(u.get("junk", 0) for u in man["units"].values())],
                 ["projects_changed_during_run", C["changed_projects"]], ["projects_changed_between_restarts", C["stale_projects"]], ["chunks_redone_after_change", C["stale_chunks"]],
-                ["archive_sets_redone_after_change", C["stale_archives"]], ["restarts_resumed", man["restarts"]],
+                ["archive_sets_redone_after_change", C["stale_archives"]], ["drawing_sheets_counted", C["sheets_counted"]], ["drawing_sheets_not_counted", C["sheets_not_counted"]], ["restarts_resumed", man["restarts"]],
                 ["seconds", round(active, 1)], ["seconds_scan", round(man["prescan_s"], 1)], ["seconds_process", round(proc_s, 1)],
                 ["seconds_finalize", round(fin_s, 1)],
                 ["avg_MB_per_s", round(bytes_out / 1e6 / max(1.0, proc_s + man["prescan_s"]), 1)],
@@ -936,7 +969,8 @@ def what_is(tier, anonymized):
     else:
         body = ("Level 2 = level 1 (names and paths) plus Links.csv: for assembly, drawing and STEP files, the FILE NAMES of the\r\n"
                 "other CAD files they reference (or, for STEP, the product-structure names). Nothing else was copied from inside the\r\n"
-                "files - no geometry, no text, no properties.\r\n")
+                "files - no geometry, no text, no properties. For AutoCAD drawings (.dwg/.dxf) the number of sheets (layouts) is\r\n"
+                "counted (columns sheets, sheets_conf of Files.csv); the layout names are not kept.\r\n")
     return head + body + ("Run_log.csv, Run_phases.csv, Run_metrics.csv and System_info.csv describe how the run went and what machine it ran\r\n"
                           "on (no file or folder names). "
                           "Files found INSIDE archives (zip, tar; 7z/rar listed only) appear as normal rows with the archive column set; their\r\n"

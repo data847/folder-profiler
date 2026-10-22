@@ -11,7 +11,7 @@ FOLDER PROFILER (Windows)  -  full guide: HOW_TO_RUN.pdf
 It records, for every file at any folder depth: type, size, date, short format tag, file name and folder path, and (for assembly,
 drawing and STEP files) the NAMES of the files they reference. No file is ever copied, hashed or read in full except to list those
 references, and no file contents are stored. The zip therefore contains file and folder names: share it only if that is acceptable.
-No internet use. There are no options to choose.
+For AutoCAD drawings it also counts the sheets (layouts) - only the number. No internet use. There are no options to choose.
 You can open file_profiler.py in Notepad to read everything it does, and the CSVs in the zip to check.
 If something fails, send us output\error_log.txt (your name and paths are removed from it).
 

@@ -100,6 +100,9 @@ dgn,DRAWING,,,MicroStation drawing
 dwfx,DRAWING,AutoCAD,,
 bak,DATA,,,backup copy (often of a DWG) - not counted as a drawing
 skb,DATA,,,SketchUp backup - not counted as a model
+psd,IMG,,,Photoshop image
+prn,DATA,,,printer / plot output file
+max,PART,3dsMax,,3ds Max scene counted as a 3D model (visualisation; domain left blank)
 old,DATA,,,backup copy
 cfg,DATA,,,configuration / settings (OLE storage in Solid Edge folders), not a model
 dwl,DATA,,,AutoCAD lock file

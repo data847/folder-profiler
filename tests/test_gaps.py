@@ -85,7 +85,8 @@ with tempfile.TemporaryDirectory() as t:
     check("backup that kept its dates is flagged as a probable copy of the original (83%)", ([r[0] for r in flagged], "83%" in flagged[0][2]), (["Orig backup"], True))
     check("KNOWN LIMIT: a copy whose dates were reset is not recognised without hashing (not flagged)", "Orig restored" in [r[0] for r in flagged], False)
     st = {r[0]: r for r in s}
-    check("Project_Stats names the original and the share", (st["Orig backup"][-2], st["Orig backup"][-1], st["Orig"][-2]), ("Orig", "83%", ""))
+    ci, si = cp.STATS_HEADER.index("possible_copy_of"), cp.STATS_HEADER.index("copy_share")
+    check("Project_Stats names the original and the share", (st["Orig backup"][ci], st["Orig backup"][si], st["Orig"][ci]), ("Orig", "83%", ""))
     names, rv = cli(z); check("default: copy is flagged but still counted (nothing silently dropped)", sorted(r[0] for r in names), ["Orig", "Orig backup", "Orig restored"])
     names, rv = cli(z, "--copies", "exclude"); check("--copies exclude drops the flagged copy from Project Compiled", sorted(r[0] for r in names), ["Orig", "Orig restored"])
     n_all = {r[0]: int(r[4]) for r in cli(z, "--unique", "--unique-scope", "all")[0]}

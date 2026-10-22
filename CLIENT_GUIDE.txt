@@ -12,6 +12,7 @@ folder path. For assembly, drawing and STEP files it also reads out the NAMES of
 so that parts can be grouped under their real assembly. Nothing else is read out of your files: no geometry, no
 text, no properties, and no file is ever copied or sent. THE ZIP THEREFORE CONTAINS YOUR FILE AND FOLDER NAMES -
 only send it if you are happy to share those.
+For AutoCAD drawings (.dwg, .dxf) it also reads how many sheets (layouts) the drawing has - only that number, never the layout names.
 There are no settings to choose: the tool always records all of this and always includes every sub-folder.
 (Expert command line only: --level 0|1|2 records less, --project-depth N sets which folder level counts as a project.)
 

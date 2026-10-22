@@ -22,7 +22,7 @@ Two pieces:
 | **2** (default) | + `Links.csv`: the *names* of files referenced inside assemblies, drawings and STEP files | **real part-to-assembly links** for SolidWorks, Solid Edge and Inventor assemblies and STEP structure |
 
 `--level 0|1|2` (default 2), `--project-depth N` (projects = folders N levels down, default 1) are command-line options only; the UI always uses level 2.
-Level 2 opens each assembly/drawing/STEP file **once** (the format tag and the references come from the same read) and keeps only referenced
+Level 2 also counts the **sheets (layouts)** of every AutoCAD `.dwg` / `.dxf` (`sheets`, `sheets_conf` columns of `Files.csv`; only the number is kept, no layout names) - see below. Level 2 opens each assembly/drawing/STEP file **once** (the format tag and the references come from the same read) and keeps only referenced
 **file names** (no geometry, text or properties); it needs `cad_links.py` next to `file_profiler.py`. STEP files are streamed in 16 MB blocks and only
 their PRODUCT / ASSEMBLY entities are parsed (about 12x faster than line-by-line, identical result, flat memory). SolidWorks, Solid Edge and Inventor
 files have real container readers. **CATIA V5, Creo and NX have none:** for `.catproduct`, `.catdrawing`, `.prt`, `.drw` and non-OLE `.asm` the file is
@@ -45,6 +45,18 @@ Because the default is level 2, the output contains client file and folder names
   (CPU %, memory, files/s, MB/s, process read speed every 5 s), `Run_log.csv` (events, written as they happen so a crash keeps them) and `System_info.csv`
   (OS, CPU, RAM, disk type, antivirus state on Windows). No host name, user name or paths. Windows probes use ctypes/PowerShell and are untested here;
   macOS and Linux probes were tested.
+
+## AutoCAD sheets (layouts), with a confidence number
+
+`dwg_sheets.py` counts the paper-space layouts of each drawing (LAYOUT objects minus the Model tab): DXF by its OBJECTS section, DWG R2000 through
+the object map and class table, DWG R2004-R2018 by decompressing the page-based sections and scanning the objects. Each file gets
+`sheets` and `sheets_conf` (0-100, **computed on that file**: the object map must parse, the handle read back from every sampled object
+must equal the one the map gave it, the layout count must be plausible; DXF 99, DWG at most 95). **Not supported:** AutoCAD 2007 (AC1021) files and
+binary DXF (reported as not counted, confidence 0); R13/R14 have no layouts. Archived drawings are counted too.
+Validated against the DXF twin of 21 public drawings (21 of 21 identical) and run on 99 public DWG files of R2000-R2018. Not yet compared
+with AutoCAD's own count on a client's drawings. The compiler adds `sheets`, `sheets_confidence` to File Level and `drawing_sheets`,
+`sheet_files_counted`, `sheet_files_not_counted`, `sheets_confidence_avg`, `sheets_confidence_min` to Project Stats; the 11-column Project
+Compiled tab is unchanged.
 
 ## What has been verified on real files
 
