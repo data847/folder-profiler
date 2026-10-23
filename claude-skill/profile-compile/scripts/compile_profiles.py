@@ -897,6 +897,7 @@ def write_small_csvs(out, compiled, stats, review, confidence, unmapped):
     dump("Project_Compiled.csv", HEADINGS, compiled)
     dump("Project_Stats.csv", STATS_HEADER, stats)
     dump("Review.csv", ["project", "topic", "detail"], review)
+    dump("By_Domain.csv", BY_DOMAIN_HEADER, by_domain_rows(compiled, stats))
     if unmapped:
         dump("Unmapped_Extensions.csv", UNMAPPED_HEADER, unmapped)
     if confidence:
@@ -951,6 +952,69 @@ def _sheets(wb, title, header, sink, max_sheets, numeric=()):
     return max(0, len(sink.parts) - max_sheets)
 
 
+BY_DOMAIN_HEADER = ["Domain", "Projects", "Files", "Size_GB", "Part Files", "Assembly Files", "Native 2D Drawings", "PDF Drawings", "Neutral 3D Files",
+                    "Drawing Sheets", "Projects (names)"]
+
+
+def by_domain_rows(compiled, stats):
+    """One row per domain: how many projects and what they hold. The domain is the label of each project (Project Compiled, column 3)."""
+    st = {r[0]: r for r in stats}
+    H = STATS_HEADER
+    agg = {}
+    for c in compiled:
+        d = agg.setdefault(c[2] or "Unclassified", {"p": [], "files": 0, "bytes": 0, "n": [0, 0, 0, 0, 0], "sheets": 0})
+        d["p"].append(c[0])
+        for i, col in enumerate((4, 5, 6, 7, 8)):
+            d["n"][i] += int(c[col] or 0)
+        r = st.get(c[0])
+        if r:
+            d["files"] += int(r[1] or 0)
+            d["bytes"] += int(r[15] or 0)
+            d["sheets"] += int(r[H.index("drawing_sheets")] or 0)
+    order = sorted(agg, key=lambda k: (k == "Unclassified", -len(agg[k]["p"]), k))
+    return [[k, len(agg[k]["p"]), agg[k]["files"], round(agg[k]["bytes"] / 1e9, 2), *agg[k]["n"], agg[k]["sheets"],
+             "; ".join(sorted(agg[k]["p"], key=str.lower)[:12]) + (f" ... (+{len(agg[k]['p']) - 12})" if len(agg[k]["p"]) > 12 else "")] for k in order]
+
+
+def _filtered_tabs(wb, title, header, sink, keep, max_sheets, numeric=()):
+    """Like _sheets() but only the rows of the given projects (row[0]); at most `max_sheets` sheets of 1,000,000 rows."""
+    it = (r for k in range(len(sink.parts)) for r in sink.rows(k) if r[0] in keep)
+    for k in range(max_sheets):
+        chunk = itertools.islice(it, 1_000_000)
+        first = next(chunk, None)
+        if first is None and k > 0:
+            break
+        _sheet(wb, title if k == 0 else f"{title} ({k + 1})", header, itertools.chain([first] if first is not None else [], chunk), numeric=numeric)
+
+
+def write_domain_workbooks(out, compiled, stats, review, confidence, sinks, max_sheets=3):
+    """The split by domain: by-domain/compiled_<Domain>.xlsx for every domain, holding the usual tabs for that domain's projects only
+    (Project Compiled, Assembly Breakdown, Drawing Breakdown, Project Stats, Assembly Confidence / Evidence, Review). File Level stays in the
+    main workbook. -> {domain: number of projects}."""
+    dom = {c[0]: (c[2] or "Unclassified") for c in compiled}
+    domains = sorted(set(dom.values()), key=lambda d: (d == "Unclassified", d))
+    if len(domains) < 2 or not Workbook:
+        return {}
+    folder = out / "by-domain"
+    folder.mkdir(exist_ok=True)
+    done = {}
+    for d in domains:
+        keep = {p for p, x in dom.items() if x == d}
+        wb = Workbook(write_only=True)
+        _sheet(wb, "Project Compiled", HEADINGS, [c for c in compiled if c[0] in keep], numeric=set(range(4, 9)))
+        _filtered_tabs(wb, "Assembly Breakdown", ASSEMBLY_HEADINGS, sinks.assemblies, keep, max_sheets, numeric={2, 3, 4, 5})
+        _filtered_tabs(wb, "Drawing Breakdown", DRAWING_HEADINGS, sinks.drawings, keep, max_sheets, numeric={4, 5})
+        _sheet(wb, "Project Stats", STATS_HEADER, [r for r in stats if r[0] in keep])
+        conf = [r for r in confidence if r["project"] in keep]
+        if conf:
+            _sheet(wb, "Assembly Confidence", CONFIDENCE_HEADER, [[r[h] for h in CONFIDENCE_HEADER] for r in conf])
+            _filtered_tabs(wb, "Assembly Evidence", EVIDENCE_HEADER, sinks.evidence, keep, max_sheets, numeric=set(range(2, 14)))
+        _sheet(wb, "Review", ["project", "topic", "detail"], [r for r in review if r[0] in keep])
+        wb.save(folder / f"compiled_{re.sub(r'[^A-Za-z0-9_-]+', '_', d)}.xlsx")
+        done[d] = len(keep)
+    return done
+
+
 def write_workbook(path, compiled, stats, review, confidence, unmapped, sinks, max_sheets=3):
     wb = Workbook(write_only=True)
     _sheet(wb, "Project Compiled", HEADINGS, compiled, numeric=set(range(4, 9)))
@@ -959,6 +1023,7 @@ def write_workbook(path, compiled, stats, review, confidence, unmapped, sinks, m
     left["Drawing Breakdown"] = _sheets(wb, "Drawing Breakdown", DRAWING_HEADINGS, sinks.drawings, max_sheets, numeric={4, 5})
     left["File Level"] = _sheets(wb, "File Level", FILE_HEADER, sinks.files, max_sheets, numeric={5})
     _sheet(wb, "Project Stats", STATS_HEADER, stats)
+    _sheet(wb, "By Domain", BY_DOMAIN_HEADER, by_domain_rows(compiled, stats), numeric=set(range(1, 10)))
     if confidence:
         _sheet(wb, "Assembly Confidence", CONFIDENCE_HEADER, [[r[h] for h in CONFIDENCE_HEADER] for r in confidence])
         left["Assembly Evidence"] = _sheets(wb, "Assembly Evidence", EVIDENCE_HEADER, sinks.evidence, max_sheets, numeric=set(range(2, 14)))
@@ -1067,6 +1132,9 @@ def main():
     ap.add_argument("--pdf-drawings", choices=["auto", "none", "all"], default="auto",
                     help="auto (default): by file name when the profile has names (level >= 1), else none; none; all")
     ap.add_argument("--estimate-assemblies", action="store_true", help=argparse.SUPPRESS)     # kept for old command lines: now the default
+    ap.add_argument("--no-split-by-domain", action="store_true",
+                    help="do not write the per-domain workbooks (by-domain/compiled_<Domain>.xlsx); they are written by default when the projects fall into "
+                         "more than one domain")
     ap.add_argument("--no-assembly-breakdown", action="store_true",
                     help="leave the Assembly Breakdown tab empty (default: fill it, with method and confidence reported)")
     ap.add_argument("--project-by", choices=["auto", "structure", "folder"], default="auto",
@@ -1113,6 +1181,12 @@ def main():
     write_small_csvs(out, compiled, stats, review, eng.confidence, unmapped)
     if Workbook:
         write_workbook(out / "compiled.xlsx", compiled, stats, review, eng.confidence, unmapped, sinks, a.xlsx_max_sheets)
+        if not a.no_split_by_domain:
+            split = write_domain_workbooks(out, compiled, stats, review, eng.confidence, sinks, a.xlsx_max_sheets)
+            if split:
+                print("split by domain -> by-domain/: " + ", ".join(f"{d} ({n} projects)" for d, n in split.items()))
+            else:
+                print("split by domain: skipped (all projects share one domain)")
     else:
         print("(openpyxl not installed - wrote CSVs only)")
     n_asm = sinks.assemblies.total
