@@ -81,7 +81,7 @@ STEP 3. Choose what to measure. At the top of the page you see two options:
   - Click a folder name to open it. Click "Up" to go back.
   - Option (a): keep going until the box at the top shows the folder you want measured
     (the folder that CONTAINS your project folders). You can also type or paste its path.
-  - You can paste a folder's path (for example \\server\share\Project1 or Z:\Project1) into the
+  - You can paste a folder's path (for example \\server\share\Project1 or D:\Projects\Project1) into the
     box at the top and press Enter in either option. In option (b) then click "Add this folder".
   - Option (b): click the little square next to each project folder to tick it. Click the
     folder's NAME to open it and look inside.

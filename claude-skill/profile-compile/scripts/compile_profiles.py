@@ -64,17 +64,17 @@ from structure import (assign_assemblies, build_universe, detect_copies, detect_
 HEADINGS = ["Project Name", "Project Description", "Domain", "Native CAD Software", "Part Files",
             "Assembly Files", "Native 2D Drawings", "PDF Drawings", "Neutral 3D Files",
             "2D Files (file types)", "3D Files (file types)"]
-DRAWING_HEADINGS = ["Project Name", "Drawing File Name", "Format", "Native CAD Software", "Sheets", "Sheets Confidence", "Assembly",
+DRAWING_HEADINGS = ["Project Name", "Drawing File Name", "Format", "Native CAD Software", "Sheets", "Sheets Confidence", "Sheets Basis", "Assembly",
                     "Assembly Method", "In Archive"]
 ASSEMBLY_HEADINGS = ["Project Name", "Assembly File Name", "Part Files", "Native 2D Drawings",
                      "PDF Drawings", "Neutral 3D Files"]
 FILE_HEADER = ["project", "ext", "class", "native_software", "domain", "size_bytes", "modified_utc", "sha256",
                "header_signature", "duplicate_of_earlier_file", "in_archive", "archive_duplicate_not_counted", "dedupe_key",
-               "sheets", "sheets_confidence", "sheets_status"]
+               "sheets", "sheets_confidence", "sheets_status", "sheets_used", "sheets_basis"]
 STATS_HEADER = ["project", "files_total", "unique_hashes", "duplicate_files", "parts", "assemblies",
                 "native_2d_drawings", "neutral_3d", "pdf", "simulation", "documents", "data", "images",
                 "archive_other", "unmapped", "total_bytes", "counted_as", "files_in_archives", "archive_duplicates_not_counted",
-                "possible_copy_of", "copy_share", "drawing_sheets", "sheet_files_counted", "sheet_files_not_counted",
+                "possible_copy_of", "copy_share", "drawing_sheets", "sheet_files_counted", "sheet_files_model_only", "sheet_files_assumed",
                 "sheets_confidence_avg", "sheets_confidence_min", "domain_basis", "domain_confidence"]
 CLASSES = {"PART", "ASSEMBLY", "DRAWING", "NEUTRAL3D", "PDF", "SIM", "DOC", "DATA", "IMG", "ARCHIVE", "OTHER"}
 NATIVE = {"PART", "ASSEMBLY", "DRAWING"}      # only these name the "Native CAD Software"
@@ -353,6 +353,21 @@ class Sinks:
             s.close()
 
 
+SHEET_BASIS_COUNTED, SHEET_BASIS_MODEL, SHEET_BASIS_ASSUMED = "counted", "model tab only - counted as 1", "not read - assumed 1"
+
+
+def sheets_used(r):
+    """-> (sheets to report, basis). A drawing file is at least ONE sheet: an AutoCAD file with only the Model tab (0 layouts) and one that
+    could not be read (R2007, damaged ...) both count as 1, and the basis column says so; the confidence stays the file's own (0 when unread)."""
+    if r["ext"] not in ("dwg", "dxf") or r["sheets_conf"] is None:               # not attempted: other formats, or a profile below level 2
+        return ("" if r["sheets"] is None else r["sheets"]), (SHEET_BASIS_COUNTED if r["sheets"] is not None else "")
+    if r["sheets"] is None:
+        return 1, SHEET_BASIS_ASSUMED
+    if r["sheets"] == 0:
+        return 1, SHEET_BASIS_MODEL
+    return r["sheets"], SHEET_BASIS_COUNTED
+
+
 def _csv_safe(v):
     """A text cell that starts with = + @ (tab, CR) would be run as a formula when the CSV is opened in Excel; a file called 'x.=1+1' has
     the extension '=1+1'. Such cells get a leading apostrophe. Numbers and everything else are untouched."""
@@ -362,7 +377,7 @@ def _csv_safe(v):
 def file_row(r):
     return [r["project"], r["ext"], r["cls"], r["sw"], r["domain"], r["size"], r["modified"], r["sha"], r["sig"],
             "yes" if r["dup"] else "", r["archive"], "yes" if r["adup"] else "", r["fp"] or r["keys"][0],
-            "" if r["sheets"] is None else r["sheets"], "" if r["sheets_conf"] is None else r["sheets_conf"], r["sheets_status"] or ""]
+            "" if r["sheets"] is None else r["sheets"], "" if r["sheets_conf"] is None else r["sheets_conf"], r["sheets_status"] or "", *sheets_used(r)]
 
 
 def _to_int(v):
@@ -629,8 +644,12 @@ class Engine:
         sh_ok = [r for r in sh_rows if r["sheets"] is not None]
         sh_no = [r for r in sh_rows if r["sheets"] is None]
         if sh_rows and any(r["sheets_conf"] is not None for r in sh_rows):
-            sheet_stats = [sum(r["sheets"] for r in sh_ok), len(sh_ok), len(sh_no),
-                           round(sum(r["sheets_conf"] for r in sh_ok) / len(sh_ok)) if sh_ok else "", min((r["sheets_conf"] for r in sh_ok), default="")]
+            used = [sheets_used(r) for r in sh_rows]
+            n_real = sum(1 for _v, b in used if b == SHEET_BASIS_COUNTED)
+            n_model = sum(1 for _v, b in used if b == SHEET_BASIS_MODEL)
+            sh_real = [r for r, (_v, b) in zip(sh_rows, used) if b == SHEET_BASIS_COUNTED]
+            sheet_stats = [sum(v for v, _b in used if v != ""), n_real, n_model, len(sh_no),
+                           round(sum(r["sheets_conf"] for r in sh_real) / len(sh_real)) if sh_real else "", min((r["sheets_conf"] for r in sh_real), default="")]
             STATUS_TEXT = {"unsupported-r2007": "AutoCAD 2007 format (not supported)", "no-layouts-in-version": "older than AutoCAD 2000 / no layouts in this file",
                            "dxf-binary": "binary DXF (not supported)", "too-large": "file larger than the size limit", "unreadable": "file could not be read",
                            "not-dwg": "not an AutoCAD file in spite of the extension", "no-layout-objects": "no layout found in the file",
@@ -640,10 +659,12 @@ class Engine:
                                        "older than AutoCAD 2000 (has no layouts)" if r["sig"] in ("DWG:AC1012", "DWG:AC1014") else
                                        "no layouts in this DXF" if r["ext"] == "dxf" else "could not be read") for r in sh_no)
             rev.append([proj, "drawing sheets",
-                        f"{sheet_stats[0]} sheets (layouts) in {len(sh_ok)} of {len(sh_rows)} AutoCAD drawing files; confidence average {sheet_stats[3]}, lowest {sheet_stats[4]} (0-100, "
-                        "computed on each file from checks on its own structure)" + (f"; not counted: {', '.join(f'{k} x{v}' for k, v in why.most_common())}" if sh_no else "")])
+                        f"{sheet_stats[0]} sheets in {len(sh_rows)} AutoCAD drawing files (every drawing file is at least 1 sheet): {n_real} counted from their layouts, "
+                        f"{n_model} with only the Model tab (counted as 1 each), {len(sh_no)} not read (assumed 1 each"
+                        + (f": {', '.join(f'{k} x{v}' for k, v in why.most_common())}" if sh_no else "") + f"); confidence of the counted ones: average {sheet_stats[4]}, lowest {sheet_stats[5]} "
+                        "(0-100, computed on each file from checks on its own structure)"])
         else:
-            sheet_stats = ["", "", "", "", ""]
+            sheet_stats = ["", "", "", "", "", ""]
             if sh_rows:
                 rev.append([proj, "drawing sheets", f"{len(sh_rows)} AutoCAD drawing files, sheets not counted: needs a level 2 profile"])
         self.stats[proj] = [proj, len(rows), len({r["keys"][0] for r in rows if r["keys"][0]}) + sum(1 for r in rows if not r["keys"][0]),
@@ -716,12 +737,12 @@ class Engine:
                 a_name, a_how = "", "not placed"
             outs["dr"].append([proj, r["name"] or "(name not recorded: level 0 profile)", r["ext"].upper(),
                                (soft[r["sw"]]["display"] if r["sw"] in soft else r["sw"]) if r["cls"] == "DRAWING" else "",
-                               "" if r["sheets"] is None else r["sheets"], "" if r["sheets_conf"] is None else r["sheets_conf"],
+                               *((lambda u: (u[0], "" if r["sheets_conf"] is None else r["sheets_conf"], u[1]))(sheets_used(r)) if r["cls"] == "DRAWING" else ("", "", "")),
                                a_name, a_how, r["archive"]])
         outs["dr"].sort(key=lambda x: (x[1].lower(), x[2]))
         if outs["dr"]:
             def how_of(x):
-                name, h = x[6], x[7]
+                name, h = x[7], x[8]
                 return ("by reference" if h == "link" else "by name" if h == "name" else "by folder" if (h in ("folder", "spread") and name)
                         else "no assembly" if h.startswith(("no assembly", "assembly breakdown")) else "unplaced" if h.startswith("not placed")
                         else "estimate only (several candidates)")

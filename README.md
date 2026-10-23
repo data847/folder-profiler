@@ -34,8 +34,8 @@ Because the default is level 2, the output contains client file and folder names
 
 Decided per project by the compiler: specific tools vote (SketchUp, Revit, SolidWorks ...; **general-purpose AutoCAD / Rhino do not**), then the tool named in
 STEP/IFC headers, then file and folder names against `domain_keywords.csv`, else `Unclassified`; `Project Stats` has `domain_basis` and `domain_confidence`, `Review` explains
-each non-obvious call. On a real 74-project, 385k-file architecture drive this gave 68 Architecture (66 of them High from SketchUp/Revit files), 2 Mechanical (Inventor
-standard-parts libraries), 4 Unclassified - where the old rule called 56 projects Mechanical because AutoCAD counted as Mechanical.
+each non-obvious call. On a real multi-project architecture drive this put the great majority of projects in Architecture on SketchUp / Revit evidence, left the few
+without any evidence as Unclassified, and no longer called AutoCAD-heavy projects Mechanical (the old rule counted AutoCAD as Mechanical).
 
 ## Two steps
 
@@ -79,8 +79,8 @@ Compiled tab is unchanged.
 
 | Format | Verified on real files? |
 |---|---|
-| SolidWorks assemblies (`.sldasm`) | yes - a real assembly: all 22 parts found (SET-09) |
-| STEP product structure | yes - real STEP files (SET-09) |
+| SolidWorks assemblies (`.sldasm`) | yes - a real assembly: all of its parts found |
+| STEP product structure | yes - real STEP files |
 | **Solid Edge** (`.asm`, `.dft`) | **yes** - a real hinge assembly gives exactly its 3 parts; 3 real drawings give the models they document (Engine1.dft -> engine1.asm, carb1.par, ...). Real files from public sources (SolidEdgeCommunity/SEU14, an MIT-licensed hinge example). Real `.par` parts and `.pwd` weldments were not read for references |
 | Solid Edge **content tag** (`OLE2:SolidEdge`) | **yes** - all 7 real files (3 `.dft`, 1 `.asm`, 3 `.par`) are recognised from the names inside the OLE directory, whatever their extension |
 | Inventor / Revit content tags, CATIA `V5_CFV2`, Creo `#UGC:` headers | **no real files seen** - the tags follow documented/remembered file signatures and are tested only on synthetic files |
@@ -92,7 +92,7 @@ Compiled tab is unchanged.
 
 - **Compressed files are not opened** (removed in 1.7): a `.zip` / `.rar` / `.7z` / `.tar` is one ordinary file. Profiles from earlier profilers may carry archive rows (`archive` column); the compiler still reads those, and does not count an archived file twice when an identical loose one exists.
 - **No hashing at all** (1.6): file contents are never fingerprinted. The compiler recognises duplicates by **type + size + modified date** (and, for
-  archived files, name + size); older profiles that still carry a `sha256` column keep exact matching. Measured on a real 162,409-file CAD drive: 97.4%
+  archived files, name + size); older profiles that still carry a `sha256` column keep exact matching. Measured on a real CAD drive of over 100,000 files: 97.4%
   of the files it calls duplicates really are, and it finds 94.4% of the true duplicates; copies whose dates were reset are missed.
 - **Whole-project copies** are flagged by the compiler (>= 80% of a project's files identical to a bigger project; `Review.csv` +
   `Project_Stats.csv`). `--copies exclude` drops them from Project Compiled, `--unique --unique-scope all` counts each content once in the whole profile.

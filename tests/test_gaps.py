@@ -65,6 +65,32 @@ with tempfile.TemporaryDirectory() as t:
           (sum(1 for r in f if r["archive"]), [r["name"] for r in f if r["adup"]]), (3, ["a.sldprt"]))
     check("Review explains the archive handling", any("found inside archives" in r[2] and "1 identical" in r[2] for r in rev), True)
 
+# ---------------------------------------------------------------- (2b) every AutoCAD drawing is at least one sheet
+with tempfile.TemporaryDirectory() as t:
+    zp = os.path.join(t, "sheets.zip")
+    hdr = "project,file_no,ext,size_bytes,modified_utc,depth,header_signature,dir_id,asm_name,rel_path,sheets,sheets_conf,sheets_status\r\n"
+    rows = ["S,1,dwg,100,2024-01-01T00:00:00Z,1,DWG:AC1032,d1,,a.dwg,3,95,ok",                       # three real sheets
+            "S,2,dwg,101,2024-01-01T00:00:00Z,1,DWG:AC1032,d1,,b.dwg,0,95,ok",                      # Model tab only
+            "S,3,dwg,102,2024-01-01T00:00:00Z,1,DWG:AC1021,d1,,c.dwg,,0,unsupported-r2007",         # could not be read
+            "S,4,dxf,103,2024-01-01T00:00:00Z,1,DXF:AC1027:3D,d1,,d.dxf,1,99,ok",
+            "S,5,slddrw,104,2024-01-01T00:00:00Z,1,BINARY,d1,,e.slddrw,,,"]                          # not an AutoCAD file: sheets not counted at all
+    with zipfile.ZipFile(zp, "w") as zf:
+        zf.writestr("Files.csv", "\ufeff" + hdr + "\r\n".join(rows) + "\r\n")
+        zf.writestr("Run_info.csv", "key,value\r\nfolder_name,x\r\n")
+        zf.writestr("Projects.csv", "project,file_count,total_bytes,distinct_extensions,first_modified_utc,last_modified_utc\r\nS,5,510,3,,\r\n")
+    c, f, s, rev, asm, ev = comp(zp, False, "auto", True)
+    d = {r[1]: r for r in ev["drawings"]}
+    check("drawing rows: sheets used (3 real, model-only -> 1, unread -> 1, dxf 1, other format blank)", [d[n][4] for n in ("a.dwg", "b.dwg", "c.dwg", "d.dxf", "e.slddrw")], [3, 1, 1, 1, ""])
+    check("drawing rows: basis says which are real", [d[n][6] for n in ("a.dwg", "b.dwg", "c.dwg", "d.dxf", "e.slddrw")],
+          ["counted", "model tab only - counted as 1", "not read - assumed 1", "counted", ""])
+    check("drawing rows: the file's own confidence is kept (0 for the unread one)", [d[n][5] for n in ("a.dwg", "c.dwg")], [95, 0])
+    st = {r[0]: r for r in s}["S"]; H = cp.STATS_HEADER
+    check("Project_Stats: total 3+1+1+1 = 6 sheets; 2 counted, 1 model-only, 1 assumed", [st[H.index(k)] for k in ("drawing_sheets", "sheet_files_counted", "sheet_files_model_only", "sheet_files_assumed")], [6, 2, 1, 1])
+    check("confidence average / lowest are over the really counted files only", [st[H.index("sheets_confidence_avg")], st[H.index("sheets_confidence_min")]], [97, 95])
+    fl = {r["name"]: r for r in f}
+    check("File_Level has sheets_used and sheets_basis", [cp.file_row(fl[n])[-2:] for n in ("b.dwg", "c.dwg")], [[1, "model tab only - counted as 1"], [1, "not read - assumed 1"]])
+    check("Review explains it", any(r[1] == "drawing sheets" and "at least 1 sheet" in r[2] and "assumed 1 each" in r[2] for r in rev), True)
+
 # ---------------------------------------------------------------- (3) whole-project copies and cross-project duplicates
 with tempfile.TemporaryDirectory() as t:
     src = os.path.join(t, "parent")

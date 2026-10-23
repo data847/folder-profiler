@@ -138,7 +138,7 @@ duplicate; the compiler treats blank as unique).
 ## Decisions to surface (never pick silently)
 
 1. **Counting rule** — default counts every file; `--unique` counts each file once per project, judging duplicates by type + size + modified date (approximate: 97% of what it calls a duplicate is one and it finds 94% of true duplicates on the real D: data; copies with reset dates are missed)
-   (identical files repeat across e.g. `1_Pre`/`2_Post`; SET-09 parts: 44 all vs 23 unique). When they
+   (identical files repeat across e.g. `1_Pre`/`2_Post`; a real project: 44 parts counted all vs 23 unique). When they
    differ, report both and ask which the sheet should use.
 2. **PDF Drawings** — at level 0 a profile has no file names, so PDFs cannot be told apart and the count is 0 (Review lists
    them). At level ≥ 1 they are classified by name: a PDF named like a part, assembly or drawing counts;
