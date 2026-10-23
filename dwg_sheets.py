@@ -26,6 +26,7 @@ Validation: compared with the DXF export of the same drawing on 21 public test d
 21 of 21 identical - and run on 99 public DWG files of those versions (every one counted, every sampled handle verified). Not yet compared
 with AutoCAD's own sheet count on your clients' drawings. Layouts were introduced in AutoCAD 2000, so R13 / R14 files have none to count.
 """
+import itertools
 import re
 import struct
 
@@ -37,8 +38,10 @@ SENTINEL_CLASSES = bytes.fromhex("8DA1C4B8C4A9F8C5C0DCF45FE7CFB68A")
 VERSION_FACTOR = {"R2000": 0.95, "R2004": 0.95, "R2010": 0.95, "R2013": 0.95, "R2018": 0.95}      # 95 is the ceiling for a DWG: the rest is residual risk
 
 
-def _res(n, conf, method, note=""):
-    return {"sheets": n, "confidence": int(max(0, min(100, round(conf)))), "method": method, "note": note}
+def _res(n, conf, method, note="", code=None):
+    """code = a short, closed-vocabulary STATUS written next to every count ("ok" or why it could not be counted) - no file text in it."""
+    conf = int(max(0, min(100, round(conf))))
+    return {"sheets": n, "confidence": conf, "method": method, "note": note, "code": code or ("ok" if n is not None else "failed")}
 
 
 # ------------------------------------------------------------------------------------------------------------ DXF
@@ -48,10 +51,10 @@ _DXF_MODEL = re.compile(rb"AcDbLayout[ \t]*\r?\n[ \t]*1[ \t]*\r?\n[ \t]*Model[ \
 
 def dxf_sheets(data):
     if data[:22].startswith(b"AutoCAD Binary DXF"):
-        return _res(None, 0, "dxf-binary", "binary DXF is not supported")
+        return _res(None, 0, "dxf-binary", "binary DXF is not supported", "dxf-binary")
     n = len(_DXF_LAYOUT.findall(data))
     if n == 0:
-        return _res(None, 0, "dxf", "no LAYOUT objects (a DXF older than R2000 has no layouts)")
+        return _res(None, 0, "dxf", "no LAYOUT objects (a DXF older than R2000 has no layouts)", "no-layouts-in-version")
     model = bool(_DXF_MODEL.search(data))
     conf = 99 if model else 80
     return _res(max(0, n - 1), conf, "dxf-layout-objects", "" if model else "no layout named Model found: the count may include or miss it")
@@ -307,28 +310,29 @@ def _score(version, n_layouts, checked, matched, inb, classes_exact, layout_name
 def _dwg_r2000(d, version):
     count = struct.unpack_from("<I", d, 0x15)[0]
     if not 3 <= count <= 12:
-        return _res(None, 0, "dwg-" + version, "section locators not understood")
+        return _res(None, 0, "dwg-" + version, "section locators not understood", "r2000-locators")
     loc = {}
     for i in range(count):
         num, seek, size = struct.unpack_from("<BII", d, 0x19 + 9 * i)
         loc[num] = (seek, size)
     if 1 not in loc or 2 not in loc:
-        return _res(None, 0, "dwg-" + version, "class / object map sections not listed")
+        return _res(None, 0, "dwg-" + version, "class / object map sections not listed", "r2000-locators")
     cs, _ = loc[1]
     if d[cs:cs + 16] != SENTINEL_CLASSES:
-        return _res(None, 0, "dwg-" + version, "class section sentinel not found")
+        return _res(None, 0, "dwg-" + version, "class section sentinel not found", "class-table")
     csize = struct.unpack_from("<I", d, cs + 16)[0]
     classes, exact = _classes(d[cs + 20:cs + 20 + csize], version, "inline")
     names = [n for n, x in classes.items() if x == "LAYOUT"]
     if len(names) != 1:
-        return _res(None, 0, "dwg-" + version, "no LAYOUT class in the class table")
+        return _res(None, 0, "dwg-" + version, "no LAYOUT class in the class table", "class-table")
     om_start, om_size = loc[2]
     entries = _object_map(d, om_start, om_size)
     if not entries:
-        return _res(None, 0, "dwg-" + version, "empty object map")
+        return _res(None, 0, "dwg-" + version, "empty object map", "object-map")
     n, checked, matched, inb = _scan(d, entries, names[0], version)
     conf = _score(version, n, checked, matched, inb, exact, len(names))
-    return _res(n - 1 if conf else None, conf, f"dwg-{version}-objects", f"{n} layout objects, {matched}/{checked} sampled handles verified")
+    return _res(n - 1 if conf else None, conf, f"dwg-{version}-objects", f"{n} layout objects, {matched}/{checked} sampled handles verified",
+                None if conf else ("no-layout-objects" if n == 0 else "handle-mismatch"))
 
 
 # ------------------------------------------------------------------------------------------------------------ R2004+
@@ -440,30 +444,38 @@ def lz77(src, out_len, plus_one=1):
         return None
 
 
-def _sections_r2004(d):
-    """-> {section name: decompressed bytes} or raises ValueError."""
-    def sys_page(sig):
-        pos = 0
-        while True:
-            pos = d.find(sig, pos)
-            if pos < 0:
-                return None
-            if pos + 20 <= len(d):
-                dsz, csz, ctype = struct.unpack_from("<III", d, pos + 4)
-                if 0 < csz < len(d) and 0 < dsz < (1 << 28) and ctype in (1, 2) and pos + 20 + csz <= len(d):
-                    body = d[pos + 20:pos + 20 + csz]
-                    if ctype == 1 and csz == dsz:
-                        return bytes(body)
+class SectionError(ValueError):
+    """A step of reading the compressed sections failed; .code is the short status written next to the count."""
+
+    def __init__(self, code, msg=""):
+        super().__init__(msg or code)
+        self.code = code
+
+
+def _sys_pages(d, sig):
+    """Every valid system page (page map / section map) found by its signature, in file order. More than one can exist (the page map is
+    written twice; a damaged or re-saved file can hold stale copies), so the caller tries the candidates until one works."""
+    pos = 0
+    while True:
+        pos = d.find(sig, pos)
+        if pos < 0:
+            return
+        if pos + 20 <= len(d):
+            dsz, csz, ctype = struct.unpack_from("<III", d, pos + 4)
+            if 0 < csz < len(d) and 0 < dsz < (1 << 28) and ctype in (1, 2) and pos + 20 + csz <= len(d):
+                body = d[pos + 20:pos + 20 + csz]
+                if ctype == 1 and csz == dsz:
+                    yield bytes(body)
+                else:
                     for po in (1, 0):
                         out = lz77(body, dsz, po)
                         if out is not None:
-                            return out
-            pos += 1
+                            yield out
+                            break
+        pos += 1
 
-    pmap = sys_page(struct.pack("<I", 0x41630E3B))
-    smap = sys_page(struct.pack("<I", 0x4163003B))
-    if pmap is None or smap is None:
-        raise ValueError("system pages not found")
+
+def _read_sections(d, pmap, smap):
     addr, pages, p = 0x100, {}, 0
     while p + 8 <= len(pmap):
         num, size = struct.unpack_from("<ii", pmap, p)
@@ -475,6 +487,8 @@ def _sections_r2004(d):
         pages[num] = addr
         addr += size
     ndesc = struct.unpack_from("<I", smap, 0)[0]
+    if not 0 < ndesc < 200:
+        raise SectionError("section-map", "implausible section count")
     p, out = 20, {}
     for _ in range(ndesc):
         total, npages, maxd, _u, comp, _sid, _enc = struct.unpack_from("<QIIIIII", smap, p)
@@ -486,12 +500,12 @@ def _sections_r2004(d):
             p += 16
             a = pages.get(pnum)
             if a is None or a + 32 > len(d):
-                raise ValueError("page missing")
+                raise SectionError("page-missing", "page missing")
             mask = 0x4164536B ^ a
             hdr = bytes(x ^ y for x, y in zip(d[a:a + 32], struct.pack("<I", mask) * 8))
             ptype, _sec, csize, psize, pstart, _c1, _c2, _z = struct.unpack("<IIIIIIII", hdr)
             if ptype != 0x4163043B or a + 32 + csize > len(d):
-                raise ValueError("bad data page")
+                raise SectionError("data-page", "bad data page")
             body = d[a + 32:a + 32 + csize]
             if comp == 2:
                 raw = None
@@ -500,7 +514,7 @@ def _sections_r2004(d):
                     if raw is not None:
                         break
                 if raw is None:
-                    raise ValueError("decompression failed")
+                    raise SectionError("decompress", "decompression failed")
             else:
                 raw = bytes(body)
             if start + len(raw) > len(buf):
@@ -510,44 +524,65 @@ def _sections_r2004(d):
     return out
 
 
+def _sections_r2004(d):
+    """-> {section name: decompressed bytes}; tries every page-map / section-map candidate; raises SectionError."""
+    pmaps = list(itertools.islice(_sys_pages(d, struct.pack("<I", 0x41630E3B)), 4))
+    smaps = list(itertools.islice(_sys_pages(d, struct.pack("<I", 0x4163003B)), 4))
+    if not pmaps or not smaps:
+        raise SectionError("system-pages", "system pages not found")
+    err = None
+    for pm in pmaps:
+        for sm in smaps:
+            try:
+                return _read_sections(d, pm, sm)
+            except SectionError as e:
+                err = err or e
+            except (struct.error, IndexError, ValueError) as e:
+                err = err or SectionError("section-map", str(e))
+    raise err
+
+
 def _dwg_r2004(d, version):
     try:
         secs = _sections_r2004(d)
+    except SectionError as e:
+        return _res(None, 0, "dwg-" + version, f"sections could not be read ({e})", "sections-" + e.code)
     except (ValueError, struct.error, IndexError) as e:
-        return _res(None, 0, "dwg-" + version, f"sections could not be decompressed ({e})")
+        return _res(None, 0, "dwg-" + version, f"sections could not be read ({e})", "sections-other")
     hnd, obj = secs.get("AcDb:Handles"), secs.get("AcDb:AcDbObjects")
     if not (hnd and obj):
-        return _res(None, 0, "dwg-" + version, "handle / object sections missing")
+        return _res(None, 0, "dwg-" + version, "handle / object sections missing", "sections-missing")
     # From R2004 on, LAYOUT is a FIXED object type (82); the class table is no longer needed to find it
     best = (LAYOUT_FIXED_TYPE, {}, True)
     try:
         entries = _object_map(hnd, 0, 0)
     except (ValueError, IndexError) as e:
-        return _res(None, 0, "dwg-" + version, f"object map not understood ({e})")
+        return _res(None, 0, "dwg-" + version, f"object map not understood ({e})", "object-map")
     if not entries:
-        return _res(None, 0, "dwg-" + version, "empty object map")
+        return _res(None, 0, "dwg-" + version, "empty object map", "object-map")
     n, checked, matched, inb = _scan(obj, entries, best[0], version)
     conf = _score(version, n, checked, matched, inb, best[2], 1)
-    return _res(n - 1 if conf else None, conf, f"dwg-{version}-objects", f"{n} layout objects, {matched}/{checked} sampled handles verified")
+    return _res(n - 1 if conf else None, conf, f"dwg-{version}-objects", f"{n} layout objects, {matched}/{checked} sampled handles verified",
+                None if conf else ("no-layout-objects" if n == 0 else "handle-mismatch"))
 
 
 # ------------------------------------------------------------------------------------------------------------ entry points
 def dwg_sheets(data):
     v = VERSIONS.get(bytes(data[:6]))
     if v is None:
-        return _res(None, 0, "dwg", "not a known DWG version")
+        return _res(None, 0, "dwg", "not a known DWG version", "not-dwg")
     if v in ("R13", "R14"):
-        return _res(None, 0, "dwg-" + v, "layouts (sheet tabs) were introduced in AutoCAD 2000; this file has none to count")
+        return _res(None, 0, "dwg-" + v, "layouts (sheet tabs) were introduced in AutoCAD 2000; this file has none to count", "no-layouts-in-version")
     if v == "R2007":
-        return _res(None, 0, "dwg-R2007", "AutoCAD 2007 files use a different layout that is not supported")
+        return _res(None, 0, "dwg-R2007", "AutoCAD 2007 files use a different layout that is not supported", "unsupported-r2007")
     if len(data) > MAX_BYTES:
-        return _res(None, 0, "dwg-" + v, "file larger than the size limit")
+        return _res(None, 0, "dwg-" + v, "file larger than the size limit", "too-large")
     try:
         if v in ("R13", "R14", "R2000"):
             return _dwg_r2000(data, v)
         return _dwg_r2004(data, v)
     except (struct.error, ValueError, IndexError, EOFError, KeyError) as e:
-        return _res(None, 0, "dwg-" + v, f"could not be read ({type(e).__name__})")
+        return _res(None, 0, "dwg-" + v, f"could not be read ({type(e).__name__})", "error-" + type(e).__name__.lower())
 
 
 def count_sheets_bytes(data, ext):
@@ -558,15 +593,15 @@ def count_sheets_bytes(data, ext):
         if ext == "dwg":
             return dwg_sheets(data)
     except Exception as e:                                       # never let a damaged file stop a run
-        return _res(None, 0, ext, f"could not be read ({type(e).__name__})")
-    return _res(None, 0, ext, "not a drawing format")
+        return _res(None, 0, ext, f"could not be read ({type(e).__name__})", "error-" + type(e).__name__.lower())
+    return _res(None, 0, ext, "not a drawing format", "not-dwg")
 
 
 def count_sheets_file(f, ext, size=None):
     """Same for an open binary file positioned at 0."""
     try:
         if size is not None and size > MAX_BYTES:
-            return _res(None, 0, ext, "file larger than the size limit")
+            return _res(None, 0, ext, "file larger than the size limit", "too-large")
         return count_sheets_bytes(f.read(MAX_BYTES + 1), ext)
     except OSError:
-        return _res(None, 0, ext, "unreadable")
+        return _res(None, 0, ext, "unreadable", "unreadable")

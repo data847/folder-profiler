@@ -41,7 +41,7 @@ python3 scripts/compile_profiles.py <zip | folder-of-zips> [more ...] [--unique]
 |---|---|
 | Project Name | Top-level folder recorded by the profiler (must be unique) |
 | Project Description | Left **blank** — the user decided it is not needed |
-| Domain | Mechanical / Electronics / Architecture: majority among native files, else neutral-file tool, else `Unclassified` |
+| Domain | Mechanical / Electronics / Architecture, decided in this order (see "How the domain is decided"): specific tools -> tool named in STEP/IFC headers -> file and folder names -> `Unclassified`. `Project Stats` carries `domain_basis` and `domain_confidence` |
 | Native CAD Software | Software of **native** files only (part / assembly / drawing extensions), most frequent first, else `Unknown` |
 | Part Files | count of PART extensions (`sldprt par psm ipt prt catpart …`) |
 | Assembly Files | count of ASSEMBLY extensions (`sldasm asm iam catproduct`) |
@@ -81,6 +81,13 @@ processing order (the folder order of the profile), not sorted by project.
 **Software from content, not only from the extension (profiler 1.7+):** the profiler's `header_signature` names the program inside some files (`OLE2:SolidEdge` - verified on 7 real files; `OLE2:Inventor`, `OLE2:Revit`, `CATIA:V5`, `CREO` - not yet seen on real files). `mapping/signature_software.csv` maps those tags to software. It decides `Native CAD Software` for the shared extensions `.asm` / `.prt` (which the extension table leaves blank) and overrides a wrong extension; `Review.csv` topic "software by content" counts both. A file with CAD content under a non-CAD extension is NOT counted as a part or assembly but is listed under "native file, other extension".
 
 **Step 1 zips (quick count):** `quick_<name>_<date>.zip` from the profiler's `--quick` / *Step 1* button holds only file counts and sizes per extension and project (no names, nothing opened). Give one to `compile_profiles.py` (no other option applies) and it writes `quick_count.xlsx` plus `Quick_Overview.csv`, `Quick_By_Extension.csv`, `Quick_By_Project.csv`: an overview by file class (PART / ASSEMBLY / DRAWING / NEUTRAL3D / PDF / IMG ...), every extension with its class, software and domain (extensions missing from `extensions.csv` show as UNMAPPED), and per project the parts / assemblies / drawings / neutral / PDF counts and top extensions. It cannot say which part belongs to which assembly - that needs the step-2 profile.
+
+**How the domain is decided (per project, never guessed):**
+1. **Specific tools vote**, one vote per native file (SolidWorks, Inventor, CATIA, Creo, NX, Solid Edge ... -> Mechanical; Revit, SketchUp, ArchiCAD -> Architecture; KiCad, Altium, Eagle -> Electronics). **General-purpose CAD (AutoCAD, Rhino, FreeCAD, OpenCascade, 3ds Max) does not vote**, because it is used in every domain - `software_domain.csv` column `role` (`specific` / `general`). Confidence: High when one domain has >= 90% of the specific votes and the specific tools are >= 20% of the native files; Medium from 60%; else Low.
+2. Otherwise the tool named inside STEP / IFC / IGES headers (Low).
+3. Otherwise **file and folder names** matched against `mapping/domain_keywords.csv` (editable regex words per domain, e.g. floor plan, elevation, ceiling -> Architecture; gearbox, shaft, bracket -> Mechanical; schematic, pcb -> Electronics). Needs level >= 1. Needs >= 10 matching names and >= 55% of the matches (High: >= 80% of >= 50 matches).
+4. Otherwise `Unclassified` - the Review line says so: set it by hand.
+Names are always checked too: if they agree with the tools the confidence rises, if they strongly contradict it a High is lowered to Medium. `Review.csv` topic "domain" gives the basis in words for every project that is not an unambiguous High. Mixed projects (a second domain with >= 20% of the votes) say "Mixed domains".
 
 **Drawing Breakdown tab (drawing level):** one row per drawing file - every native 2D drawing (DWG, DXF, SLDDRW, DFT, IDW, DRW, CATDRAWING ...) and every PDF counted as a drawing - with `Format`, `Native CAD Software`, `Sheets`, `Sheets Confidence`, `Assembly` and `Assembly Method`. The assembly comes from, in order: the file references of the drawing (`link`, also through the part it documents), a matching file name (`name`), the one assembly in its folder (`folder` / `spread`); with several assemblies in its folder the cell stays empty and the method says how many candidates ("folder: 2 candidate assemblies"). Rows add up to Native 2D Drawings + PDF Drawings of Project Compiled; the Review line says how many were placed each way. Also written as `Drawing_Breakdown.csv` (parts of 1,000,000 rows). At level 0 file names are not recorded, so rows carry "(name not recorded: level 0 profile)". Sheet counts are for AutoCAD files only; PDF page counts are not read.
 
@@ -155,7 +162,7 @@ duplicate; the compiler treats blank as unique).
 
 `scripts/mapping/extensions.csv` — `ext,class,software,domain,note`. Classes: `PART ASSEMBLY DRAWING NEUTRAL3D PDF
 SIM DOC DATA IMG ARCHIVE OTHER` (an unknown class aborts the run). `scripts/mapping/software_domain.csv` —
-`tag,display,domain`.
+`tag,display,domain,role` (role `general` = no domain of its own); `scripts/mapping/domain_keywords.csv` — `domain,pattern` (regular expressions on file / folder names).
 
 For each *unmapped extension* in `Review.csv`, **propose** a row (class, software, domain) and wait for the user's yes
 before editing. Leave `software` blank when an extension is ambiguous (`.prt .asm .sch .brd .dxf`). Never guess a domain

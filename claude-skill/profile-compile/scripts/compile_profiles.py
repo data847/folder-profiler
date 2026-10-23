@@ -70,12 +70,12 @@ ASSEMBLY_HEADINGS = ["Project Name", "Assembly File Name", "Part Files", "Native
                      "PDF Drawings", "Neutral 3D Files"]
 FILE_HEADER = ["project", "ext", "class", "native_software", "domain", "size_bytes", "modified_utc", "sha256",
                "header_signature", "duplicate_of_earlier_file", "in_archive", "archive_duplicate_not_counted", "dedupe_key",
-               "sheets", "sheets_confidence"]
+               "sheets", "sheets_confidence", "sheets_status"]
 STATS_HEADER = ["project", "files_total", "unique_hashes", "duplicate_files", "parts", "assemblies",
                 "native_2d_drawings", "neutral_3d", "pdf", "simulation", "documents", "data", "images",
                 "archive_other", "unmapped", "total_bytes", "counted_as", "files_in_archives", "archive_duplicates_not_counted",
                 "possible_copy_of", "copy_share", "drawing_sheets", "sheet_files_counted", "sheet_files_not_counted",
-                "sheets_confidence_avg", "sheets_confidence_min"]
+                "sheets_confidence_avg", "sheets_confidence_min", "domain_basis", "domain_confidence"]
 CLASSES = {"PART", "ASSEMBLY", "DRAWING", "NEUTRAL3D", "PDF", "SIM", "DOC", "DATA", "IMG", "ARCHIVE", "OTHER"}
 NATIVE = {"PART", "ASSEMBLY", "DRAWING"}      # only these name the "Native CAD Software"
 REPORT_WORDS = re.compile(r"report|spec|manual|datasheet|data.?sheet|catalog|brochure|invoice|quot|certificate|summary|presentation|"
@@ -129,7 +129,7 @@ class Row:
     """One file of a profile. A __slots__ object instead of a dict: about a fifth of the memory per file, which is what lets a profile
     with millions of files compile. Behaves like the dict the structure code was written for (r["x"], r.get("x"), r["x"] = v)."""
     __slots__ = ("project", "ext", "cls", "sw", "tool", "domain", "size", "modified", "sha", "keys", "fp", "sig", "dup", "dir", "asm",
-                 "name", "stem", "rel", "pdfdraw", "archive", "adup", "lk", "sheets", "sheets_conf")
+                 "name", "stem", "rel", "pdfdraw", "archive", "adup", "lk", "sheets", "sheets_conf", "sheets_status")
 
     def __init__(self, **kw):
         for k, v in kw.items():
@@ -162,10 +162,16 @@ def load_mapping(map_dir):
     soft = {r["tag"].strip(): r for r in read_csv(Path(map_dir) / "software_domain.csv")}
     sigp = Path(map_dir) / "signature_software.csv"          # which program wrote a file, judged by what is INSIDE it
     soft[BY_SIGNATURE] = {r["sig"].strip(): r["software"].strip() for r in read_csv(sigp)} if sigp.exists() else {}
+    kwp = Path(map_dir) / "domain_keywords.csv"             # file / folder name words that point to a domain (the fallback when no specific tool does)
+    pats = collections.defaultdict(list)
+    for r in (read_csv(kwp) if kwp.exists() else []):
+        pats[r["domain"].strip()].append(r["pattern"].strip())
+    soft[DOMAIN_KEYWORDS] = {d: re.compile("|".join(f"(?:{p})" for p in ps), re.I) for d, ps in pats.items()}
     return ext_map, soft
 
 
 BY_SIGNATURE = "__by_signature__"
+DOMAIN_KEYWORDS = "__domain_keywords__"
 
 
 class CsvSource:
@@ -356,7 +362,7 @@ def _csv_safe(v):
 def file_row(r):
     return [r["project"], r["ext"], r["cls"], r["sw"], r["domain"], r["size"], r["modified"], r["sha"], r["sig"],
             "yes" if r["dup"] else "", r["archive"], "yes" if r["adup"] else "", r["fp"] or r["keys"][0],
-            "" if r["sheets"] is None else r["sheets"], "" if r["sheets_conf"] is None else r["sheets_conf"]]
+            "" if r["sheets"] is None else r["sheets"], "" if r["sheets_conf"] is None else r["sheets_conf"], r["sheets_status"] or ""]
 
 
 def _to_int(v):
@@ -417,7 +423,7 @@ class RowBuilder:
                              asm=f.get("asm_name", ""), name=nm, stem=stem(nm) if nm else "", rel=rel, pdfdraw=False, archive=_I(archive),
                              adup=dup and bool(archive),
                              lk=self.lk.get(int(f["file_no"])) if self.lk is not None else None,
-                             sheets=_to_int(f.get("sheets")), sheets_conf=_to_int(f.get("sheets_conf"))))
+                             sheets=_to_int(f.get("sheets")), sheets_conf=_to_int(f.get("sheets_conf")), sheets_status=_I(f.get("sheets_status", ""))))
 
 
 # ---------------------------------------------------------------------------------------------------- the compiler
@@ -522,6 +528,67 @@ class Engine:
             if links:
                 self.lost_links += links.rest()
 
+    # ------------------------------------------------------------------------------------------ domain
+    def classify_domain(self, counted, proj):
+        """-> (domain, basis, confidence, [review texts]). In order:
+        1. SPECIFIC tools (SolidWorks, Revit, SketchUp, KiCad ... - software_domain.csv role 'specific') vote, one vote per native file;
+           general-purpose CAD (AutoCAD, Rhino ...) does not vote, because it is used in every domain.
+        2. the tool named in neutral-file headers (STEP / IFC ...);
+        3. file and folder NAMES matched against domain_keywords.csv (needs level >= 1);
+        4. Unclassified."""
+        soft, notes = self.soft, []
+        native = [r for r in counted if r["cls"] in NATIVE]
+        spec = collections.Counter(r["domain"] for r in native if r["domain"] and (soft.get(r["sw"], {}).get("role") or "specific") != "general")
+        domain = basis = conf = ""
+        if spec:
+            domain, top = spec.most_common(1)[0]
+            tot = sum(spec.values())
+            share, cover = top / tot, tot / max(1, len(native))
+            conf = "High" if share >= 0.9 and cover >= 0.2 else "Medium" if share >= 0.6 else "Low"
+            basis = "specific tools"
+            general = len(native) - tot
+            notes.append(f"decided by {', '.join(f'{d} tools: {k} files' for d, k in spec.most_common())}" + (f"; {general} files of general-purpose CAD (AutoCAD / Rhino ...) did not vote" if general else ""))
+            if len(spec) > 1 and spec.most_common(2)[1][1] / tot >= 0.2:
+                notes.append("Mixed domains: " + ", ".join(f"{d} ({k})" for d, k in spec.most_common()))
+        if not domain:
+            neutral = collections.Counter(soft[r["tool"]]["domain"] for r in counted if r["cls"] == "NEUTRAL3D" and r["tool"] in soft and soft[r["tool"]]["domain"])
+            if neutral:
+                domain = neutral.most_common(1)[0][0]
+                basis, conf = "neutral-file headers", "Low"
+                notes.append("only the tool named inside STEP / IFC / IGES headers points to this domain: " + ", ".join(f"{d} ({k})" for d, k in neutral.most_common()))
+        if True:
+            kws = soft.get(DOMAIN_KEYWORDS) or {}
+            hits = collections.Counter()
+            named = 0
+            for r in counted:
+                path = r["rel"] or r["name"]
+                if not path:
+                    continue
+                named += 1
+                text = proj + "/" + path
+                for d, rx in kws.items():
+                    if rx.search(text):
+                        hits[d] += 1
+            H = sum(hits.values())
+            if hits:
+                nd, nk = hits.most_common(1)[0]
+                nshare = nk / H
+                nconf = "High" if nshare >= 0.8 and H >= 50 else "Medium" if nshare >= 0.65 and H >= 20 else "Low"
+                if not domain and H >= 10 and nshare >= 0.55:
+                    domain, basis, conf = nd, "file and folder names", nconf
+                    notes.append(f"decided by file / folder names: {', '.join(f'{d} {k}' for d, k in hits.most_common())} of {named} named files")
+                elif domain and nd != domain and nconf != "Low":
+                    notes.append(f"but file / folder names point to {nd} ({nk} of {named} named files)")
+                    if conf == "High" and nconf in ("Medium", "High"):
+                        conf = "Medium"                                      # strong disagreement between the two kinds of evidence
+                elif domain and nd == domain and conf != "High" and nconf in ("Medium", "High"):
+                    conf = "High" if conf == "Medium" else conf              # tools and names agree
+                    notes.append(f"file / folder names agree ({nd}: {nk} of {named} named files)")
+        if not domain:
+            domain, basis, conf = "Unclassified", "none", ""
+            notes.append("no specific tool, neutral-file header or file / folder name points to a domain - set it by hand")
+        return domain, basis, conf, notes
+
     # ------------------------------------------------------------------------------------------ one final project -> its output rows
     def finish(self, proj, rows, parents):
         rev = self.review_proj[proj]
@@ -554,11 +621,7 @@ class Engine:
         t3d = types({"PART", "ASSEMBLY", "NEUTRAL3D"})
         sw = collections.Counter(r["sw"] for r in counted if r["sw"])
         sw_names = ", ".join(soft[t]["display"] if t in soft else t for t, _ in sw.most_common()) or "Unknown"
-        dom = collections.Counter(r["domain"] for r in counted if r["cls"] in NATIVE and r["domain"])
-        if not dom:  # no native files: fall back to the tool named in neutral-format headers
-            dom = collections.Counter(soft[r["tool"]]["domain"] for r in counted
-                                      if r["cls"] == "NEUTRAL3D" and r["tool"] in soft)
-        domain = dom.most_common(1)[0][0] if dom else "Unclassified"
+        domain, dom_basis, dom_conf, dom_notes = self.classify_domain(counted, proj)
 
         self.compiled[proj] = [proj, "", domain, sw_names, n["PART"], n["ASSEMBLY"], n["DRAWING"], pdf_drawings,
                                n["NEUTRAL3D"], t2d, t3d]
@@ -568,7 +631,12 @@ class Engine:
         if sh_rows and any(r["sheets_conf"] is not None for r in sh_rows):
             sheet_stats = [sum(r["sheets"] for r in sh_ok), len(sh_ok), len(sh_no),
                            round(sum(r["sheets_conf"] for r in sh_ok) / len(sh_ok)) if sh_ok else "", min((r["sheets_conf"] for r in sh_ok), default="")]
-            why = collections.Counter(("AutoCAD 2007 format (not supported)" if r["sig"] == "DWG:AC1021" else
+            STATUS_TEXT = {"unsupported-r2007": "AutoCAD 2007 format (not supported)", "no-layouts-in-version": "older than AutoCAD 2000 / no layouts in this file",
+                           "dxf-binary": "binary DXF (not supported)", "too-large": "file larger than the size limit", "unreadable": "file could not be read",
+                           "not-dwg": "not an AutoCAD file in spite of the extension", "no-layout-objects": "no layout found in the file",
+                           "handle-mismatch": "file structure did not check out", "object-map": "object table not understood", "class-table": "class table not understood"}
+            why = collections.Counter((STATUS_TEXT.get(r["sheets_status"], f"could not be read ({r['sheets_status']})") if r["sheets_status"] else
+                                       "AutoCAD 2007 format (not supported)" if r["sig"] == "DWG:AC1021" else
                                        "older than AutoCAD 2000 (has no layouts)" if r["sig"] in ("DWG:AC1012", "DWG:AC1014") else
                                        "no layouts in this DXF" if r["ext"] == "dxf" else "could not be read") for r in sh_no)
             rev.append([proj, "drawing sheets",
@@ -582,7 +650,7 @@ class Engine:
                             sum(r["dup"] for r in rows), n["PART"], n["ASSEMBLY"], n["DRAWING"], n["NEUTRAL3D"], n["PDF"], n["SIM"],
                             n["DOC"], n["DATA"], n["IMG"], n["ARCHIVE"] + n["OTHER"], n["UNMAPPED"], sum(r["size"] for r in rows),
                             ("unique hashes (whole profile)" if self.unique_scope == "all" else "unique hashes (per project)") if unique else "all files",
-                            sum(1 for r in rows if r["archive"]), sum(1 for r in rows if r["adup"]), "", "", *sheet_stats]
+                            sum(1 for r in rows if r["archive"]), sum(1 for r in rows if r["adup"]), "", "", *sheet_stats, dom_basis, dom_conf]
         n_arch = sum(1 for r in rows if r["archive"])
         if n_arch:
             rev.append([proj, "archives", f"{n_arch} files found inside archives ({sum(1 for r in rows if r['adup'])} identical to files "
@@ -590,10 +658,8 @@ class Engine:
         copy_slot = [proj, "possible copy", None]
         rev.append(copy_slot)                           # filled in (or removed) once every project is known
 
-        if domain == "Unclassified":
-            rev.append([proj, "domain", "No native or neutral model maps to a domain - set it by hand"])
-        elif len(dom) > 1:
-            rev.append([proj, "domain", "Mixed domains: " + ", ".join(f"{d} ({k})" for d, k in dom.most_common())])
+        if domain == "Unclassified" or dom_conf != "High" or len(dom_notes) > 1:
+            rev.append([proj, "domain", f"{domain}" + (f" (confidence {dom_conf}, basis: {dom_basis})" if dom_conf else "") + ": " + "; ".join(dom_notes)])
         if sw_names == "Unknown":
             rev.append([proj, "software", "No native CAD file identifies the software (only neutral/other files)"])
         elif len(sw) > 1:
@@ -719,8 +785,20 @@ class Engine:
         for proj in sorted(self.review_proj, key=str.lower):
             review += self.review_proj[proj]
         review = self.review_split + review
-        for (proj, ext), k in sorted(self.unmapped.items()):
-            review.append([proj, "unmapped extension", f".{ext} x{k} - add it to extensions.csv"])
+        if len(self.unmapped) <= 40:
+            for (proj, ext), k in sorted(self.unmapped.items()):
+                review.append([proj, "unmapped extension", f".{ext} x{k} - add it to extensions.csv"])
+        else:                                                    # many: one line per extension (the biggest 40), the rest is in Unmapped_Extensions.csv
+            per_ext = collections.Counter()
+            projs = collections.defaultdict(set)
+            for (proj, ext), k in self.unmapped.items():
+                per_ext[ext] += k
+                projs[ext].add(proj)
+            for ext, k in per_ext.most_common(40):
+                review.append(["(all projects)", "unmapped extension", f".{ext} x{k} in {len(projs[ext])} project(s) - add it to extensions.csv"])
+            if len(per_ext) > 40:
+                review.append(["(all projects)", "unmapped extension", f"{len(per_ext) - 40} more extension(s) not listed here ({len(self.unmapped)} project/extension pairs) - "
+                               "see Unmapped_Extensions.csv"])
         for (proj, was, now), k in sorted(self.sw_by_content.items()):
             review.append([proj, "software by content", f"{k} file(s) {('with an extension that does not name one program (.asm .prt ...)' if was == '-' else 'whose extension says ' + was)}"
                            f" are {now} files judging by what is inside them: counted as {now}"])

@@ -30,6 +30,13 @@ searched for CAD file names written as plain text (`kind = scan` in `Links.csv`)
 AutoCAD xrefs are not read (an xref links a drawing to a drawing, which does not change part / assembly counts).
 Because the default is level 2, the output contains client file and folder names: get the data owner's agreement first (`--level 0` records metrics only).
 
+## Domain (Mechanical / Architecture / Electronics)
+
+Decided per project by the compiler: specific tools vote (SketchUp, Revit, SolidWorks ...; **general-purpose AutoCAD / Rhino do not**), then the tool named in
+STEP/IFC headers, then file and folder names against `domain_keywords.csv`, else `Unclassified`; `Project Stats` has `domain_basis` and `domain_confidence`, `Review` explains
+each non-obvious call. On a real 74-project, 385k-file architecture drive this gave 68 Architecture (66 of them High from SketchUp/Revit files), 2 Mechanical (Inventor
+standard-parts libraries), 4 Unclassified - where the old rule called 56 projects Mechanical because AutoCAD counted as Mechanical.
+
 ## Two steps
 
 - **Step 1 - quick count** (`--quick`, or the *Step 1* button of the page): files per type and size, per project and overall - nothing is opened, no file

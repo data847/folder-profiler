@@ -1,23 +1,23 @@
-tag,display,domain
-SolidWorks,SolidWorks,Mechanical
-Inventor,Inventor,Mechanical
-CATIA,CATIA,Mechanical
-Creo,Creo,Mechanical
-NX,NX,Mechanical
-SolidEdge,Solid Edge,Mechanical
-Fusion360,Fusion 360,Mechanical
-FreeCAD,FreeCAD,Mechanical
-Onshape,Onshape,Mechanical
-Rhino,Rhino,Mechanical
-OpenCascade,OpenCascade,Mechanical
-CalculiX,CalculiX,Mechanical
-ANSYS,ANSYS,Mechanical
-Abaqus,Abaqus,Mechanical
-AutoCAD,AutoCAD,Mechanical
-SketchUp,SketchUp,Architecture
-Revit,Revit,Architecture
-ArchiCAD,ArchiCAD,Architecture
-Altium,Altium,Electronics
-KiCad,KiCad,Electronics
-Eagle,Eagle,Electronics
-3dsMax,3ds Max,
+tag,display,domain,role
+SolidWorks,SolidWorks,Mechanical,specific
+Inventor,Inventor,Mechanical,specific
+CATIA,CATIA,Mechanical,specific
+Creo,Creo,Mechanical,specific
+NX,NX,Mechanical,specific
+SolidEdge,Solid Edge,Mechanical,specific
+Fusion360,Fusion 360,Mechanical,specific
+FreeCAD,FreeCAD,,general
+Onshape,Onshape,Mechanical,specific
+Rhino,Rhino,,general
+OpenCascade,OpenCascade,,general
+CalculiX,CalculiX,Mechanical,specific
+ANSYS,ANSYS,Mechanical,specific
+Abaqus,Abaqus,Mechanical,specific
+AutoCAD,AutoCAD,,general
+SketchUp,SketchUp,Architecture,specific
+Revit,Revit,Architecture,specific
+ArchiCAD,ArchiCAD,Architecture,specific
+Altium,Altium,Electronics,specific
+KiCad,KiCad,Electronics,specific
+Eagle,Eagle,Electronics,specific
+3dsMax,3ds Max,,general

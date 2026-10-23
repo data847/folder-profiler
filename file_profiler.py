@@ -6,7 +6,7 @@ full profile described below.
 
 What it writes (one zip of CSVs, nothing else):
   Files.csv       one row per file: project, file_no, ext, size_bytes, modified, depth, header_signature, dir_id, asm_name,
-                  (rel_path at level >= 1), sheets, sheets_conf (level 2)
+                  (rel_path at level >= 1), sheets, sheets_conf, sheets_status (level 2)
   Projects.csv    one row per project folder: counts, bytes, date range
   Extensions.csv  one row per project + extension: counts, bytes
   Dirs.csv        the folder tree (anonymous ids; names at level >= 1)
@@ -653,15 +653,15 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
 
         def columns():
             return (["project", "file_no", "ext", "size_bytes", "modified_utc", "depth", "header_signature", "dir_id", "asm_name"]
-                    + (["rel_path"] if tier >= 1 else []) + (["sheets", "sheets_conf"] if tier >= 2 else []))
+                    + (["rel_path"] if tier >= 1 else []) + (["sheets", "sheets_conf", "sheets_status"] if tier >= 2 else []))
 
         def sheet_cols(sh):
             """Row cells for the sheet count: '' = not attempted (not a drawing / level < 2); confidence 0 with no count = attempted, failed."""
             if tier < 2:
                 return []
             if sh is None:
-                return ["", ""]
-            return [sh["sheets"] if sh["sheets"] is not None else "", sh["confidence"]]
+                return ["", "", ""]
+            return [sh["sheets"] if sh["sheets"] is not None else "", sh["confidence"], sh["code"]]
 
         def link_rows(proj, n, ext, res):
             if res[0] in ("native", "scan"):
@@ -745,6 +745,7 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
                         C["errors"] += 1
                     if sh is not None:
                         C["sheets_counted" if sh["sheets"] is not None else "sheets_not_counted"] += 1
+                        C["sheet_status:" + sh["code"]] += 1
                     rows.append([proj, nn, ext, size, mtime, depth, sig, dir_id, asm] + ([relpath] if tier >= 1 else []) + sheet_cols(sh if ext in SHEET_EXTS else None))
                     if was_link:
                         if res is None:
@@ -902,7 +903,8 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
                 ["unreadable_folders", C["dir_errors"]], ["linked_folders_skipped", walk_counts["links_skipped"]],
                 ["ignored_system_files", C["junk"] + sum(u.get("junk", 0) for u in man["units"].values())],
                 ["projects_changed_during_run", C["changed_projects"]], ["projects_changed_between_restarts", C["stale_projects"]], ["chunks_redone_after_change", C["stale_chunks"]],
-                ["drawing_sheets_counted", C["sheets_counted"]], ["drawing_sheets_not_counted", C["sheets_not_counted"]], ["restarts_resumed", man["restarts"]],
+                ["drawing_sheets_counted", C["sheets_counted"]], ["drawing_sheets_not_counted", C["sheets_not_counted"]],
+                ["drawing_sheets_status", "; ".join(f"{k.split(':', 1)[1]} x{v}" for k, v in sorted(C.items(), key=lambda kv: -kv[1]) if k.startswith("sheet_status:"))], ["restarts_resumed", man["restarts"]],
                 ["seconds", round(active, 1)], ["seconds_scan", round(man["prescan_s"], 1)], ["seconds_process", round(proc_s, 1)],
                 ["seconds_finalize", round(fin_s, 1)],
                 ["avg_MB_per_s", round(bytes_out / 1e6 / max(1.0, proc_s + man["prescan_s"]), 1)],

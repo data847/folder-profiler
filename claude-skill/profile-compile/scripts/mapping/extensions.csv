@@ -143,3 +143,70 @@ mov,IMG,,,video
 avi,IMG,,,video
 mkv,IMG,,,video
 iso,ARCHIVE,,,disk image
+ttf,DATA,,,font
+otf,DATA,,,font
+ttc,DATA,,,font
+woff,DATA,,,web font
+woff2,DATA,,,web font
+eot,DATA,,,web font
+css,DATA,,,web
+map,DATA,,,web source map / data
+py,DATA,,,script
+rb,DATA,,,Ruby script (SketchUp plugin)
+rbe,DATA,,,encrypted Ruby (SketchUp plugin)
+rbs,DATA,,,scrambled Ruby (SketchUp plugin)
+lsp,DATA,,,AutoLISP script
+arx,DATA,,,AutoCAD plugin
+shx,DATA,,,AutoCAD font
+dyn,DATA,,,Dynamo graph
+dyf,DATA,,,Dynamo custom node
+qm,DATA,,,translation
+strings,DATA,,,translation
+lang,DATA,,,translation
+lingvo,DATA,,,translation
+msi,DATA,,,installer
+cab,DATA,,,installer package
+msp,DATA,,,installer patch
+tlb,DATA,,,type library
+pak,DATA,,,game / app resource pack
+h,DATA,,,source header
+sig,DATA,,,signature
+3dmbak,DATA,,,Rhino backup - not counted as a model
+dwgbak,DATA,,,AutoCAD backup - not counted as a drawing
+dds,IMG,,,texture
+psb,IMG,,,Photoshop large document
+arw,IMG,,,Sony raw photo
+heic,IMG,,,photo
+webp,IMG,,,image
+ls8,OTHER,,,Lumion scene (visualisation)
+ls10,OTHER,,,Lumion scene (visualisation)
+ls12,OTHER,,,Lumion scene (visualisation)
+ls11,OTHER,,,Lumion scene (visualisation)
+inn,OTHER,,,Lumion library model (seen in 'Lumion 10.0/Library')
+mtt,OTHER,,,Lumion library data
+txx,OTHER,,,Lumion library texture data
+sim,OTHER,,,Lumion material (seen in 'Materials/indoor')
+ltm,OTHER,,,Lumion tree model
+ldf,OTHER,,,Lumion HDR sky
+srt,OTHER,,,SpeedTree model (Lumion trees)
+vismat,OTHER,,,visualisation material (render library)
+pcp,DATA,,,AutoCAD plot configuration written next to exported DWGs
+zdct,DATA,,,Adobe resource
+clx,DATA,,,installed-software data
+xfo,DATA,,,installed-software template data
+tds,DATA,,,installed-software template
+gpd,DATA,,,printer driver
+dpb,DATA,,,printer driver
+asr,DATA,,,Autodesk licensing data
+fx,DATA,,,shader
+pimx,DATA,,,Adobe package data
+tbl,DATA,,,Revit shared table
+las,DATA,,,geodetic grid shift file
+los,DATA,,,geodetic grid shift file
+b,DATA,,,geodetic grid file
+cfa,DATA,,,Premiere audio preview
+pek,DATA,,,Premiere peak file
+download,DATA,,,unfinished browser download
+img,DATA,,,disk image / installer
+bin,DATA,,,binary data / installer
+3dm_tmp,DATA,,,Rhino temporary file
