@@ -45,8 +45,8 @@ li span.n{flex:1}pre{margin:0;max-height:220px;overflow:auto;font-size:13px;whit
 .bar.ind i{width:35%;animation:slide 1.1s infinite ease-in-out}@keyframes slide{0%{margin-left:-35%}100%{margin-left:100%}}
 @media(prefers-reduced-motion:reduce){.bar.ind i{animation:none;width:100%;opacity:.5}}
 .chip b{cursor:pointer;color:var(--er)}input[type=checkbox]{width:17px;height:17px}
-</style></head><body><main>
-<h1>Folder Profiler</h1><p class="s">Measures file extensions, sizes, dates and fingerprints. Never copies files. How much it records is your choice (step 3). Runs only on this computer.</p>
+table.qt{border-collapse:collapse}table.qt td,table.qt th{border:1px solid #8884;padding:3px 10px;text-align:left}</style></head><body><main>
+<h1>Folder Profiler</h1><p class="s">Two steps: a very fast count of files per type, then the full profile. Never copies or changes your files. Runs only on this computer.</p>
 <div class="card"><b>1. What do you want to measure?</b>
 <div class="modes" style="margin-top:8px"><label><input type="radio" name="m" value="parent" checked> One parent folder <span class="mut">(each sub-folder = a project)</span></label>
 <label><input type="radio" name="m" value="pick"> Pick project folders <span class="mut">(tick one or more)</span></label></div></div>
@@ -55,9 +55,10 @@ li span.n{flex:1}pre{margin:0;max-height:220px;overflow:auto;font-size:13px;whit
 <ul id="ls"></ul>
 <div id="selbox" style="display:none;margin-top:12px"><span class="mut" id="selcount"></span><ul id="sel" style="max-height:150px"></ul></div></div>
 <div class="card"><b>3. Run</b>
-<label style="display:block;margin-top:8px"><input type="checkbox" id="arch" checked> Look inside archives <span class="mut">(.zip and .tar.gz are opened; .7z and .rar are listed only. Nothing is extracted to disk.)</span></label>
 <label style="display:block;margin-top:8px"><input type="checkbox" id="fresh"> Start from scratch <span class="mut">(normally a stopped run continues where it stopped; tick this to ignore saved progress)</span></label>
-<div class="row" style="margin-top:8px"><button id="go">Start profiling</button></div>
+<div class="row" style="margin-top:8px"><button id="goquick" title="Counts the files of each type and their size. Nothing is opened, so it is very fast.">Step 1: quick count</button>
+<button id="go" title="The complete profile (file details, references inside assemblies, drawing sheets). Takes much longer.">Step 2: full profile</button></div>
+<div class="mut" style="margin-top:6px">Step 1 only counts files per type and size (very fast; no file is opened). Step 2 is the complete profile.</div>
 <div class="bar" id="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100"><i id="barfill"></i></div><div class="mut" id="barlabel" style="margin-top:6px"></div>
 <pre id="log" class="mut" style="margin-top:10px"></pre><div id="res" style="margin-top:10px"></div></div>
 </main><script>
@@ -80,13 +81,15 @@ function setMode(m){mode=m;$("h2").textContent=m=="pick"?"2. Tick the project fo
 document.querySelectorAll("input[name=m]").forEach(r=>r.onchange=()=>setMode(r.value));
 $("addcur").onclick=()=>{if(cur&&!sel.includes(cur)){sel.push(cur);renderSel()}};
 $("up").onclick=()=>ls($("up").dataset.parent);$("p").onchange=()=>ls($("p").value);
-$("go").onclick=async()=>{$("res").textContent="";$("bar").style.display="none";$("barlabel").textContent="";
+$("go").onclick=()=>start("full");$("goquick").onclick=()=>start("quick");
+const busy=v=>{$("go").disabled=v;$("goquick").disabled=v};
+async function start(kind){$("res").textContent="";$("bar").style.display="none";$("barlabel").textContent="";
  if(mode=="pick"&&!sel.length){$("res").innerHTML="<span class='er'>Tick at least one folder first.</span>";return}
- $("go").disabled=true;
- const o={arch:$("arch").checked,fresh:$("fresh").checked};
+ busy(true);
+ const o={fresh:$("fresh").checked,kind:kind};
  const body=mode=="pick"?{t:T,paths:sel,...o}:{t:T,path:$("p").value,...o};
  const r=await fetch("/api/start",{method:"POST",body:JSON.stringify(body)});const j=await r.json();
- if(j.error){$("res").innerHTML="<span class='er'>"+esc(j.error)+"</span>";$("go").disabled=false;return}poll()};
+ if(j.error){$("res").innerHTML="<span class='er'>"+esc(j.error)+"</span>";busy(false);return}poll()}
 const mb=b=>b>=1e9?(b/1e9).toFixed(1)+" GB":(b/1e6).toFixed(0)+" MB";
 function bar(j){const p=j.progress,b=$("bar");
  if(j.state=="idle"){b.style.display="none";$("barlabel").textContent="";return}
@@ -100,8 +103,12 @@ function bar(j){const p=j.progress,b=$("bar");
  $("barfill").style.width=pct+"%";b.setAttribute("aria-valuenow",Math.round(pct));
  $("barlabel").textContent=Math.round(pct)+"%  -  "+p.files.toLocaleString()+" of "+p.total_files.toLocaleString()+" files  ("+mb(p.bytes)+" of "+mb(p.total_bytes)+")"}
 async function poll(){const j=await (await fetch("/api/status?t="+T)).json();bar(j);$("log").textContent=j.log.join("\n");$("log").scrollTop=1e9;
- if(j.state=="running"){setTimeout(poll,700);return}$("go").disabled=false;
- if(j.state=="done")$("res").innerHTML="<span class='ok'>Done: "+j.result.projects+" folders, "+j.result.files.toLocaleString()+" files"+(j.result.errors?", "+j.result.errors+" unreadable":"")+
+ if(j.state=="running"){setTimeout(poll,700);return}busy(false);
+ if(j.state=="done"&&j.result.quick){let t="<table class='qt'><tr><th>File type</th><th>Files</th><th>Size</th></tr>";
+  j.result.top.forEach(x=>{t+="<tr><td>."+esc(x[0])+"</td><td>"+x[1].toLocaleString()+"</td><td>"+mb(x[2])+"</td></tr>"});t+="</table>";
+  $("res").innerHTML="<span class='ok'>Step 1 done: "+j.result.files.toLocaleString()+" files, "+mb(j.result.total_bytes)+", "+j.result.types+" file types in "+j.result.projects+" folders ("+j.result.seconds+" s).</span><br><br>"+t+
+   "<br><a class='btn' href='/api/download?t="+T+"'>Download quick count zip</a> <span class='mut'>"+esc(j.result.name)+"</span><br><br><span class='mut'>When you are ready, click <b>Step 2: full profile</b> for the complete profile.</span>"}
+ else if(j.state=="done")$("res").innerHTML="<span class='ok'>Done: "+j.result.projects+" folders, "+j.result.files.toLocaleString()+" files"+(j.result.errors?", "+j.result.errors+" unreadable":"")+
   ".</span><br><br><a class='btn' href='/api/download?t="+T+"'>Download metrics zip</a> <span class='mut'>"+esc(j.result.name)+"</span><br><br>"+
   "<a class='btn' style='background:var(--ac)' href='/api/download_log?t="+T+"'>Download run statistics</a> <span class='mut'>timings and your machine's speed - no file or folder names, safe to share</span>";
  else if(j.state=="error")$("res").innerHTML="<span class='er'>"+esc(j.error)+"</span>"}
@@ -109,7 +116,7 @@ renderSel();ls("");
 </script></body></html>"""
 
 
-def _run(path, folders=None, anon=False, tier=2, depth=1, arch=True, fresh=False):
+def _run(path, folders=None, anon=False, tier=2, depth=1, fresh=False, quick=False):
     def log(msg):
         with LOCK:
             STATE["log"].append(msg.rstrip())
@@ -119,9 +126,17 @@ def _run(path, folders=None, anon=False, tier=2, depth=1, arch=True, fresh=False
                                  "bytes": done_bytes, "total_bytes": total_bytes}
     try:
         label = os.environ.get("PROFILER_FOLDER_NAME") if IN_DOCKER and path == DATA_ROOT else None
+        if quick:
+            zip_path, nproj, nfiles, errors = fp.quick_scan(path, OUT_DIR, log=log, label=label, folders=folders, progress=progress, project_depth=depth)
+            with LOCK:
+                STATE.update(state="done", result={"path": zip_path, "name": os.path.basename(zip_path), "stats_path": "", "stats_name": "",
+                                                   "projects": nproj, "files": nfiles, "errors": errors, "quick": True,
+                                                   "top": fp.LAST_RUN.get("top", []), "total_bytes": fp.LAST_RUN.get("total_bytes", 0),
+                                                   "types": fp.LAST_RUN.get("distinct_extensions", 0), "seconds": fp.LAST_RUN.get("seconds", 0)})
+            return
         zip_path, nproj, nfiles, errors = fp.profile(path, OUT_DIR, log=log, label=label, folders=folders, progress=progress,
                                                       anonymize_assembly_names=anon, tier=tier, project_depth=depth,
-                                                      archive_mode="full" if arch else "off", resume=not fresh)
+                                                      resume=not fresh)
         sz = fp.LAST_RUN.get("stats_zip") or ""
         with LOCK:
             STATE.update(state="done", result={"path": zip_path, "name": os.path.basename(zip_path), "stats_path": sz,
@@ -234,7 +249,7 @@ class Handler(BaseHTTPRequestHandler):
             STATE.update(state="running", log=[], result=None, error=None,
                          progress={"phase": "scan", "files": 0, "total_files": 0, "bytes": 0, "total_bytes": 0})
         threading.Thread(target=_run, args=(path, folders or None, bool(body.get("anon")), 2, 1,
-                                                          body.get("arch", True) is not False, bool(body.get("fresh"))), daemon=True).start()
+                                                          bool(body.get("fresh")), body.get("kind") == "quick"), daemon=True).start()
         self._json({"ok": True})
 
 

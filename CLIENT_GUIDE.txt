@@ -34,12 +34,15 @@ The tool never computes fingerprints of your files and never reads a file in ful
 STEP files whose references are listed). Duplicate files are recognised by their size and modified date instead.
 All sub-folders are included, however deeply they are nested.
 
-LOOKING INSIDE ARCHIVES (.zip, .tar.gz, .7z, .rar)
-By default the tool also opens archives to see the CAD files inside, because those are part of your projects.
-.zip and .tar.gz archives are read in memory (nothing is extracted to your disk); .7z and .rar are only
-LISTED (names and sizes). A file inside an archive that is identical to a file already in the same project is
-not counted twice. Untick "Look inside archives" on the page (or use --archives off) to skip this. It can add
-time on folders with many large archives (there is a built-in limit of 20 GB read from archives per run).
+COMPRESSED FILES (.zip, .rar, .7z, .tar ...)
+The tool does NOT open compressed files. Each one is counted as a single file, like any other.
+
+TWO STEPS
+Step 1 - QUICK COUNT (very fast, a few seconds to minutes): counts how many files of each type there are and how big they are,
+per project folder and overall. No file is opened and no file names are recorded (only project folder names and file types).
+Step 2 - FULL PROFILE (the complete run, much longer): everything described in "WHAT IT RECORDS" above.
+In the browser page there is one button for each step. Run step 1 first if you want a fast overview, or send both zips.
+(Command line: add --quick for step 1; without it you get step 2.)
 
 WHAT YOU NEED
 - A Windows computer (Mac: see the Mac section at the bottom).

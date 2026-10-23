@@ -294,7 +294,7 @@ def step_structure_stream(f):
 
 
 def step_structure_bytes(data):
-    """Same as step_structure() for content already in memory (files inside archives)."""
+    """Same as step_structure() for content already in memory (a file already read into memory)."""
     import io
     if len(data) > MAX_STEP_BYTES:
         return None

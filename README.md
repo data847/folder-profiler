@@ -30,6 +30,16 @@ searched for CAD file names written as plain text (`kind = scan` in `Links.csv`)
 AutoCAD xrefs are not read (an xref links a drawing to a drawing, which does not change part / assembly counts).
 Because the default is level 2, the output contains client file and folder names: get the data owner's agreement first (`--level 0` records metrics only).
 
+## Two steps
+
+- **Step 1 - quick count** (`--quick`, or the *Step 1* button of the page): files per type and size, per project and overall - nothing is opened, no file
+  names are recorded, no archive or file content is looked at. Folders are listed by many threads at once (a flat queue of folders, so one huge project is
+  shared too); **there is no depth limit** (tested at 150 levels; `Run_info.csv` reports the deepest level reached) and folder links / junctions are not followed.
+  Writes `quick_<name>_<date>.zip` (`Extensions.csv`, `Extensions_All.csv`, `Projects.csv`, `Run_info.csv`); its numbers equal the full profile's `Extensions.csv`
+  (tested). Measured: 60,000 files in 0.5 s against 3.3 s for step 2 on a warm SSD; on a cold hard disk the gap is far larger because step 1 never opens a file.
+- **Step 2 - full profile** (the default run): everything below.
+- `compile_profiles.py quick_*.zip` turns a step-1 zip into `quick_count.xlsx` (Overview by file class, By Extension, By Project).
+
 ## Resume, run statistics, scale
 
 - **Streaming + resumable.** Each project is processed in chunks of 5,000 files that are saved to `<out>/.resume/<run id>/` as they finish; stop the run
@@ -37,7 +47,7 @@ Because the default is level 2, the output contains client file and folder names
   output is identical to an uninterrupted run (tested). `--fresh` ignores saved progress.
   **Saved progress is checked against the disk.** Every saved chunk stores a fingerprint (relative path, size, modified time of its files); on a restart
   a chunk whose files changed is profiled again (a replaced file with the same file count is caught), finished projects get a stat-only check
-  (no file is opened), changed archives are re-read, and each of these is said in the log and counted in `Run_info.csv`.
+  (no file is opened), and each of these is said in the log and counted in `Run_info.csv`.
   Folder ids are 16 hex characters (64 bits; the earlier 10 collided with ~37% probability at 1M folders).
 - **No depth limit.** Folders are walked iteratively with no depth cap (tested 150 levels; Windows long paths via `\\?\`); `--project-depth` accepts any N;
   directory links / junctions are not followed (and counted).
@@ -52,7 +62,7 @@ Because the default is level 2, the output contains client file and folder names
 the object map and class table, DWG R2004-R2018 by decompressing the page-based sections and scanning the objects. Each file gets
 `sheets` and `sheets_conf` (0-100, **computed on that file**: the object map must parse, the handle read back from every sampled object
 must equal the one the map gave it, the layout count must be plausible; DXF 99, DWG at most 95). **Not supported:** AutoCAD 2007 (AC1021) files and
-binary DXF (reported as not counted, confidence 0); R13/R14 have no layouts. Archived drawings are counted too.
+binary DXF (reported as not counted, confidence 0); R13/R14 have no layouts.
 Validated against the DXF twin of 21 public drawings (21 of 21 identical) and run on 99 public DWG files of R2000-R2018. Not yet compared
 with AutoCAD's own count on a client's drawings. The compiler adds a **Drawing Breakdown** tab (one row per drawing file: format, software, sheets, confidence, the assembly it belongs to and how that was decided - by reference, by name, by folder, or several candidates) and `sheets`, `sheets_confidence` to File Level and `drawing_sheets`,
 `sheet_files_counted`, `sheet_files_not_counted`, `sheets_confidence_avg`, `sheets_confidence_min` to Project Stats; the 11-column Project
@@ -71,12 +81,9 @@ Compiled tab is unchanged.
 | Inventor, Revit, AutoCAD xrefs (references) | no real files seen; Inventor shares the OLE reader and is untested; Revit and AutoCAD xrefs are not read |
 | Windows system probes (metrics) | no - macOS and Linux only |
 
-## Archives, duplicates and references across folders
+## Duplicates and references across folders
 
-- **Archives** (`--archives full|list|off`, default `full`): `.zip` and `.tar(.gz/.bz2/.xz)` are opened in memory (also zip-in-zip, 2 levels); their
-  CAD files become normal rows (`archive` column = zip/tar; names shown as `<archive>!/<inner path>` at level >= 1) and, at level 2, archived assemblies are searched for references. `.7z` and `.rar` are listed only (names, sizes), through `bsdtar`
-  (libarchive; Windows 10+ ships it as `tar.exe`; included in the Docker image). Nothing is extracted to disk; `--archive-budget-gb` (default 20) caps
-  the decompression per run. An archived file identical to one already in the same project is not counted again.
+- **Compressed files are not opened** (removed in 1.7): a `.zip` / `.rar` / `.7z` / `.tar` is one ordinary file. Profiles from earlier profilers may carry archive rows (`archive` column); the compiler still reads those, and does not count an archived file twice when an identical loose one exists.
 - **No hashing at all** (1.6): file contents are never fingerprinted. The compiler recognises duplicates by **type + size + modified date** (and, for
   archived files, name + size); older profiles that still carry a `sha256` column keep exact matching. Measured on a real 162,409-file CAD drive: 97.4%
   of the files it calls duplicates really are, and it finds 94.4% of the true duplicates; copies whose dates were reset are missed.

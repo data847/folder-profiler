@@ -1,10 +1,9 @@
 # Folder Profiler - hardened image. Standard library only; nothing is pip-installed.
 FROM python:3.12-alpine
 
-# bsdtar (libarchive) lets the profiler LIST 7z and rar archives; zip and tar need nothing extra
-RUN apk add --no-cache libarchive-tools && adduser -D -u 10001 profiler
+RUN adduser -D -u 10001 profiler
 WORKDIR /app
-COPY file_profiler.py cad_links.py archives.py dwg_sheets.py sysmetrics.py ui.py ./
+COPY file_profiler.py cad_links.py dwg_sheets.py sysmetrics.py ui.py ./
 COPY tests ./tests
 
 ENV PROFILER_IN_DOCKER=1 \

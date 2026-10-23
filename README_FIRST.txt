@@ -8,6 +8,9 @@ FOLDER PROFILER (Windows)  -  full guide: HOW_TO_RUN.pdf
      run.bat          otherwise (Python is included)
 3. When it says Done, send us the ONE zip in the "output" folder.
 
+TWO STEPS: run-ui.bat opens a page with two buttons. "Step 1: quick count" only counts files per type and size (very fast, nothing is
+opened). "Step 2: full profile" is the complete run. On the command line, add --quick for step 1.
+
 It records, for every file at any folder depth: type, size, date, short format tag, file name and folder path, and (for assembly,
 drawing and STEP files) the NAMES of the files they reference. No file is ever copied, hashed or read in full except to list those
 references, and no file contents are stored. The zip therefore contains file and folder names: share it only if that is acceptable.
@@ -17,8 +20,7 @@ If something fails, send us output\error_log.txt (your name and paths are remove
 
 (Experts only: --level 0|1|2 records less; --project-depth N sets which folder level is a project.)
 
-ARCHIVES: .zip/.tar.gz files are opened to see the CAD files inside (nothing is extracted to disk; 7z/rar are listed only).
-Untick "Look inside archives" on the page or use --archives off to skip them.
+COMPRESSED FILES (zip, rar, 7z ...) are counted as one file each; nothing is opened inside them.
 
 IF IT STOPS (crash, power cut, Ctrl+C): just start it again with the same settings - it continues from the last saved point (progress is kept in
 output\.resume and deleted when the run finishes). Tick "Start from scratch" / use --fresh to ignore it. Changed files are noticed and redone.

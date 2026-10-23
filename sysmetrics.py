@@ -4,7 +4,7 @@
     system_info(...)  -> list of (key, value): OS, CPU, RAM, storage type/free space of the drive being read, antivirus state
     Monitor           -> background thread that samples CPU, memory and read throughput every few seconds into Run_metrics.csv
     RunLog            -> timestamped event log (Run_log.csv) that survives a crash (append + flush) and a restart (append)
-    Activity          -> thread-safe "busy seconds" per activity (tag reading, link reading, archive reading, writing ...)
+    Activity          -> thread-safe "busy seconds" per activity (tag reading, link reading, sheet counting, writing ...)
 
 Windows probes use ctypes (kernel32 / psapi / winreg) and PowerShell for disk type and Defender; Linux reads /proc; macOS uses
 sysctl / ps / vm_stat. Probes that a platform cannot answer are left blank.

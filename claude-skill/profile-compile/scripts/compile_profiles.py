@@ -15,6 +15,8 @@ Output: Project_Compiled.csv, File_Level.csv, Project_Stats.csv, Review.csv, and
                                 which the profiler deliberately does not collect) - or, with
                                 --estimate-assemblies, ESTIMATED rows (see below)
           "File Level", "Project Stats", "Review"   supporting detail
+Step 1 zips (quick_*.zip from the profiler's quick count) are recognised and compiled into quick_count.xlsx (Overview by class, By Extension, By
+Project) - no other options apply to them.
 Local only: no network, no credentials. Reads zips, writes files.
 Scale: the profile is streamed one project at a time (memory = the biggest project, not the whole profile); File_Level, Assembly_Breakdown and
 Assembly_Evidence are split into parts of 1,000,000 rows (Excel's sheet limit is 1,048,576) and compiled.xlsx holds the first --xlsx-max-sheets of them.
@@ -313,7 +315,7 @@ class CsvSink:
             if self.f:
                 self.f.close()
             self._open()
-        self.w.writerow(row)
+        self.w.writerow([_csv_safe(v) for v in row])
         self.n += 1
         self.total += 1
 
@@ -343,6 +345,12 @@ class Sinks:
     def close(self):
         for s in (self.files, self.assemblies, self.evidence, self.drawings):
             s.close()
+
+
+def _csv_safe(v):
+    """A text cell that starts with = + @ (tab, CR) would be run as a formula when the CSV is opened in Excel; a file called 'x.=1+1' has
+    the extension '=1+1'. Such cells get a leading apostrophe. Numbers and everything else are untouched."""
+    return "'" + v if isinstance(v, str) and v[:1] in ("=", "+", "@", "\t", "\r") else v
 
 
 def file_row(r):
@@ -784,7 +792,7 @@ def write_small_csvs(out, compiled, stats, review, confidence, unmapped):
         with open(out / name, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.writer(f)
             w.writerow(header)
-            w.writerows(rows)
+            w.writerows([_csv_safe(v) for v in r] for r in rows)
     dump("Project_Compiled.csv", HEADINGS, compiled)
     dump("Project_Stats.csv", STATS_HEADER, stats)
     dump("Review.csv", ["project", "topic", "detail"], review)
@@ -822,7 +830,16 @@ def _sheet(wb, title, header, rows, color="FF181F34", numeric=()):
         head.append(c)
     ws.append(head)
     for r in itertools.chain(first, it):
-        ws.append([_num(v) if j in numeric and v != "" else v for j, v in enumerate(r)])
+        cells = []
+        for j, v in enumerate(r):
+            if j in numeric and v != "":
+                v = _num(v)
+            if isinstance(v, str) and v[:1] == "=":                  # text that merely looks like a formula stays text
+                c = WriteOnlyCell(ws, value=v)
+                c.data_type = "s"
+                v = c
+            cells.append(v)
+        ws.append(cells)
 
 
 def _sheets(wb, title, header, sink, max_sheets, numeric=()):
@@ -852,6 +869,88 @@ def write_workbook(path, compiled, stats, review, confidence, unmapped, sinks, m
                            f"CSV files ({tab.replace(' ', '_')}_*.csv); raise --xlsx-max-sheets to put them in the workbook too"])
     _sheet(wb, "Review", ["project", "topic", "detail"], review)
     wb.save(path)
+
+
+# ---------------------------------------------------------------------------------------------------- step 1 (quick count) zips
+def _zip_list(paths):
+    out = []
+    for p in paths:
+        p = Path(p)
+        out += sorted(z for z in p.glob("*.zip") if not z.name.startswith("run_stats_")) if p.is_dir() else [p]
+    return out
+
+
+def is_quick_zip(path):
+    try:
+        with zipfile.ZipFile(path) as zf:
+            names = set(zf.namelist())
+        return "Extensions_All.csv" in names and "Files.csv" not in names
+    except (zipfile.BadZipFile, OSError):
+        return False
+
+
+QUICK_BY_EXT = ["extension", "class", "native_software", "domain", "files", "size_GB", "share_of_files_pct", "share_of_size_pct"]
+QUICK_BY_PROJECT = ["project", "files", "size_GB", "parts", "assemblies", "native_2d_drawings", "neutral_3d", "pdf", "other_files", "top_extensions"]
+QUICK_OVERVIEW = ["class", "meaning", "files", "size_GB", "share_of_files_pct"]
+CLASS_MEANING = {"PART": "native part / single-file model", "ASSEMBLY": "native assembly", "DRAWING": "native 2D drawing", "NEUTRAL3D": "neutral 3D exchange file (STEP, IGES, STL ...)",
+                 "PDF": "PDF", "SIM": "simulation", "DOC": "document", "DATA": "data / backup / log", "IMG": "image", "ARCHIVE": "archive", "OTHER": "other",
+                 "UNMAPPED": "extension not in extensions.csv"}
+
+
+def compile_quick(paths, ext_map, soft, out):
+    """Step 1 output (quick_*.zip of the profiler) -> a simple workbook: how many files of each type and class, per project and overall."""
+    rd = lambda zf, n: list(csv.DictReader(io.StringIO(zf.read(n).decode("utf-8-sig"))))
+    runs = []
+    for z in paths:
+        with zipfile.ZipFile(z) as zf:
+            info = {r["key"]: r["value"] for r in rd(zf, "Run_info.csv")}
+            runs.append((info.get("folder_name", Path(z).stem), rd(zf, "Extensions.csv")))
+    owners = collections.defaultdict(set)                           # project name -> the runs that have it (a clash gets the run's name as prefix)
+    for folder, rows in runs:
+        for r in rows:
+            owners[r["project"]].add(folder)
+    by_ext, by_proj = collections.defaultdict(lambda: [0, 0]), {}
+    for folder, rows in runs:
+        for r in rows:
+            proj = r["project"] if len(owners[r["project"]]) == 1 else f"{folder}/{r['project']}"
+            n, b, ext = int(r["file_count"]), int(r["total_bytes"]), r["ext"]
+            by_ext[ext][0] += n
+            by_ext[ext][1] += b
+            P = by_proj.setdefault(proj, {"files": 0, "bytes": 0, "cls": collections.Counter(), "ext": collections.Counter()})
+            m = ext_map.get(ext)
+            cls = m["class"] if m else "UNMAPPED"
+            P["files"] += n; P["bytes"] += b; P["cls"][cls] += n; P["ext"][ext] += n
+    total_n = sum(v[0] for v in by_ext.values()) or 1
+    total_b = sum(v[1] for v in by_ext.values()) or 1
+    ext_rows, cls_tot = [], collections.defaultdict(lambda: [0, 0])
+    for ext, (n, b) in sorted(by_ext.items(), key=lambda kv: -kv[1][0]):
+        m = ext_map.get(ext)
+        cls = m["class"] if m else "UNMAPPED"
+        sw = m["software"] if m else ""
+        ext_rows.append([ext, cls, soft[sw]["display"] if sw in soft else sw, (m["domain"] if m else "") or (soft[sw]["domain"] if sw in soft else ""),
+                         n, round(b / 1e9, 3), round(100 * n / total_n, 2), round(100 * b / total_b, 2)])
+        cls_tot[cls][0] += n
+        cls_tot[cls][1] += b
+    cls_rows = [[c, CLASS_MEANING.get(c, ""), n, round(b / 1e9, 3), round(100 * n / total_n, 2)] for c, (n, b) in sorted(cls_tot.items(), key=lambda kv: -kv[1][0])]
+    proj_rows = []
+    for proj, P in sorted(by_proj.items(), key=lambda kv: kv[0].lower()):
+        c = P["cls"]
+        proj_rows.append([proj, P["files"], round(P["bytes"] / 1e9, 3), c["PART"], c["ASSEMBLY"], c["DRAWING"], c["NEUTRAL3D"], c["PDF"],
+                          P["files"] - c["PART"] - c["ASSEMBLY"] - c["DRAWING"] - c["NEUTRAL3D"] - c["PDF"],
+                          ", ".join(f".{e} {k}" for e, k in P["ext"].most_common(5))])
+    def dump(name, header, rows):
+        with open(out / name, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f); w.writerow(header); w.writerows([_csv_safe(v) for v in r] for r in rows)
+    dump("Quick_Overview.csv", QUICK_OVERVIEW, cls_rows)
+    dump("Quick_By_Extension.csv", QUICK_BY_EXT, ext_rows)
+    dump("Quick_By_Project.csv", QUICK_BY_PROJECT, proj_rows)
+    if Workbook:
+        wb = Workbook(write_only=True)
+        _sheet(wb, "Overview", QUICK_OVERVIEW, cls_rows)
+        _sheet(wb, "By Extension", QUICK_BY_EXT, ext_rows)
+        _sheet(wb, "By Project", QUICK_BY_PROJECT, proj_rows)
+        wb.save(out / "quick_count.xlsx")
+    return len(proj_rows), total_n, cls_rows
 
 
 def main():
@@ -884,8 +983,20 @@ def main():
     a = ap.parse_args()
 
     ext_map, soft = load_mapping(a.map_dir)
-    runs = load_profiles(a.inputs)
     out = Path(a.out) if a.out else Path.cwd() / "compile-profiles" / datetime.now().strftime("%Y%m%d-%H%M%S")
+    zips = _zip_list(a.inputs)
+    quick_zips = [z for z in zips if is_quick_zip(z)]
+    if quick_zips:                                                   # step 1 output: the simple extension-count workbook
+        out.mkdir(parents=True, exist_ok=True)
+        nproj, nfiles, cls_rows = compile_quick(quick_zips, ext_map, soft, out)
+        print(f"{len(quick_zips)} quick-count zip(s) -> {nproj} project(s), {nfiles:,} files")
+        for r in cls_rows[:8]:
+            print(f"   {r[0]:10} {r[2]:>10,} files  {r[3]:>8} GB  {r[4]}%")
+        print(f"Wrote files in {out}")
+        if len(quick_zips) == len(zips):
+            return
+        a.inputs = [str(z) for z in zips if z not in quick_zips]
+    runs = load_profiles(a.inputs)
     out.mkdir(parents=True, exist_ok=True)
     sinks = Sinks(CsvSink(out, "File_Level", FILE_HEADER, a.csv_part_rows),
                   CsvSink(out, "Assembly_Breakdown_ESTIMATE", ASSEMBLY_HEADINGS, a.csv_part_rows),

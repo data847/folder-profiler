@@ -16,7 +16,7 @@ for %%I in ("%SRC%") do set "NAME=%%~nxI"
 if "%NAME%"=="" set "NAME=folder"
 docker image inspect %IMAGE% >nul 2>nul || docker build -q -t %IMAGE% . || (echo Could not build the image. It needs internet once, to download Python. & pause & exit /b 1)
 if not exist output mkdir output
-docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges -v "%SRC%:/data:ro" -v "%~dp0output:/out" -e PROFILER_FOLDER_NAME="%NAME%" -e PROFILER_TIER -e PROFILER_PROJECT_DEPTH -e PROFILER_ANON_ASM -e PROFILER_ARCHIVES -e PROFILER_ARCHIVE_GB -e PROFILER_METRICS_INTERVAL %IMAGE% %2 %3 %4 %5 %6 %7
+docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges -v "%SRC%:/data:ro" -v "%~dp0output:/out" -e PROFILER_FOLDER_NAME="%NAME%" -e PROFILER_TIER -e PROFILER_PROJECT_DEPTH -e PROFILER_ANON_ASM -e PROFILER_METRICS_INTERVAL %IMAGE% %2 %3 %4 %5 %6 %7
 echo.
 if exist output start "" explorer output
 pause

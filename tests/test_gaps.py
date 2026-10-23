@@ -1,4 +1,4 @@
-"""The three gaps: (1) references into another folder, (2) archived files in the compiler, (3) copies of whole projects.
+"""The three gaps: (1) references into another folder, (2) archive rows of older profiles in the compiler, (3) copies of whole projects.
 Run: python tests/test_gaps.py"""
 import csv, io, os, struct, subprocess, sys, tempfile, zipfile, zlib
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -43,24 +43,27 @@ with tempfile.TemporaryDirectory() as t:
     check("only the truly missing file is listed as unresolved", e["unresolved_examples"], "nowhere.sldprt")
     check("the external part is counted in ITS project, not double counted in Proj", (e["parts"], e["parts_link"]), (1, 1))
 
-# ---------------------------------------------------------------- (2) archives in the compiler
+# ---------------------------------------------------------------- (2) profiles from the EARLIER profilers that looked inside archives
+# The profiler no longer opens archives, but the compiler still understands profiles that carry archive rows (hand-built here).
 with tempfile.TemporaryDirectory() as t:
-    src = os.path.join(t, "parent")
-    put(src, "P/Main.sldasm", sw_file(["a.sldprt", "b.sldprt"])); put(src, "P/a.sldprt", "part a" * 9)
-    with zipfile.ZipFile(os.path.join(src, "P/bk.zip"), "w") as zf:
-        zf.writestr("old/a.sldprt", "part a" * 9)                    # identical to the loose a.sldprt -> must not count twice
-        zf.writestr("old/b.sldprt", "part b is only inside the zip")  # exists nowhere else -> counts
-        zf.writestr("old/Sub.sldasm", sw_file(["b.sldprt"]))          # archived assembly with a reference to an archived part
-    z = profile(src, t, "o", tier=2)
-    c, f, s, rev, asm, ev = comp(z, False, "auto", True)
+    zp = os.path.join(t, "old_profile.zip")
+    hdr = "project,file_no,ext,size_bytes,modified_utc,depth,header_signature,dir_id,asm_name,rel_path,archive\r\n"
+    rows = ["P,1,sldasm,50,2024-01-01T00:00:00Z,1,OLE2,d1,Main.sldasm,Main.sldasm,",
+            "P,2,sldprt,54,2024-01-01T00:00:00Z,1,BINARY,d1,,a.sldprt,",
+            "P,3,sldprt,54,,2,ARCHIVED,d2,,bk.zip!/old/a.sldprt,zip",          # identical to the loose a.sldprt -> must not count twice
+            "P,4,sldprt,29,,2,ARCHIVED,d2,,bk.zip!/old/b.sldprt,zip",          # exists nowhere else -> counts
+            "P,5,sldasm,40,,2,ARCHIVED,d2,Sub.sldasm,bk.zip!/old/Sub.sldasm,zip"]
+    with zipfile.ZipFile(zp, "w") as zf:
+        zf.writestr("Files.csv", "\ufeff" + hdr + "\r\n".join(rows) + "\r\n")
+        zf.writestr("Run_info.csv", "key,value\r\nfolder_name,old\r\n")
+        zf.writestr("Projects.csv", "project,file_count,total_bytes,distinct_extensions,first_modified_utc,last_modified_utc\r\nP,5,227,2,,\r\n")
+    c, f, s, rev, asm, ev = comp(zp, False, "auto", True)
     pc = {r[0]: r for r in c}["P"]
     check("parts: loose a + archived b counted; archived duplicate of a NOT counted again", pc[4], 2)
     check("assemblies: loose Main + archived Sub", pc[5], 2)
     check("File_Level marks archive rows and the duplicate that was not counted",
           (sum(1 for r in f if r["archive"]), [r["name"] for r in f if r["adup"]]), (3, ["a.sldprt"]))
     check("Review explains the archive handling", any("found inside archives" in r[2] and "1 identical" in r[2] for r in rev), True)
-    evp = ev["projects"][0]
-    check("level 2 links work through the archive (Main -> a, b ; Sub -> b)", (evp["refs_total"], evp["refs_resolved"], evp["parts_link"]), (3, 3, 2))
 
 # ---------------------------------------------------------------- (3) whole-project copies and cross-project duplicates
 with tempfile.TemporaryDirectory() as t:

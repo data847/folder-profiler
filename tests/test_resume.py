@@ -1,4 +1,4 @@
-"""Resume: a run that is interrupted (crash, Ctrl+C, mid-chunk failure, mid-archive) continues from the saved point, never re-reads a
+"""Resume: a run that is interrupted (crash, Ctrl+C, mid-chunk failure) continues from the saved point, never re-reads a
 finished file, and ends with exactly the output an uninterrupted run gives.   Run: python tests/test_resume.py"""
 import csv, io, os, sys, tempfile, zipfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -14,7 +14,7 @@ def build(src):
         for i in range(14):
             d = os.path.join(src, f"P{p}", f"sub{i % 3}"); os.makedirs(d, exist_ok=True)
             open(os.path.join(d, f"f{i:02d}.sldprt"), "wb").write(b"x" * (i + 1 + p))
-    for k in range(3):                                              # three zips in P1 -> archives are resumable units too
+    for k in range(3):                                              # three zips in P1: counted as ordinary files, never opened
         with zipfile.ZipFile(os.path.join(src, "P1", f"bk{k}.zip"), "w") as z:
             z.writestr(f"old/a{k}.sldprt", b"a" * (k + 2)); z.writestr(f"old/b{k}.par", b"b" * (k + 3))
 
@@ -76,18 +76,6 @@ with tempfile.TemporaryDirectory() as t:
     fp.signature = counting_sig
     z = run(src, out)
     check("mid-chunk crash: resume redoes only the unsaved chunk and the result is still identical", (crashed, rows_of(z) == base), (True, True))
-    # ---- 3. crash between archives of one project
-    out = os.path.join(t, "o3")
-    def boom_after_archive(ui, ch):
-        if ch == "a0": raise Boom("simulated crash after the first archive")
-    fp._TEST_HOOK = boom_after_archive
-    try:
-        run(src, out); crashed = False
-    except Boom:
-        crashed = True
-    fp._TEST_HOOK = None
-    z = run(src, out); r = rows_of(z)
-    check("archive crash: resume continues at the next archive, no entry lost or doubled", (crashed, r == base, sum(1 for x in r if x["archive"])), (True, True, 6))
     # ---- 4. Ctrl+C is saved too
     out = os.path.join(t, "o4")
     def interrupt(ui, ch):
@@ -143,21 +131,6 @@ with tempfile.TemporaryDirectory() as t:
     check("replaced file: stale chunks are redone, said in the log and counted",
           ("profiled again" in log, int(info_of(z)["chunks_redone_after_change"]) > 0), (True, True))
     os.remove(newf); open(gone, "wb").write(keep)
-    # ---- 8. an archive is replaced while the run is down
-    out = os.path.join(t, "o9")
-    stop_at_archive = lambda ui, ch: (_ for _ in ()).throw(Boom()) if str(ch).startswith("a") else None
-    fp._TEST_HOOK = stop_at_archive
-    try: run(src, out)
-    except Boom: pass
-    fp._TEST_HOOK = None
-    zp = os.path.join(src, "P1", "bk0.zip")
-    old = open(zp, "rb").read()
-    with zipfile.ZipFile(zp, "w") as zz:
-        zz.writestr("old/swapped_in.sldprt", b"s" * 9)
-    z = run(src, out)
-    names = [r["rel_path"] for r in rows_of(z)]
-    check("replaced archive: its new content is listed", (any("swapped_in" in n for n in names), any(n.endswith("old/a0.sldprt") for n in names)), (True, False))
-    open(zp, "wb").write(old)
     # ---- 9. folder ids are long enough that two folders never share one
     ids = {r["dir_id"] for r in csv.DictReader(io.StringIO(zipfile.ZipFile(z).read("Files.csv").decode("utf-8-sig")))}
     check("folder ids are 16 hex characters", {len(i) for i in ids}, {16})
