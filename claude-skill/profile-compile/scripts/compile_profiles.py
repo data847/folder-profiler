@@ -354,13 +354,16 @@ class Sinks:
 
 
 SHEET_BASIS_COUNTED, SHEET_BASIS_MODEL, SHEET_BASIS_ASSUMED = "counted", "model tab only - counted as 1", "not read - assumed 1"
+SHEET_BASIS_NODATA = "profile has no sheet data - assumed 1"
 
 
 def sheets_used(r):
     """-> (sheets to report, basis). A drawing file is at least ONE sheet: an AutoCAD file with only the Model tab (0 layouts) and one that
     could not be read (R2007, damaged ...) both count as 1, and the basis column says so; the confidence stays the file's own (0 when unread)."""
-    if r["ext"] not in ("dwg", "dxf") or r["sheets_conf"] is None:               # not attempted: other formats, or a profile below level 2
+    if r["ext"] not in ("dwg", "dxf"):                                           # other drawing formats: sheets are not counted
         return ("" if r["sheets"] is None else r["sheets"]), (SHEET_BASIS_COUNTED if r["sheets"] is not None else "")
+    if r["sheets_conf"] is None:                                                 # a profile made without sheet counting (older profiler / level < 2)
+        return 1, SHEET_BASIS_NODATA
     if r["sheets"] is None:
         return 1, SHEET_BASIS_ASSUMED
     if r["sheets"] == 0:
@@ -642,13 +645,14 @@ class Engine:
                                n["NEUTRAL3D"], t2d, t3d]
         sh_rows = [r for r in counted if r["cls"] == "DRAWING" and r["ext"] in ("dwg", "dxf")]
         sh_ok = [r for r in sh_rows if r["sheets"] is not None]
-        sh_no = [r for r in sh_rows if r["sheets"] is None]
-        if sh_rows and any(r["sheets_conf"] is not None for r in sh_rows):
+        sh_no = [r for r in sh_rows if r["sheets"] is None and r["sheets_conf"] is not None]       # attempted but not readable
+        if sh_rows:
             used = [sheets_used(r) for r in sh_rows]
             n_real = sum(1 for _v, b in used if b == SHEET_BASIS_COUNTED)
             n_model = sum(1 for _v, b in used if b == SHEET_BASIS_MODEL)
+            n_nodata = sum(1 for _v, b in used if b == SHEET_BASIS_NODATA)
             sh_real = [r for r, (_v, b) in zip(sh_rows, used) if b == SHEET_BASIS_COUNTED]
-            sheet_stats = [sum(v for v, _b in used if v != ""), n_real, n_model, len(sh_no),
+            sheet_stats = [sum(v for v, _b in used if v != ""), n_real, n_model, len(sh_no) + n_nodata,
                            round(sum(r["sheets_conf"] for r in sh_real) / len(sh_real)) if sh_real else "", min((r["sheets_conf"] for r in sh_real), default="")]
             STATUS_TEXT = {"unsupported-r2007": "AutoCAD 2007 format (not supported)", "no-layouts-in-version": "older than AutoCAD 2000 / no layouts in this file",
                            "dxf-binary": "binary DXF (not supported)", "too-large": "file larger than the size limit", "unreadable": "file could not be read",
@@ -660,13 +664,11 @@ class Engine:
                                        "no layouts in this DXF" if r["ext"] == "dxf" else "could not be read") for r in sh_no)
             rev.append([proj, "drawing sheets",
                         f"{sheet_stats[0]} sheets in {len(sh_rows)} AutoCAD drawing files (every drawing file is at least 1 sheet): {n_real} counted from their layouts, "
-                        f"{n_model} with only the Model tab (counted as 1 each), {len(sh_no)} not read (assumed 1 each"
-                        + (f": {', '.join(f'{k} x{v}' for k, v in why.most_common())}" if sh_no else "") + f"); confidence of the counted ones: average {sheet_stats[4]}, lowest {sheet_stats[5]} "
+                        f"{n_model} with only the Model tab (counted as 1 each), {len(sh_no) + n_nodata} not read (assumed 1 each"
+                        + (f": {', '.join(f'{k} x{v}' for k, v in (why + collections.Counter({'the profile has no sheet data (made by an older profiler or below level 2)': n_nodata} if n_nodata else {})).most_common())}" if (sh_no or n_nodata) else "") + f"); confidence of the counted ones: average {sheet_stats[4]}, lowest {sheet_stats[5]} "
                         "(0-100, computed on each file from checks on its own structure)"])
         else:
             sheet_stats = ["", "", "", "", "", ""]
-            if sh_rows:
-                rev.append([proj, "drawing sheets", f"{len(sh_rows)} AutoCAD drawing files, sheets not counted: needs a level 2 profile"])
         self.stats[proj] = [proj, len(rows), len({r["keys"][0] for r in rows if r["keys"][0]}) + sum(1 for r in rows if not r["keys"][0]),
                             sum(r["dup"] for r in rows), n["PART"], n["ASSEMBLY"], n["DRAWING"], n["NEUTRAL3D"], n["PDF"], n["SIM"],
                             n["DOC"], n["DATA"], n["IMG"], n["ARCHIVE"] + n["OTHER"], n["UNMAPPED"], sum(r["size"] for r in rows),

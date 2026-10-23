@@ -91,6 +91,23 @@ with tempfile.TemporaryDirectory() as t:
     check("File_Level has sheets_used and sheets_basis", [cp.file_row(fl[n])[-2:] for n in ("b.dwg", "c.dwg")], [[1, "model tab only - counted as 1"], [1, "not read - assumed 1"]])
     check("Review explains it", any(r[1] == "drawing sheets" and "at least 1 sheet" in r[2] and "assumed 1 each" in r[2] for r in rev), True)
 
+# ---------------------------------------------------------------- (2c) a profile made WITHOUT sheet counting: drawings are still at least 1 sheet, marked as assumed
+with tempfile.TemporaryDirectory() as t:
+    zp = os.path.join(t, "nosheets.zip")
+    hdr = "project,file_no,ext,size_bytes,modified_utc,depth,header_signature,dir_id,asm_name,rel_path\r\n"
+    rows = ["N,1,dwg,100,2024-01-01T00:00:00Z,1,DWG:AC1032,d1,,a.dwg", "N,2,dxf,101,2024-01-01T00:00:00Z,1,DXF:AC1027:3D,d1,,b.dxf",
+            "N,3,slddrw,102,2024-01-01T00:00:00Z,1,BINARY,d1,,c.slddrw"]
+    with zipfile.ZipFile(zp, "w") as zf:
+        zf.writestr("Files.csv", "\ufeff" + hdr + "\r\n".join(rows) + "\r\n")
+        zf.writestr("Run_info.csv", "key,value\r\nfolder_name,x\r\n")
+        zf.writestr("Projects.csv", "project,file_count,total_bytes,distinct_extensions,first_modified_utc,last_modified_utc\r\nN,3,303,3,,\r\n")
+    c, f, s, rev, asm, ev = comp(zp, False, "auto", True)
+    d = {r[1]: r for r in ev["drawings"]}
+    check("no sheet data: DWG/DXF count 1 each, marked assumed; other formats stay blank", [(d[n][4], d[n][6]) for n in ("a.dwg", "b.dxf", "c.slddrw")],
+          [(1, "profile has no sheet data - assumed 1"), (1, "profile has no sheet data - assumed 1"), ("", "")])
+    st = {r[0]: r for r in s}["N"]; H = cp.STATS_HEADER
+    check("Project_Stats: 2 sheets, 0 counted, 2 assumed", [st[H.index(k)] for k in ("drawing_sheets", "sheet_files_counted", "sheet_files_assumed")], [2, 0, 2])
+
 # ---------------------------------------------------------------- (3) whole-project copies and cross-project duplicates
 with tempfile.TemporaryDirectory() as t:
     src = os.path.join(t, "parent")
