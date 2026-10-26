@@ -40,10 +40,10 @@ without any evidence as Unclassified, and no longer called AutoCAD-heavy project
 ## Two steps
 
 - **Step 1 - quick count** (`--quick`, or the *Step 1* button of the page): files per type and size, per project and overall - nothing is opened, no file
-  names are recorded, no archive or file content is looked at. Folders are listed by many threads at once (a flat queue of folders, so one huge project is
-  shared too); **there is no depth limit** (tested at 150 levels; `Run_info.csv` reports the deepest level reached) and folder links / junctions are not followed.
+  names are recorded, no archive or file content is looked at. Folders are listed through a shared queue by a few threads on a local disk and by many (32) on a network drive or UNC path, where waiting on the network is the bottleneck
+  (a local disk is limited by Python itself: measured 4 threads beating 32); one huge project is shared between threads; **there is no depth limit** (tested at 150 levels; `Run_info.csv` reports the deepest level reached) and folder links / junctions are not followed.
   Writes `quick_<name>_<date>.zip` (`Extensions.csv`, `Extensions_All.csv`, `Projects.csv`, `Run_info.csv`); its numbers equal the full profile's `Extensions.csv`
-  (tested). Measured: 60,000 files in 0.5 s against 3.3 s for step 2 on a warm SSD; on a cold hard disk the gap is far larger because step 1 never opens a file.
+  (tested). Measured on a warm SSD (macOS): about 165,000 files per second (300,000 files in 1.8 s); 60,000 files in 0.5 s against 3.3 s for step 2; on a cold hard disk the gap is far larger because step 1 never opens a file.
 - **Step 2 - full profile** (the default run): everything below.
 - `compile_profiles.py quick_*.zip` turns a step-1 zip into `quick_count.xlsx` (Overview by file class, By Extension, By Project).
 

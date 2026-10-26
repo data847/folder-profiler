@@ -373,6 +373,39 @@ def resolve_units(root, folders, label, project_depth):
     return units, label, data_paths
 
 
+def quick_ext(name):
+    """ext_of() with a shortcut for the ordinary case (a name that does not start with a dot and ends in .something, not a number).
+    Anything unusual goes to ext_of() itself, so the answer is always the same - the tests compare both on thousands of odd names."""
+    i = name.rfind(".")
+    if 0 < i < len(name) - 1 and name[0] != ".":
+        ext = name[i + 1:].lower()
+        if not ext.isdigit():
+            return ext
+    return ext_of(name)
+
+
+def quick_threads(paths):
+    """Threads for the quick count. Listing a folder is mostly waiting on the disk or the network and a little Python, so: a network
+    location (Windows: a mapped drive or a UNC path) gets many threads to hide the latency, a local disk only a few (more just fight
+    over Python's lock - measured: 4 threads beat 32 on a local SSD)."""
+    remote = False
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            for p in paths:
+                p = os.path.abspath(p)
+                if p.startswith("\\\\"):
+                    remote = True
+                    break
+                root = os.path.splitdrive(p)[0] + "\\"
+                if ctypes.windll.kernel32.GetDriveTypeW(root) == 4:        # DRIVE_REMOTE
+                    remote = True
+                    break
+        except Exception:
+            remote = False
+    return 32 if remote else 4
+
+
 def quick_scan(root, out_dir, log=print, label=None, folders=None, workers=None, progress=None, project_depth=None):
     """STEP 1 - the quick count: how many files of each type, and how big, per project and overall. Metadata only: no file is opened,
     no archive is looked into, nothing is read - just the folder listings the operating system already holds. Folders are listed by
@@ -384,15 +417,20 @@ def quick_scan(root, out_dir, log=print, label=None, folders=None, workers=None,
     t0 = time.time()
     project_depth = max(1, int(os.environ.get("PROFILER_PROJECT_DEPTH", 1)) if project_depth is None else int(project_depth))
     units, label, data_paths = resolve_units(root, folders, label, project_depth)
-    nthreads = max(4, min(32, int(workers) if workers else default_workers() * 2))
+    nthreads = int(workers) if workers else quick_threads(data_paths)
     q, lock, finished = queue.Queue(), threading.Lock(), threading.Event()
     pending = [len(units)]
     tallies = [collections.defaultdict(lambda: [0, 0]) for _ in range(nthreads)]       # (unit index, ext) -> [files, bytes]
     ctr = [collections.Counter() for _ in range(nthreads)]
     for ui, (_n, base, recurse) in enumerate(units):
         q.put((ui, lp(base), 0, recurse))
+    S_IFMT, S_IFREG, S_IFDIR, S_IFLNK = 0o170000, 0o100000, 0o040000, 0o120000
+    JUNCTION = 0xA0000003                                    # Windows reparse tag of a junction (mount point)
 
     def work(k):
+        """One directory at a time. Per entry: ONE stat call (on Windows it comes with the directory listing, no extra disk access) gives
+        file / folder / link and the size; the extension comes from quick_ext(); counts are kept in local variables and added
+        to the shared counters once per folder."""
         tally, c = tallies[k], ctr[k]
         while True:
             item = q.get()
@@ -400,41 +438,49 @@ def quick_scan(root, out_dir, log=print, label=None, folders=None, workers=None,
                 return
             ui, path, depth, recurse = item
             subdirs = []
+            nfiles = nbytes = njunk = nerr = nlinks = 0
             try:
                 with os.scandir(path) as it:
                     for e in it:
                         try:
-                            if e.is_symlink() or (hasattr(e, "is_junction") and e.is_junction()):
-                                if e.is_dir():
-                                    c["links_skipped"] += 1
-                                    continue
-                            elif e.is_dir(follow_symlinks=False):
-                                if recurse:
+                            st = e.stat(follow_symlinks=False)
+                            kind = st.st_mode & S_IFMT
+                            if kind == S_IFREG:
+                                size = st.st_size
+                            elif kind == S_IFDIR:
+                                if getattr(st, "st_reparse_tag", 0) == JUNCTION:
+                                    nlinks += 1                          # a junction is never followed
+                                elif recurse:
                                     subdirs.append(e.path)
                                 continue
-                            elif not e.is_file(follow_symlinks=False):
-                                continue
+                            elif kind == S_IFLNK:
+                                if e.is_dir():                           # a link to a folder: not followed (it could loop)
+                                    nlinks += 1
+                                    continue
+                                size = e.stat().st_size                  # a link to a file counts as that file
+                            else:
+                                continue                                 # sockets, devices ...
                             name = e.name
-                            if name.lower() in SYSTEM_JUNK or name.startswith("._"):
-                                c["junk"] += 1
+                            if len(name) <= 11 and name.lower() in SYSTEM_JUNK or name.startswith("._"):
+                                njunk += 1
                                 continue
-                            try:
-                                size = e.stat().st_size
-                            except OSError:
-                                size = 0
-                                c["errors"] += 1
-                            t = tally[(ui, ext_of(name))]
+                            t = tally[(ui, quick_ext(name))]
                             t[0] += 1
                             t[1] += size
-                            c["files"] += 1
-                            c["bytes"] += size
+                            nfiles += 1
+                            nbytes += size
                         except OSError:
-                            c["errors"] += 1
+                            nerr += 1
                 c["dirs"] += 1
                 if depth > c["max_depth"]:
                     c["max_depth"] = depth
             except OSError:
                 c["dir_errors"] += 1
+            c["files"] += nfiles
+            c["bytes"] += nbytes
+            c["junk"] += njunk
+            c["errors"] += nerr
+            c["links_skipped"] += nlinks
             with lock:
                 pending[0] += len(subdirs) - 1
                 done = pending[0] == 0

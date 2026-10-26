@@ -113,4 +113,26 @@ with tempfile.TemporaryDirectory() as t:
         txt = open(out / "Quick_By_Extension.csv", encoding="utf-8-sig").read()
         check("in the CSV a formula-like extension gets a leading apostrophe", ("\n'=1+1," in txt and "\n'@sum," in txt and "\n-5," in txt), True)
         check("unknown extensions are listed as UNMAPPED with their counts (nothing dropped)", [(r[0].value, r[1].value) for r in ws.iter_rows(min_row=2) if r[0].value == "xxxx"[:0] or r[0].value == "my ext"], [("my ext", "UNMAPPED")])
+
+# ---- the fast extension rule equals the reference ext_of() on tricky names; the thread policy is sane
+import random
+rnd = random.Random(3)
+alphabet = "ab.1_-Z =@+x"
+names = ["noext", "a.", ".a", ".a.b", "..", "x.001", "part.prt.7", "part.PRT.12", "a.b.c", "trailing.dot.", ".gitignore", "Mixed.CaSe", "v1.2.3", "file.7z", "a..b", "..hidden", "x. ", "x. y"]
+names += ["".join(rnd.choice(alphabet) for _ in range(rnd.randint(1, 12))) for _ in range(3000)]
+fast_ext = fp.quick_ext
+diff = [n for n in names if fast_ext(n) != fp.ext_of(n)]
+check("the shortcut extension rule equals ext_of() on 3,000+ odd names", diff[:3], [])
+check("thread policy: local disks few threads, network locations many", (fp.quick_threads(["/tmp"]), fp.quick_threads(["\\\\server\\share"]) >= 4), (4, True))
+with tempfile.TemporaryDirectory() as t:
+    base = os.path.join(t, "d"); put(base, "P/real.sldprt", b"x" * 7); put(base, "P/sub/inner.dwg", b"y" * 5)
+    if hasattr(os, "symlink"):
+        try:
+            os.symlink(os.path.join(base, "P", "real.sldprt"), os.path.join(base, "P", "filelink.sldprt"))
+            os.symlink(os.path.join(base, "P", "sub"), os.path.join(base, "P", "dirlink"), target_is_directory=True)
+            qz, _p, nf, _e = fp.quick_scan(base, os.path.join(t, "q"), log=lambda *_: None)
+            allx = {r["ext"]: (int(r["file_count"]), int(r["total_bytes"])) for r in rd(qz, "Extensions_All.csv")}
+            check("a link to a file counts as that file; a link to a folder is skipped (not looped)", (allx.get("sldprt"), allx.get("dwg"), nf), ((2, 14), (1, 5), 3))
+        except OSError:
+            print("SKIP - symlinks not allowed here")
 sys.exit(1 if any(bad) else 0)
