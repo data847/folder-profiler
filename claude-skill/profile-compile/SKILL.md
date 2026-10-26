@@ -1,37 +1,51 @@
 ---
 name: profile-compile
 description: >-
-  Reads the zip files produced by the Folder Profiler (profile_<folder>_<date>.zip containing
-  Files.csv, Projects.csv, Extensions.csv, Run_info.csv) and compiles them into the "Projects
-  Compiled" workbook format - Project Compiled tab (Project Name, Project Description, Domain,
-  Native CAD Software, Part Files, Assembly Files, Native 2D Drawings, PDF Drawings, Neutral 3D
-  Files, 2D Files (file types), 3D Files (file types)) plus the empty Assembly Breakdown tab -
-  with file-level and per-project detail and a review list. Use when the user hands over profiler
-  zips (or a folder of them) and wants the compiled project sheet, CAD file counts per project,
-  or the file-level breakdown. Local only; never uploads anywhere.
+  Turns the output of the Folder Profiler into the usual Projects Compiled workbook. Takes either zip the profiler makes - the step-2 full
+  profile (profile_<folder>_<date>.zip) or the step-1 quick count (quick_<folder>_<date>.zip) - one zip or a folder of them. Step 2 gives
+  compiled.xlsx: Project Compiled (the 11-column template), Assembly Breakdown, Drawing Breakdown (with AutoCAD sheet counts and
+  confidence), File Level, Project Stats, Review, plus one workbook per domain (Architecture / Mechanical / Electronics). Step 1 gives
+  quick_count.xlsx: file counts by class, extension and project. Use when the user hands over profiler zips, or asks for the compiled project
+  sheet, CAD file counts per project, the assembly or drawing breakdown, sheet counts, the domain split, or extension counts from a profile.
+  Runs locally; never uploads anything.
 ---
 
-# Profile Compile (Folder Profiler zips → "Projects Compiled" workbook)
+# Profile Compile (Folder Profiler output -> the usual workbook)
 
-The Folder Profiler collects **raw metrics only** (extension, size, date, a short format
-tag per file; no names, no contents, no paths below the project). This skill turns those metrics
-into the project-level sheet. Every classification decision (part / assembly / drawing / neutral,
-software, domain) is made here, from editable tables, never in the profiler.
+The Folder Profiler runs on the data owner's machine in two steps and writes one zip per step:
+
+| Input zip | Made by | You produce |
+|---|---|---|
+| `quick_<folder>_<date>.zip` | **step 1**, quick count (file types, counts, sizes; nothing opened) | `quick_count.xlsx` (+ 3 CSVs): Overview by file class, By Extension, By Project |
+| `profile_<folder>_<date>.zip` | **step 2**, full profile (names, references inside assemblies / drawings, AutoCAD sheets) | `compiled.xlsx` (+ CSVs): Project Compiled, Assembly Breakdown, Drawing Breakdown, File Level, Project Stats, Assembly Confidence / Evidence, Unmapped Extensions, Review; and `by-domain/compiled_<Domain>.xlsx` |
+
+`run_stats_*.zip` files are run statistics, not data - ignore them. Both kinds of zip can be given together; the script recognises each.
+Every classification decision (part / assembly / drawing / neutral, software, domain) is made here, from the editable tables in
+`scripts/mapping/`, never in the profiler.
+
+## Workflow
+
+1. **Find the zips.** Use the path the user gave (a zip or a folder of zips). If none was given, ask - do not search the disk. Say what you found
+   (how many, which are step 1 / step 2).
+2. **Run the script** (below). Pass `--out <folder>`: the project's own outputs folder if its instructions name one, otherwise a new folder next
+   to the zips. Never write outputs into a git repository or a shared / published location.
+3. **Check** the output folder has the files listed above and that the totals make sense (files read, projects, Review items).
+4. **Report** as in "How to answer" and hand over the workbook(s) to the user (attach / link the file).
+5. **Surface the decisions** in `Review.csv` ("Decisions to surface" below) - never settle them silently.
 
 ## Run it
 
 ```bash
-python3 scripts/compile_profiles.py <zip | folder-of-zips> [more ...] [--unique] [--pdf-drawings auto|none|all] [--project-by auto|structure|folder] [--no-assembly-breakdown] [--copies flag|exclude|keep] [--unique-scope project|all] [--out DIR]
+python3 scripts/compile_profiles.py <zip | folder-of-zips> [more ...] --out <output folder> [--unique] [--pdf-drawings auto|none|all] [--project-by auto|structure|folder] [--no-assembly-breakdown] [--copies flag|exclude|keep] [--unique-scope project|all] [--no-split-by-domain] [--xlsx-max-sheets N]
 ```
 
-(path relative to this skill's folder)
+(path relative to this skill's folder; no other options apply to step-1 zips)
 
-- Standard library only (Python 3.9+). If `openpyxl` is importable (`pip install openpyxl`) it also writes
-  `compiled.xlsx`; otherwise only CSVs (it says so).
-- Output folder: `./compile-profiles/<timestamp>/` under the current folder, or the folder given with `--out`
-  (if the project's own instructions name an outputs folder, pass it with `--out`):
-  `Project_Compiled.csv`, `File_Level.csv`, `Project_Stats.csv`, `Review.csv` (+ `compiled.xlsx`).
-- If the user gave no path, ask where the zips are. Do not search the disk.
+- Python 3.9+. The only extra package is `openpyxl` (`pip install openpyxl`) for the `.xlsx` files; without it only the CSVs are written (it says so).
+- It streams the profile one project at a time (hundreds of thousands of files compile in under a minute and ~200 MB); large tabs are split into
+  1,000,000-row parts because of Excel's row limit (`Review.csv` says so).
+- Step-1 zips: the workbook is `quick_count.xlsx` with the three tabs above; there is no assembly or drawing information in a step-1 zip, so say that
+  if asked ("which part belongs to which assembly needs the step-2 profile").
 
 ## Output format (never change the headings)
 
@@ -79,6 +93,8 @@ processing order (the folder order of the profile), not sorted by project.
 **Which formats are proven:** references were verified on real SolidWorks assemblies, real STEP files and real Solid Edge files (one assembly, three drawings). Inventor uses the same container reader but has not been tested on a real file. CATIA V5, Creo and NX have no container reader: their references are found by searching the file for CAD file names (`kind = scan` in Links.csv), tested only on synthetic files - `Review.csv` says "references by text scan" for those projects; treat them as weaker than SolidWorks / Solid Edge / STEP. Revit and AutoCAD xrefs are not read. References to drawings / templates (`.dft`, `.idw`, `.slddrw`, ...) are never counted.
 
 **Software from content, not only from the extension (profiler 1.7+):** the profiler's `header_signature` names the program inside some files (`OLE2:SolidEdge` - verified on 7 real files; `OLE2:Inventor`, `OLE2:Revit`, `CATIA:V5`, `CREO` - not yet seen on real files). `mapping/signature_software.csv` maps those tags to software. It decides `Native CAD Software` for the shared extensions `.asm` / `.prt` (which the extension table leaves blank) and overrides a wrong extension; `Review.csv` topic "software by content" counts both. A file with CAD content under a non-CAD extension is NOT counted as a part or assembly but is listed under "native file, other extension".
+
+**Unreadable folders / files and tiered files (Windows file servers):** a step-2 zip carries `Unreadable.csv` (project, kind folder|file, path below the project, reason, e.g. PermissionError) and the compiler writes it next to the workbook plus one Review line per project ("N folder(s) ... could not be read ... NOT in the counts"). Always surface these: the counts for those projects are lower than the truth until access is granted. Files tagged `TIERED` (Azure File Sync / OneDrive online-only) were deliberately not opened; AutoCAD ones have sheets status `not-read-tiered`. `Run_info.csv` has `cloud_tiered_files_not_opened`, `deduplicated_files`, `network_retries`. A step-1 zip's list is passed on as `Quick_Unreadable.csv` (folders only).
 
 **Step 1 zips (quick count):** `quick_<name>_<date>.zip` from the profiler's `--quick` / *Step 1* button holds only file counts and sizes per extension and project (no names, nothing opened). Give one to `compile_profiles.py` (no other option applies) and it writes `quick_count.xlsx` plus `Quick_Overview.csv`, `Quick_By_Extension.csv`, `Quick_By_Project.csv`: an overview by file class (PART / ASSEMBLY / DRAWING / NEUTRAL3D / PDF / IMG ...), every extension with its class, software and domain (extensions missing from `extensions.csv` show as UNMAPPED), and per project the parts / assemblies / drawings / neutral / PDF counts and top extensions. It cannot say which part belongs to which assembly - that needs the step-2 profile.
 
@@ -172,15 +188,16 @@ from a project name. Re-run after editing.
 
 ## How to answer
 
-1. Show the Project Compiled rows as a markdown table with the 11 headings (first ~15 rows if many).
-2. State zips / projects / files read, the counting rule and PDF setting used, and link the output folder.
+1. Step 2: show the Project Compiled rows as a markdown table with the 11 headings (first ~15 rows if many). Step 1: show the Overview (file class, files, size, share) and the top extensions.
+2. State zips / projects / files read, the counting rule and PDF setting used, and attach or link the workbook(s) and the output folder.
 3. List `Review` items grouped by topic, each with a proposed resolution.
 4. Offer: `--unique` comparison, `--pdf-drawings all`, mapping additions, or the file-level view.
 
 ## Guardrails
 
 - **Never push to Google Sheets, email or any service** and never ask for credentials. Reads zips, writes local files only.
-- A zip without `Files.csv`/`Run_info.csv` is skipped with a message — report which.
+- A zip that is neither a step-1 nor a step-2 profiler zip is skipped with a message — report which.
 - "Same project appears in more than one zip": the same folder was profiled twice; ask which zip to keep, don't merge.
-- Numbers come from metadata, not from opening any file; say so if asked how a count was obtained.
+- Step-1 numbers come from folder listings only (no file opened). Step-2 numbers come from metadata plus a short read of each file's start, the references inside assembly / drawing / STEP files and the layout count of AutoCAD drawings - never file contents beyond that; say so if asked how a count was obtained.
+- Outputs hold real client names: keep them in the local outputs folder; never commit them to a repository or put them in a shared drive unless the user says to.
 - Do not edit `scripts/compile_profiles.py` to change classification; edit the mapping CSVs.

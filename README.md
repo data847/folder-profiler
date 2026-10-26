@@ -30,6 +30,23 @@ searched for CAD file names written as plain text (`kind = scan` in `Links.csv`)
 AutoCAD xrefs are not read (an xref links a drawing to a drawing, which does not change part / assembly counts).
 Because the default is level 2, the output contains client file and folder names: get the data owner's agreement first (`--level 0` records metrics only).
 
+## Windows file servers and network shares (Server 2019, Azure File Sync, deduplication)
+
+Both steps work on mapped drives and `\\server\share` paths (long paths included). Built for file servers:
+- **Same fast engine in both steps.** Step 1 and step 2's counting pass share one threaded folder listing (4 threads on a local disk, 32 on a network drive or UNC path);
+  step 2's file readers also use 48 threads on a network share, because every open waits on the network (`PROFILER_WORKERS` overrides).
+- **Cloud-tiered / online-only files are never opened.** Files with the OFFLINE, RECALL_ON_OPEN, RECALL_ON_DATA_ACCESS or UNPINNED attribute (Azure File Sync cloud
+  tiering, OneDrive online-only) would be downloaded in full by even a 4 KB read. They are counted from the listing, tagged `TIERED` (AutoCAD ones get sheets status
+  `not-read-tiered`) and reported in `Run_info.csv` (`cloud_tiered_files_not_opened`).
+- **Unreadable folders and files are listed**, not just counted: `Unreadable.csv` (project, kind, path below the project, reason - e.g. `PermissionError`); step 1 lists folders only
+  (no file names), level 0 records no path. The compiler adds a Review line per project and writes `Unreadable.csv` next to the workbook.
+- **Dropped connections are retried** (timeouts, network name deleted, unreachable: 3 retries with pauses; a whole folder listing is repeated, so nothing is counted twice);
+  `network_retries` in `Run_info.csv`. Permission errors are never retried.
+- **Deduplicated files** (Windows Server Data Deduplication) read normally but more slowly; they are counted in `Run_info.csv` (`deduplicated_files`).
+Run step 1 from any PC against the share; run step 2 on the server itself or a machine on the same fast network, with an account that has read access
+(never type a password into the tool: use the signed-in account or `net use` first). Not tested against a real Server 2019 from the development Mac: the tiered-file and retry
+paths are tested with simulated attributes and errors, and every failure falls back to the plain behaviour.
+
 ## Domain (Mechanical / Architecture / Electronics)
 
 Decided per project by the compiler: specific tools vote (SketchUp, Revit, SolidWorks ...; **general-purpose AutoCAD / Rhino do not**), then the tool named in

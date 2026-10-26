@@ -44,6 +44,15 @@ Step 2 - FULL PROFILE (the complete run, much longer): everything described in "
 In the browser page there is one button for each step. Run step 1 first if you want a fast overview, or send both zips.
 (Command line: add --quick for step 1; without it you get step 2.)
 
+NETWORK DRIVES AND WINDOWS FILE SERVERS
+You can measure a mapped drive (Z:\...) or a server path (\\server\share\...). Tips:
+  - Use an account that can read the folders. Folders the tool cannot read are listed in Unreadable.csv (inside the zip) so the owner can fix the
+    permissions and run again; nothing inside them is in the counts.
+  - Files that exist only in the cloud (Azure File Sync "tiered" files, OneDrive "online-only" files) are NOT opened, because opening them would
+    download them. They are still counted from the folder listing and shown as TIERED.
+  - A short network drop is handled automatically (the tool waits and tries again). If the connection stays down, run it again: it continues.
+  - For the fastest full profile, run it on the server itself, or on a computer on the same fast network.
+
 WHAT YOU NEED
 - A Windows computer (Mac: see the Mac section at the bottom).
 - The folder you want measured. Inside it, each sub-folder is counted as one project.

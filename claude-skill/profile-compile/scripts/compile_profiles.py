@@ -207,7 +207,8 @@ def load_profiles(paths):
             if "Projects.csv" in names:
                 counts = {r["project"]: int(r["file_count"]) for r in read_csv(zf.read("Projects.csv").decode("utf-8-sig"))}
         runs.append({"zip": z.name, "info": info, "files": CsvSource(z, "Files.csv"), "parents": parents, "projects": counts,
-                     "links": CsvSource(z, "Links.csv") if "Links.csv" in names else []})
+                     "links": CsvSource(z, "Links.csv") if "Links.csv" in names else [],
+                     "unreadable": CsvSource(z, "Unreadable.csv") if "Unreadable.csv" in names else []})
     if not runs:
         raise SystemExit("No profiler zips found.")
     for r in runs:
@@ -466,6 +467,7 @@ class Engine:
         self.deferred = {}                                # exclude mode: per-project outputs held back until copies are known
         self.universe = None
         self.lost_links = 0
+        self.unreadable_rows = []                         # [project, kind, path, reason] of everything the profiler could not read
 
     # ------------------------------------------------------------------------------------------ rows
     def builder(self, proj, lk, count=True):
@@ -656,7 +658,7 @@ class Engine:
                            round(sum(r["sheets_conf"] for r in sh_real) / len(sh_real)) if sh_real else "", min((r["sheets_conf"] for r in sh_real), default="")]
             STATUS_TEXT = {"unsupported-r2007": "AutoCAD 2007 format (not supported)", "no-layouts-in-version": "older than AutoCAD 2000 / no layouts in this file",
                            "dxf-binary": "binary DXF (not supported)", "too-large": "file larger than the size limit", "unreadable": "file could not be read",
-                           "not-dwg": "not an AutoCAD file in spite of the extension", "no-layout-objects": "no layout found in the file",
+                           "not-dwg": "not an AutoCAD file in spite of the extension", "not-read-tiered": "cloud-tiered file, deliberately not opened (it would be downloaded)", "no-layout-objects": "no layout found in the file",
                            "handle-mismatch": "file structure did not check out", "object-map": "object table not understood", "class-table": "class table not understood"}
             why = collections.Counter((STATUS_TEXT.get(r["sheets_status"], f"could not be read ({r['sheets_status']})") if r["sheets_status"] else
                                        "AutoCAD 2007 format (not supported)" if r["sig"] == "DWG:AC1021" else
@@ -828,6 +830,18 @@ class Engine:
         for (proj, now), k in sorted(self.native_unknown_ext.items()):
             review.append([proj, "native file, other extension", f"{k} file(s) look like {now} native files by content but their extension is not a native CAD "
                            "extension in extensions.csv, so they are NOT counted as parts / assemblies - rename them or add the extension"])
+        bad = collections.defaultdict(lambda: [collections.Counter(), collections.Counter()])
+        for run in runs:
+            folder = run["info"].get("folder_name", run["zip"])
+            for r in run.get("unreadable") or []:
+                proj = r["project"] if names[r["project"]] == 1 else f"{folder}/{r['project']}"
+                self.unreadable_rows.append([proj, r["kind"], r["path"], r["reason"]])
+                bad[proj][0][r["kind"]] += 1
+                bad[proj][1][r["reason"]] += 1
+        for proj, (kinds, why) in sorted(bad.items(), key=lambda kv: kv[0].lower()):
+            review.append([proj, "unreadable", f"{kinds['folder']} folder(s) and {kinds['file']} file(s) could not be read ("
+                           + ", ".join(f"{k} x{v}" for k, v in why.most_common(3)) + ") - what is inside them is NOT in the counts; grant read access or "
+                           "re-run for those; the list is in Unreadable.csv"])
         if self.lost_links:
             review.append(["(all projects)", "references", f"{self.lost_links} reference row(s) in Links.csv could not be matched to a project "
                            "(out of order) and were ignored"])
@@ -1107,6 +1121,13 @@ def compile_quick(paths, ext_map, soft, out):
     def dump(name, header, rows):
         with open(out / name, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.writer(f); w.writerow(header); w.writerows([_csv_safe(v) for v in r] for r in rows)
+    bad = []
+    for z in paths:
+        with zipfile.ZipFile(z) as zf:
+            if "Unreadable.csv" in zf.namelist():
+                bad += [[r["project"], r["kind"], r["path"], r["reason"]] for r in rd(zf, "Unreadable.csv")]
+    if bad:
+        dump("Quick_Unreadable.csv", ["project", "kind", "path", "reason"], bad)
     dump("Quick_Overview.csv", QUICK_OVERVIEW, cls_rows)
     dump("Quick_By_Extension.csv", QUICK_BY_EXT, ext_rows)
     dump("Quick_By_Project.csv", QUICK_BY_PROJECT, proj_rows)
@@ -1179,6 +1200,11 @@ def main():
     sinks.evidence.close(keep_empty=bool(eng.confidence))
     sinks.drawings.close(keep_empty=False)
     write_small_csvs(out, compiled, stats, review, eng.confidence, unmapped)
+    if eng.unreadable_rows:
+        with open(out / "Unreadable.csv", "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            w.writerow(["project", "kind", "path", "reason"])
+            w.writerows([_csv_safe(v) for v in r] for r in eng.unreadable_rows)
     if Workbook:
         write_workbook(out / "compiled.xlsx", compiled, stats, review, eng.confidence, unmapped, sinks, a.xlsx_max_sheets)
         if not a.no_split_by_domain:
