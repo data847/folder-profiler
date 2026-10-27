@@ -30,3 +30,6 @@ schlib,library
 pcblib,library
 olb,library
 bxl,library
+fsch,schematic
+fbrd,layout
+flbr,library

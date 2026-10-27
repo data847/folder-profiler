@@ -5,7 +5,7 @@ psm,PART,SolidEdge,,
 ipt,PART,Inventor,,
 catpart,PART,CATIA,,
 prt,PART,,,ambiguous (NX/Creo) - software left blank
-f3d,PART,Fusion360,,single-file design counted as a part
+f3d,PART,Fusion360,,single-file design counted as a part (a Fusion design can hold several components; not opened)
 fcstd,PART,FreeCAD,,
 3dm,PART,Rhino,,
 skp,PART,SketchUp,Architecture,
@@ -239,3 +239,8 @@ webm,OTHER,,,video
 flv,OTHER,,,video
 3gp,OTHER,,,video
 mts,OTHER,,,video
+f3z,ASSEMBLY,Fusion360,,archive of a multi-design assembly (the designs inside are not opened - one file)
+f2d,DRAWING,Fusion360,,Fusion drawing
+fsch,EDA,FusionElectronics,Electronics,Fusion Electronics schematic
+fbrd,EDA,FusionElectronics,Electronics,Fusion Electronics board
+flbr,EDA,FusionElectronics,Electronics,Fusion Electronics library
