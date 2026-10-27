@@ -63,6 +63,7 @@ table.qt{border-collapse:collapse}table.qt td,table.qt th{border:1px solid #8884
 <div id="selbox" style="display:none;margin-top:12px"><span class="mut" id="selcount"></span><ul id="sel" style="max-height:150px"></ul></div></div>
 <div class="card"><b>3. Run</b>
 <label style="display:block;margin-top:8px"><input type="checkbox" id="anonn"> Anonymise file and folder names in the result <span class="mut">(optional; applies to Step 1 and Step 2. Only the result is renamed, never your files. You also get a separate name map to keep private; extra time is negligible)</span></label>
+<label style="display:block;margin:6px 0 0 24px"><input type="checkbox" id="anonmap" checked disabled> Also give me the name map <span class="mut">(a separate file, real name &rarr; anonymised name, with its own download button. Keep it private.)</span></label>
 <label style="display:block;margin-top:8px"><input type="checkbox" id="fresh"> Start from scratch <span class="mut">(normally a stopped run continues where it stopped; tick this to ignore saved progress)</span></label>
 <div class="row" style="margin-top:8px"><button id="goquick" title="Counts the files of each type and their size. Nothing is opened, so it is very fast.">Step 1: quick count</button>
 <button id="go" title="The complete profile (file details, references inside assemblies, drawing sheets). Takes much longer.">Step 2: full profile</button></div>
@@ -107,12 +108,13 @@ function setMode(m){mode=m;$("h2").textContent=m=="pick"?"2. Tick the project fo
 document.querySelectorAll("input[name=m]").forEach(r=>r.onchange=()=>setMode(r.value));
 $("addcur").onclick=()=>{if(cur&&!sel.includes(cur)){sel.push(cur);renderSel()}};
 $("up").onclick=()=>ls($("up").dataset.parent);$("p").onchange=()=>ls($("p").value);
+$("anonn").onchange=()=>{$("anonmap").disabled=!$("anonn").checked};
 $("go").onclick=()=>start("full");$("goquick").onclick=()=>start("quick");
 const busy=v=>{$("go").disabled=v;$("goquick").disabled=v};
 async function start(kind){$("res").textContent="";$("bar").style.display="none";$("barlabel").textContent="";
  if(mode=="pick"&&!sel.length){$("res").innerHTML="<span class='er'>Tick at least one folder first.</span>";return}
  busy(true);
- const o={fresh:$("fresh").checked,kind:kind,anon_names:$("anonn").checked};
+ const o={fresh:$("fresh").checked,kind:kind,anon_names:$("anonn").checked,anon_map:$("anonmap").checked};
  const body=mode=="pick"?{t:T,paths:sel,...o}:{t:T,path:$("p").value,...o};
  const r=await fetch("/api/start",{method:"POST",body:JSON.stringify(body)});const j=await r.json();
  if(j.error){$("res").innerHTML="<span class='er'>"+esc(j.error)+"</span>";busy(false);return}poll()}
@@ -254,7 +256,7 @@ table{border-collapse:collapse;width:100%}td,th{border:1px solid var(--bd);paddi
 </main><script>document.getElementById("cb").textContent="http://localhost:"+location.port+"/callback"</script></body></html>"""
 
 
-def _run(path, folders=None, anon=False, tier=2, depth=1, fresh=False, quick=False, anon_names=False):
+def _run(path, folders=None, anon=False, tier=2, depth=1, fresh=False, quick=False, anon_names=False, anon_map=True):
     def log(msg):
         with LOCK:
             STATE["log"].append(msg.rstrip())
@@ -266,7 +268,7 @@ def _run(path, folders=None, anon=False, tier=2, depth=1, fresh=False, quick=Fal
         label = os.environ.get("PROFILER_FOLDER_NAME") if IN_DOCKER and path == DATA_ROOT else None
         if quick:
             zip_path, nproj, nfiles, errors = fp.quick_scan(path, OUT_DIR, log=log, label=label, folders=folders, progress=progress, project_depth=depth,
-                                                            anonymize_names=anon_names or None)
+                                                            anonymize_names=anon_names or None, name_map=anon_map)
             with LOCK:
                 STATE.update(state="done", result={"path": zip_path, "name": os.path.basename(zip_path), "stats_path": "", "stats_name": "",
                                                    "map_path": fp.LAST_RUN.get("map_zip", ""), "map_name": os.path.basename(fp.LAST_RUN.get("map_zip", "")),
@@ -276,7 +278,7 @@ def _run(path, folders=None, anon=False, tier=2, depth=1, fresh=False, quick=Fal
             return
         zip_path, nproj, nfiles, errors = fp.profile(path, OUT_DIR, log=log, label=label, folders=folders, progress=progress,
                                                       anonymize_assembly_names=anon, tier=tier, project_depth=depth,
-                                                      resume=not fresh, anonymize_names=anon_names or None)
+                                                      resume=not fresh, anonymize_names=anon_names or None, name_map=anon_map)
         sz = fp.LAST_RUN.get("stats_zip") or ""
         with LOCK:
             STATE.update(state="done", result={"path": zip_path, "name": os.path.basename(zip_path), "stats_path": sz,
@@ -494,7 +496,7 @@ class Handler(BaseHTTPRequestHandler):
             STATE.update(state="running", log=[], result=None, error=None,
                          progress={"phase": "scan", "files": 0, "total_files": 0, "bytes": 0, "total_bytes": 0})
         threading.Thread(target=_run, args=(path, folders or None, bool(body.get("anon")), 2, 1,
-                                                          bool(body.get("fresh")), body.get("kind") == "quick", bool(body.get("anon_names"))), daemon=True).start()
+                                                          bool(body.get("fresh")), body.get("kind") == "quick", bool(body.get("anon_names")), body.get("anon_map", True) is not False), daemon=True).start()
         self._json({"ok": True})
 
 

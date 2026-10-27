@@ -622,7 +622,7 @@ def _name_map(flag):
     return name_anon.NameMap()
 
 
-def quick_scan(root, out_dir, log=print, label=None, folders=None, workers=None, progress=None, project_depth=None, anonymize_names=None):
+def quick_scan(root, out_dir, log=print, label=None, folders=None, workers=None, progress=None, project_depth=None, anonymize_names=None, name_map=True):
     """STEP 1 - the quick count: how many files of each type, and how big, per project and overall. Metadata only: no file is opened,
     no archive is looked into, nothing is read - just the folder listings the operating system already holds (see scan_tree). Writes
     quick_<name>_<stamp>.zip: Extensions.csv (per project), Extensions_All.csv, Projects.csv, Unreadable.csv, Run_info.csv.
@@ -686,7 +686,7 @@ def quick_scan(root, out_dir, log=print, label=None, folders=None, workers=None,
         z.writestr("Run_info.csv", csv_bytes(["key", "value"], info))
         z.writestr("WHAT_IS_IN_THIS_ZIP.txt", what.encode("utf-8"))
     map_zip = ""
-    if nm:
+    if nm and name_map:
         map_zip = nm.write_zip(os.path.join(out_dir, f"name_map_{re.sub(r'[^A-Za-z0-9_.-]', '_', label)}_{stamp}.zip"), label)
     LAST_RUN.clear()
     LAST_RUN.update(map_zip=map_zip, quick_zip=zip_path, top=[[e, n, b] for e, n, b, *_ in all_rows[:12]], total_bytes=nbytes, distinct_extensions=len(overall),
@@ -699,7 +699,7 @@ def quick_scan(root, out_dir, log=print, label=None, folders=None, workers=None,
 
 def profile(root, out_dir, log=print, label=None, folders=None, workers=None, progress=None,
             anonymize_assembly_names=None, tier=None, project_depth=None,
-            resume=True, metrics_interval=None, system_info=True, chunk_files=None, anonymize_names=None):
+            resume=True, metrics_interval=None, system_info=True, chunk_files=None, anonymize_names=None, name_map=True):
     """Profile a folder tree. Streaming and resumable: every project is processed in chunks that are saved to
     <out_dir>/.resume/<run id>/ as they finish; a run that stops (crash, power cut, Ctrl+C) continues from the last saved chunk when
     started again with the same settings. The state is deleted when the run completes. Nothing is ever hashed except folder
@@ -1194,7 +1194,7 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
     except OSError:
         pass
     map_zip = ""
-    if nm:                                  # SEPARATE from the profile zip: whoever gets the profile cannot reverse the codes
+    if nm and name_map:                     # SEPARATE from the profile zip: whoever gets the profile cannot reverse the codes
         map_zip = nm.write_zip(os.path.join(out_dir, f"name_map_{safe}_{stamp}.zip"), label)
     LAST_RUN.update(zip=zip_path, stats_zip=stats_zip, map_zip=map_zip)
     return zip_path, len(units), nfiles_out, C["errors"]
@@ -1277,6 +1277,8 @@ def main(argv=None):
     ap.add_argument("--anonymize-names", action="store_true",
                     help="optional: replace project, folder and file names in the OUTPUT by codes (extensions kept); the code-to-name table is written "
                          "to a separate name_map_*.zip, never into the profile. Works for step 1 and step 2; files are never touched")
+    ap.add_argument("--no-name-map", action="store_true",
+                    help="with --anonymize-names: do not write the name_map_*.zip (the codes can then never be turned back into names)")
     ap.add_argument("--level", "--tier", dest="level", type=int, choices=[0, 1, 2], default=None,
                     help="detail level: 0 = metrics only, 1 = + file/folder names and paths, "
                          "2 (default) = + names of files referenced inside assemblies/drawings/STEP (env PROFILER_TIER)")
@@ -1301,7 +1303,7 @@ def main(argv=None):
         print(f"Quick count (step 1): {label or folder}\n(read-only; no file is opened; nothing is copied or sent anywhere)\n")
         try:
             qz, nproj, nfiles, errors = quick_scan(folder, out_dir, label=label, workers=a.workers, project_depth=a.project_depth,
-                                                   anonymize_names=a.anonymize_names or None)
+                                                   anonymize_names=a.anonymize_names or None, name_map=not a.no_name_map)
         except SystemExit as e:
             print(e)
             return 1
@@ -1319,7 +1321,7 @@ def main(argv=None):
                                                     tier=a.level, project_depth=a.project_depth,
                                                     resume=not a.fresh, metrics_interval=a.metrics_interval,
                                                     system_info=not a.no_system_info, chunk_files=a.chunk_files,
-                                                    anonymize_names=a.anonymize_names or None)
+                                                    anonymize_names=a.anonymize_names or None, name_map=not a.no_name_map)
     except SystemExit as e:
         print(e)
         return 1
