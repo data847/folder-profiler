@@ -158,6 +158,22 @@ def _in_data(p):
     return p == DATA_ROOT or p.startswith(DATA_ROOT + os.sep)
 
 
+
+def _net_hint(path, e):
+    """On Windows, tell the person what to do about the usual file-server errors (logon failure, access denied, drive letter not visible)."""
+    if os.name != "nt":
+        return ""
+    code = getattr(e, "winerror", None)
+    if code in (1326, 1219, 1244, 86):       # logon failure / multiple connections with other credentials / not authenticated / bad password
+        unc = "\\".join(path.split("\\")[:4]) if path.startswith("\\\\") else r"\\server\share"
+        return (". Windows has no valid login for that server for the account running this program. Fix: open a Command Prompt AS THE SAME USER "
+                f"that starts the profiler and run:  net use {unc} /user:DOMAIN\\yourname  (it asks for the password), or open the folder once in File "
+                "Explorer and tick 'Remember my credentials'. If 'net use' says error 1219, first run  net use * /delete  and try again")
+    if code in (5, 53, 67):                  # access denied / network path not found / network name not found
+        return (". Check the path and that this account may read the share. Drive letters mapped in Explorer are not visible to a program "
+                "started 'as administrator' or as another user: type the full \\\\server\\share\\folder path instead")
+    return ""
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -197,7 +213,7 @@ class Handler(BaseHTTPRequestHandler):
                 dirs = sorted((d for d in os.listdir(p) if os.path.isdir(os.path.join(p, d)) and not d.startswith(".")),
                               key=str.lower)
             except OSError as e:
-                return self._json({"error": f"Cannot open that folder ({e.strerror})"})
+                return self._json({"error": f"Cannot open that folder ({e.strerror})" + _net_hint(p, e)})
             return self._json({"path": p, "parent": p if IN_DOCKER and os.path.realpath(p) == DATA_ROOT else os.path.dirname(p), "dirs": dirs, "sep": os.sep})
         if u.path == "/api/status":
             with LOCK:
