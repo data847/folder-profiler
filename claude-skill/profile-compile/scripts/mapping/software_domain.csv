@@ -21,3 +21,5 @@ Altium,Altium,Electronics,specific
 KiCad,KiCad,Electronics,specific
 Eagle,Eagle,Electronics,specific
 3dsMax,3ds Max,,general
+OrCAD,OrCAD,Electronics,specific
+LTspice,LTspice,Electronics,specific

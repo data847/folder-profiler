@@ -61,7 +61,7 @@ with tempfile.TemporaryDirectory() as t:
     check("Mech estimate rows sum to project totals (parts, 2D, PDF, neutral)", tuple(sum(a[i] for a in mech) for i in (2, 3, 4, 5)), (3, 2, 0, 2))
     check("Mech row carries the real assembly name recorded by profiler 1.2", mech[0][1], "top.sldasm")
     check("projects without an assembly file get one summary row each (never an empty tab)",
-          sorted((a[0], a[1]) for a in rows.asm if a[1].startswith("(no assembly")), [("Arch", "(no assembly file in this project)"), ("Elec", "(no assembly file in this project)")])
+          sorted((a[0], a[1]) for a in rows.asm if a[1].startswith("(no assembly")), [("Arch", "(no assembly file in this project)")])        # an electronics-only project (schematics, layouts) has no parts / drawings: no row
     check("Mech's rows are its real assembly", {a[0] for a in rows.asm if not a[1].startswith("(no assembly")}, {"Mech"})
     check("review says ESTIMATE", any("ESTIMATE" in x[2] for x in review), True)
     # uneven split: 7 parts over 3 assemblies -> 3,2,2 summing to 7

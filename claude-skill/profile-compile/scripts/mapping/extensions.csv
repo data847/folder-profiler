@@ -23,14 +23,14 @@ catdrawing,DRAWING,CATIA,,
 dwg,DRAWING,AutoCAD,,
 dxf,DRAWING,,,open format - software left blank
 dwf,DRAWING,AutoCAD,,
-schdoc,DRAWING,Altium,Electronics,schematic
-pcbdoc,DRAWING,Altium,Electronics,PCB layout
-kicad_sch,DRAWING,KiCad,Electronics,schematic
-kicad_pcb,DRAWING,KiCad,Electronics,PCB layout
-sch,DRAWING,,Electronics,ambiguous (Eagle/KiCad) - software left blank
-brd,DRAWING,,Electronics,ambiguous - software left blank
-gbr,DRAWING,,Electronics,Gerber
-ger,DRAWING,,Electronics,Gerber
+schdoc,EDA,Altium,Electronics,schematic
+pcbdoc,EDA,Altium,Electronics,PCB layout
+kicad_sch,EDA,KiCad,Electronics,schematic
+kicad_pcb,EDA,KiCad,Electronics,PCB layout
+sch,EDA,,Electronics,ambiguous (Eagle/KiCad) - software left blank
+brd,EDA,,Electronics,ambiguous - software left blank
+gbr,EDA,,Electronics,Gerber
+ger,EDA,,Electronics,Gerber
 step,NEUTRAL3D,,,
 stp,NEUTRAL3D,,,
 iges,NEUTRAL3D,,,
@@ -120,7 +120,7 @@ ipn,DATA,Inventor,,Inventor presentation (exploded view) - not a model
 dll,DATA,,,software
 exe,DATA,,,software
 ocx,DATA,,,software
-lib,DATA,,,software
+lib,EDA,,Electronics,library (SPICE / schematic / footprint); software left blank
 exp,DATA,,,software
 ilk,DATA,,,software
 manifest,DATA,,,
@@ -137,11 +137,11 @@ hcg,DATA,,,
 sev,DATA,,,
 tmp,DATA,,,temporary file
 z$w,DATA,,,temporary file
-mp4,IMG,,,video
-wmv,IMG,,,video
-mov,IMG,,,video
-avi,IMG,,,video
-mkv,IMG,,,video
+mp4,OTHER,,,video
+wmv,OTHER,,,video
+mov,OTHER,,,video
+avi,OTHER,,,video
+mkv,OTHER,,,video
 iso,ARCHIVE,,,disk image
 ttf,DATA,,,font
 otf,DATA,,,font
@@ -210,3 +210,32 @@ download,DATA,,,unfinished browser download
 img,DATA,,,disk image / installer
 bin,DATA,,,binary data / installer
 3dm_tmp,DATA,,,Rhino temporary file
+dsn,EDA,OrCAD,Electronics,schematic (OrCAD Capture design)
+opj,EDA,OrCAD,Electronics,OrCAD project
+pcb,EDA,,Electronics,PCB layout (software left blank)
+prjpcb,EDA,Altium,Electronics,Altium project
+gtl,EDA,,Electronics,Gerber top copper
+gbl,EDA,,Electronics,Gerber bottom copper
+gts,EDA,,Electronics,Gerber top solder mask
+gbs,EDA,,Electronics,Gerber bottom solder mask
+gto,EDA,,Electronics,Gerber top silkscreen
+gbo,EDA,,Electronics,Gerber bottom silkscreen
+drl,EDA,,Electronics,drill file
+xln,EDA,,Electronics,Excellon drill file
+pos,EDA,,Electronics,pick-and-place / component position file
+net,EDA,,Electronics,netlist
+cir,EDA,,Electronics,netlist / SPICE circuit
+sp,EDA,,Electronics,SPICE netlist
+cdl,EDA,,Electronics,netlist (circuit description language)
+asc,EDA,LTspice,Electronics,LTspice simulation schematic
+schlib,EDA,Altium,Electronics,Altium schematic library
+pcblib,EDA,Altium,Electronics,Altium PCB library
+olb,EDA,OrCAD,Electronics,OrCAD library
+bxl,EDA,,Electronics,Ultra Librarian library
+m4v,OTHER,,,video
+mpg,OTHER,,,video
+mpeg,OTHER,,,video
+webm,OTHER,,,video
+flv,OTHER,,,video
+3gp,OTHER,,,video
+mts,OTHER,,,video

@@ -59,6 +59,7 @@ except ImportError:  # xlsx is a convenience; CSVs are always written
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))          # structure.py sits next to this file (also under `python -I`)
+import domain_metrics  # noqa: E402
 from structure import (assign_assemblies, build_universe, detect_copies, detect_copies_from, split_by_structure, split_evenly, stem)  # noqa: E402,F401
 
 HEADINGS = ["Project Name", "Project Description", "Domain", "Native CAD Software", "Part Files",
@@ -75,9 +76,9 @@ STATS_HEADER = ["project", "files_total", "unique_hashes", "duplicate_files", "p
                 "native_2d_drawings", "neutral_3d", "pdf", "simulation", "documents", "data", "images",
                 "archive_other", "unmapped", "total_bytes", "counted_as", "files_in_archives", "archive_duplicates_not_counted",
                 "possible_copy_of", "copy_share", "drawing_sheets", "sheet_files_counted", "sheet_files_model_only", "sheet_files_assumed",
-                "sheets_confidence_avg", "sheets_confidence_min", "domain_basis", "domain_confidence"]
-CLASSES = {"PART", "ASSEMBLY", "DRAWING", "NEUTRAL3D", "PDF", "SIM", "DOC", "DATA", "IMG", "ARCHIVE", "OTHER"}
-NATIVE = {"PART", "ASSEMBLY", "DRAWING"}      # only these name the "Native CAD Software"
+                "sheets_confidence_avg", "sheets_confidence_min", "domain_basis", "domain_confidence", "eda_files"]
+CLASSES = {"PART", "ASSEMBLY", "DRAWING", "NEUTRAL3D", "PDF", "SIM", "DOC", "DATA", "IMG", "ARCHIVE", "OTHER", "EDA"}
+NATIVE = {"PART", "ASSEMBLY", "DRAWING", "EDA"}      # only these name the "Native CAD Software" (EDA = electronics design files: schematics, layouts, gerbers ...)
 REPORT_WORDS = re.compile(r"report|spec|manual|datasheet|data.?sheet|catalog|brochure|invoice|quot|certificate|summary|presentation|"
                           r"assessment|breakdown|change.?log|verification|proposal|minutes|checklist|offer|\bbom\b|readme", re.I)
 DRAWING_WORDS = re.compile(r"drawing|\bdrg\b|\bdwg\b|layout|sheet|assy|detail|schematic|arrangement", re.I)
@@ -166,12 +167,15 @@ def load_mapping(map_dir):
     pats = collections.defaultdict(list)
     for r in (read_csv(kwp) if kwp.exists() else []):
         pats[r["domain"].strip()].append(r["pattern"].strip())
+    rolep = Path(map_dir) / "eda_roles.csv"                  # what each electronics-design extension is (schematic, layout, gerber ...)
+    soft[EDA_ROLES] = {r["ext"].strip().lower(): r["role"].strip() for r in read_csv(rolep)} if rolep.exists() else {}
     soft[DOMAIN_KEYWORDS] = {d: re.compile("|".join(f"(?:{p})" for p in ps), re.I) for d, ps in pats.items()}
     return ext_map, soft
 
 
 BY_SIGNATURE = "__by_signature__"
 DOMAIN_KEYWORDS = "__domain_keywords__"
+EDA_ROLES = "__eda_roles__"
 
 
 class CsvSource:
@@ -468,6 +472,8 @@ class Engine:
         self.universe = None
         self.lost_links = 0
         self.unreadable_rows = []                         # [project, kind, path, reason] of everything the profiler could not read
+        self.facts = {}                                   # per final project: what the three domain sheets need (domain_metrics.collect)
+        self.domain_sheets = {}
 
     # ------------------------------------------------------------------------------------------ rows
     def builder(self, proj, lk, count=True):
@@ -675,7 +681,7 @@ class Engine:
                             sum(r["dup"] for r in rows), n["PART"], n["ASSEMBLY"], n["DRAWING"], n["NEUTRAL3D"], n["PDF"], n["SIM"],
                             n["DOC"], n["DATA"], n["IMG"], n["ARCHIVE"] + n["OTHER"], n["UNMAPPED"], sum(r["size"] for r in rows),
                             ("unique hashes (whole profile)" if self.unique_scope == "all" else "unique hashes (per project)") if unique else "all files",
-                            sum(1 for r in rows if r["archive"]), sum(1 for r in rows if r["adup"]), "", "", *sheet_stats, dom_basis, dom_conf]
+                            sum(1 for r in rows if r["archive"]), sum(1 for r in rows if r["adup"]), "", "", *sheet_stats, dom_basis, dom_conf, n["EDA"]]
         n_arch = sum(1 for r in rows if r["archive"])
         if n_arch:
             rev.append([proj, "archives", f"{n_arch} files found inside archives ({sum(1 for r in rows if r['adup'])} identical to files "
@@ -753,6 +759,9 @@ class Engine:
             how = collections.Counter(how_of(x) for x in outs["dr"])
             rev.append([proj, "drawing breakdown", f"{len(outs['dr'])} drawing rows (= Native 2D Drawings {n['DRAWING']} + PDF Drawings {pdf_drawings}); which assembly: "
                         + ", ".join(f"{k}: {v}" for k, v in how.most_common())])
+        self.facts[proj] = domain_metrics.collect(proj, rows, counted, n, pdf_drawings, sw_names, t2d, t3d,
+                                                  self.stats[proj][STATS_HEADER.index("drawing_sheets")], domain, outs["dr"], soft,
+                                                  soft.get(EDA_ROLES, {}))
         if self.copies == "exclude":
             self.deferred[proj] = outs                   # may still be dropped when the project turns out to be a copy
         else:
@@ -796,6 +805,7 @@ class Engine:
                 self.review_proj[proj] = [[proj, "possible copy", f"EXCLUDED from Project Compiled: {share:.0%} of its {nfiles} files match files in '{orig}'"]]
                 self.compiled.pop(proj, None)
                 self.stats.pop(proj, None)
+                self.facts.pop(proj, None)
                 self.deferred.pop(proj, None)
             else:
                 self.stats[proj][19:21] = [orig, f"{share:.0%}"]
@@ -804,6 +814,7 @@ class Engine:
                                "backup or copy; counts include it (use --copies exclude to drop it, --unique --unique-scope all to count each content once)")
         for proj in sorted(self.deferred, key=str.lower):
             self._emit(self.deferred[proj])
+        self.domain_sheets = domain_metrics.build_sheets(self.facts, self.soft)
         for proj, rev in self.review_proj.items():
             rev[:] = [x for x in rev if x[2] is not None]
         review = []
@@ -872,7 +883,8 @@ def compile_runs(runs, ext_map, soft, unique, pdf_mode, estimate=False, project_
     ev_rows = sorted(sinks.evidence.rows, key=lambda r: key(r["project"]))
     conf = sorted(eng.confidence, key=lambda r: key(r["project"]))
     drawings = sorted(sinks.drawings.rows, key=lambda r: key(r[0]))
-    return compiled, file_rows, stats, review, assemblies, {"rows": ev_rows, "projects": conf, "unmapped": unm_rows, "drawings": drawings}
+    return compiled, file_rows, stats, review, assemblies, {"rows": ev_rows, "projects": conf, "unmapped": unm_rows, "drawings": drawings,
+                                                              "domain_sheets": eng.domain_sheets}
 
 
 EVIDENCE_HEADER = ["project", "assembly", "refs_total", "refs_resolved", "refs_external", "refs_ambiguous", "refs_unresolved", "parts_link", "parts_folder",
@@ -902,12 +914,17 @@ def tool_in_tag(tag):
 
 
 
-def write_small_csvs(out, compiled, stats, review, confidence, unmapped):
+def write_small_csvs(out, compiled, stats, review, confidence, unmapped, domain_sheets=None):
     def dump(name, header, rows):
         with open(out / name, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.writer(f)
             w.writerow(header)
             w.writerows([_csv_safe(v) for v in r] for r in rows)
+    for sheet, rows in (domain_sheets or {}).items():
+        if rows:
+            dump(f"Domain_{sheet}.csv", domain_metrics.SHEETS[sheet], rows)
+    if any((domain_sheets or {}).values()):
+        dump("Metric_Notes.csv", ["sheet", "column", "status", "rule used"], [n for n in domain_metrics.NOTES if (domain_sheets or {}).get(n[0])])
     dump("Project_Compiled.csv", HEADINGS, compiled)
     dump("Project_Stats.csv", STATS_HEADER, stats)
     dump("Review.csv", ["project", "topic", "detail"], review)
@@ -1001,7 +1018,7 @@ def _filtered_tabs(wb, title, header, sink, keep, max_sheets, numeric=()):
         _sheet(wb, title if k == 0 else f"{title} ({k + 1})", header, itertools.chain([first] if first is not None else [], chunk), numeric=numeric)
 
 
-def write_domain_workbooks(out, compiled, stats, review, confidence, sinks, max_sheets=3):
+def write_domain_workbooks(out, compiled, stats, review, confidence, sinks, max_sheets=3, domain_sheets=None):
     """The split by domain: by-domain/compiled_<Domain>.xlsx for every domain, holding the usual tabs for that domain's projects only
     (Project Compiled, Assembly Breakdown, Drawing Breakdown, Project Stats, Assembly Confidence / Evidence, Review). File Level stays in the
     main workbook. -> {domain: number of projects}."""
@@ -1019,6 +1036,7 @@ def write_domain_workbooks(out, compiled, stats, review, confidence, sinks, max_
         _filtered_tabs(wb, "Assembly Breakdown", ASSEMBLY_HEADINGS, sinks.assemblies, keep, max_sheets, numeric={2, 3, 4, 5})
         _filtered_tabs(wb, "Drawing Breakdown", DRAWING_HEADINGS, sinks.drawings, keep, max_sheets, numeric={4, 5})
         _sheet(wb, "Project Stats", STATS_HEADER, [r for r in stats if r[0] in keep])
+        _domain_tabs(wb, domain_sheets, keep)
         conf = [r for r in confidence if r["project"] in keep]
         if conf:
             _sheet(wb, "Assembly Confidence", CONFIDENCE_HEADER, [[r[h] for h in CONFIDENCE_HEADER] for r in conf])
@@ -1029,7 +1047,19 @@ def write_domain_workbooks(out, compiled, stats, review, confidence, sinks, max_
     return done
 
 
-def write_workbook(path, compiled, stats, review, confidence, unmapped, sinks, max_sheets=3):
+def _domain_tabs(wb, domain_sheets, keep=None):
+    """The Mechanical / Architecture / Electronics tabs (only the ones with projects) and the Metric Notes tab that says how every column was made."""
+    shown = []
+    for sheet, rows in (domain_sheets or {}).items():
+        rows = [r for r in rows if keep is None or r[0] in keep]
+        if rows:
+            _sheet(wb, sheet, domain_metrics.SHEETS[sheet], rows)
+            shown.append(sheet)
+    if shown:
+        _sheet(wb, "Metric Notes", ["sheet", "column", "status", "rule used"], [list(n) for n in domain_metrics.NOTES if n[0] in shown], color="FF6B4F00")
+
+
+def write_workbook(path, compiled, stats, review, confidence, unmapped, sinks, max_sheets=3, domain_sheets=None):
     wb = Workbook(write_only=True)
     _sheet(wb, "Project Compiled", HEADINGS, compiled, numeric=set(range(4, 9)))
     left = {}
@@ -1038,6 +1068,7 @@ def write_workbook(path, compiled, stats, review, confidence, unmapped, sinks, m
     left["File Level"] = _sheets(wb, "File Level", FILE_HEADER, sinks.files, max_sheets, numeric={5})
     _sheet(wb, "Project Stats", STATS_HEADER, stats)
     _sheet(wb, "By Domain", BY_DOMAIN_HEADER, by_domain_rows(compiled, stats), numeric=set(range(1, 10)))
+    _domain_tabs(wb, domain_sheets)
     if confidence:
         _sheet(wb, "Assembly Confidence", CONFIDENCE_HEADER, [[r[h] for h in CONFIDENCE_HEADER] for r in confidence])
         left["Assembly Evidence"] = _sheets(wb, "Assembly Evidence", EVIDENCE_HEADER, sinks.evidence, max_sheets, numeric=set(range(2, 14)))
@@ -1073,7 +1104,7 @@ QUICK_BY_EXT = ["extension", "class", "native_software", "domain", "files", "siz
 QUICK_BY_PROJECT = ["project", "files", "size_GB", "parts", "assemblies", "native_2d_drawings", "neutral_3d", "pdf", "other_files", "top_extensions"]
 QUICK_OVERVIEW = ["class", "meaning", "files", "size_GB", "share_of_files_pct"]
 CLASS_MEANING = {"PART": "native part / single-file model", "ASSEMBLY": "native assembly", "DRAWING": "native 2D drawing", "NEUTRAL3D": "neutral 3D exchange file (STEP, IGES, STL ...)",
-                 "PDF": "PDF", "SIM": "simulation", "DOC": "document", "DATA": "data / backup / log", "IMG": "image", "ARCHIVE": "archive", "OTHER": "other",
+                 "PDF": "PDF", "EDA": "electronics design file (schematic, PCB layout, gerber, library ...)", "SIM": "simulation", "DOC": "document", "DATA": "data / backup / log", "IMG": "image", "ARCHIVE": "archive", "OTHER": "other",
                  "UNMAPPED": "extension not in extensions.csv"}
 
 
@@ -1199,16 +1230,16 @@ def main():
     sinks.assemblies.close(keep_empty=False)
     sinks.evidence.close(keep_empty=bool(eng.confidence))
     sinks.drawings.close(keep_empty=False)
-    write_small_csvs(out, compiled, stats, review, eng.confidence, unmapped)
+    write_small_csvs(out, compiled, stats, review, eng.confidence, unmapped, eng.domain_sheets)
     if eng.unreadable_rows:
         with open(out / "Unreadable.csv", "w", newline="", encoding="utf-8-sig") as f:
             w = csv.writer(f)
             w.writerow(["project", "kind", "path", "reason"])
             w.writerows([_csv_safe(v) for v in r] for r in eng.unreadable_rows)
     if Workbook:
-        write_workbook(out / "compiled.xlsx", compiled, stats, review, eng.confidence, unmapped, sinks, a.xlsx_max_sheets)
+        write_workbook(out / "compiled.xlsx", compiled, stats, review, eng.confidence, unmapped, sinks, a.xlsx_max_sheets, eng.domain_sheets)
         if not a.no_split_by_domain:
-            split = write_domain_workbooks(out, compiled, stats, review, eng.confidence, sinks, a.xlsx_max_sheets)
+            split = write_domain_workbooks(out, compiled, stats, review, eng.confidence, sinks, a.xlsx_max_sheets, eng.domain_sheets)
             if split:
                 print("split by domain -> by-domain/: " + ", ".join(f"{d} ({n} projects)" for d, n in split.items()))
             else:

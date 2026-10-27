@@ -94,6 +94,7 @@ ACAD_VERSIONS = {  # DWG/DXF $ACADVER codes -> versions (closed list)
 }
 DXF_3D_ENTITIES = (b"3DSOLID", b"3DFACE", b"MESH", b"SURFACE", b"BODY", b"REGION")
 TEXT_FORMATS = [  # (lowercase pattern in first 4 KB, tag) - first match wins; tags are fixed strings
+    (b"(kicad_pcb", "EDA:KiCad"), (b"(kicad_sch", "EDA:KiCad"), (b"(kicad_symbol_lib", "EDA:KiCad"), (b"(kicad_wks", "EDA:KiCad"),
     (b"1upgm               calculix", "SIM:CalculiX"),
     (b"summary of c0nvergence", "SIM:CalculiX"),
     (b"summary of job information", "SIM:CalculiX"),
@@ -175,6 +176,8 @@ def _signature_file(f, ext):
     low = head.lower()
     if head.startswith(OLE_MAGIC):
         return _ole_tag(f, head)
+    if head.lstrip()[:5] == b"<?xml" and b"<eagle" in low:        # Eagle schematics / boards / libraries are XML with an <eagle> root
+        return "EDA:Eagle"
     if b"iso-10303-21" in low[:64]:                       # STEP / Part 21
         ap = "AP"
         m = re.search(rb"file_schema\s*\(\s*\(\s*'([^']*)'", low)

@@ -4,7 +4,7 @@ description: >-
   Turns the output of the Folder Profiler into the usual Projects Compiled workbook. Takes either zip the profiler makes - the step-2 full
   profile (profile_<folder>_<date>.zip) or the step-1 quick count (quick_<folder>_<date>.zip) - one zip or a folder of them. Step 2 gives
   compiled.xlsx: Project Compiled (the 11-column template), Assembly Breakdown, Drawing Breakdown (with AutoCAD sheet counts and
-  confidence), File Level, Project Stats, Review, plus one workbook per domain (Architecture / Mechanical / Electronics). Step 1 gives
+  confidence), File Level, Project Stats, Review, plus one workbook per domain (Architecture / Mechanical / Electronics) and the domain metric tabs of the template. Step 1 gives
   quick_count.xlsx: file counts by class, extension and project. Use when the user hands over profiler zips, or asks for the compiled project
   sheet, CAD file counts per project, the assembly or drawing breakdown, sheet counts, the domain split, or extension counts from a profile.
   Runs locally; never uploads anything.
@@ -17,7 +17,7 @@ The Folder Profiler runs on the data owner's machine in two steps and writes one
 | Input zip | Made by | You produce |
 |---|---|---|
 | `quick_<folder>_<date>.zip` | **step 1**, quick count (file types, counts, sizes; nothing opened) | `quick_count.xlsx` (+ 3 CSVs): Overview by file class, By Extension, By Project |
-| `profile_<folder>_<date>.zip` | **step 2**, full profile (names, references inside assemblies / drawings, AutoCAD sheets) | `compiled.xlsx` (+ CSVs): Project Compiled, Assembly Breakdown, Drawing Breakdown, File Level, Project Stats, Assembly Confidence / Evidence, Unmapped Extensions, Review; and `by-domain/compiled_<Domain>.xlsx` |
+| `profile_<folder>_<date>.zip` | **step 2**, full profile (names, references inside assemblies / drawings, AutoCAD sheets) | `compiled.xlsx` (+ CSVs): Project Compiled, Assembly Breakdown, Drawing Breakdown, File Level, Project Stats, By Domain, the Mechanical / Architecture / Electronics tabs + Metric Notes, Assembly Confidence / Evidence, Unmapped Extensions, Review; and `by-domain/compiled_<Domain>.xlsx` |
 
 `run_stats_*.zip` files are run statistics, not data - ignore them. Both kinds of zip can be given together; the script recognises each.
 Every classification decision (part / assembly / drawing / neutral, software, domain) is made here, from the editable tables in
@@ -107,6 +107,13 @@ Names are always checked too: if they agree with the tools the confidence rises,
 
 **Split by domain (default):** besides `compiled.xlsx` the skill writes `by-domain/compiled_<Domain>.xlsx` for every domain it found (Architecture, Mechanical, Electronics, Unclassified ...), each holding the usual tabs (Project Compiled, Assembly Breakdown, Drawing Breakdown, Project Stats, Assembly Confidence / Evidence, Review) for THAT domain's projects only; File Level stays in the main workbook. The domain workbooks together hold exactly the rows of the main one (nothing lost or duplicated; tested). The main workbook gets a `By Domain` tab and `By_Domain.csv` (projects, files, size, parts, assemblies, drawings, PDF drawings, neutral 3D, drawing sheets and the project names per domain). The split uses each project's domain label (see "How the domain is decided") - it does not change which project a file belongs to. It is skipped when all projects share one domain, and `--no-split-by-domain` turns it off. Step-1 (quick count) zips have no project domains and are not split.
 
+**Domain sheets (Mechanical / Architecture / Electronics tabs):** the workbook also has one tab per domain found, laid out exactly like the user's template sheet (`Script_Output_Template.xlsx`; headings are never changed), one row per project of that domain, plus a `Metric Notes` tab that states for EVERY column how it was made (`calculated` / `approximation` / `not calculated - definition unclear`). Also written as `Domain_Mechanical.csv`, `Domain_Architecture.csv`, `Domain_Electronics.csv` and `Metric_Notes.csv`, and each `by-domain/compiled_<Domain>.xlsx` carries its own sheet and notes. Rules (all in `scripts/domain_metrics.py`, constants at the top):
+- A metric whose definition is unclear or whose data is not in the profile is left **blank in every row**, never guessed: Mechanical `Design History Present Assembly`, `BOM Present (Y/N)`, `Neutral Export Assembly Ratio`; Electronics `Labelled Electronics but No EDA Files`.
+- `Stub Parts <10 KB %` = part files under 10,240 bytes, only for mechanical-native formats (SketchUp and other small-by-nature formats are excluded); `Assemblies >= 10 (Y/N)` uses the template comment's threshold of 25; `Repeated Library Copy Flag` = the same extension with >= 50 files in >= 3 projects with the same count; images are > 500 KB and videos are not images.
+- Vendor shares (`Share of Vendor Model Files %`, `Share of Vendor EDA Files %`) add up to 100 across the vendor's projects of that domain.
+- EDA files (schematic, PCB, Gerber, drill, netlist, simulation, library, pick-and-place; `mapping/eda_roles.csv`) are class `EDA`: they are NOT counted as Native 2D Drawings. Eagle and KiCad files are recognised by content (profiler 1.7+), so `.sch` / `.brd` belong to the right tool. `Project_Stats.csv` has an `eda_files` column.
+- Always say in your answer which columns are blank and why (read the `Metric Notes` tab); do not offer a number for them.
+
 **Drawing Breakdown tab (drawing level):** one row per drawing file - every native 2D drawing (DWG, DXF, SLDDRW, DFT, IDW, DRW, CATDRAWING ...) and every PDF counted as a drawing - with `Format`, `Native CAD Software`, `Sheets`, `Sheets Confidence`, `Assembly` and `Assembly Method`. The assembly comes from, in order: the file references of the drawing (`link`, also through the part it documents), a matching file name (`name`), the one assembly in its folder (`folder` / `spread`); with several assemblies in its folder the cell stays empty and the method says how many candidates ("folder: 2 candidate assemblies"). Rows add up to Native 2D Drawings + PDF Drawings of Project Compiled; the Review line says how many were placed each way. Also written as `Drawing_Breakdown.csv` (parts of 1,000,000 rows). At level 0 file names are not recorded, so rows carry "(name not recorded: level 0 profile)". Sheet counts are for AutoCAD files only; PDF page counts are not read.
 
 **Sheets of AutoCAD drawings (profiler 1.7+, level 2):** **Every AutoCAD drawing file counts as at least 1 sheet:** a DWG/DXF with only the Model tab (0 layouts) and one that could not be read (AutoCAD 2007, damaged, ...) both count as 1, and a `Sheets Basis` column says which is which (`counted` / `model tab only - counted as 1` / `not read - assumed 1`); the confidence stays the file's own (0 when unread), and `Project_Stats` keeps the three kinds apart (`sheet_files_counted`, `sheet_files_model_only`, `sheet_files_assumed`). A profile made without sheet counting (an older profiler, or level < 2) gives 1 per DWG/DXF too, marked `profile has no sheet data - assumed 1`. Other drawing formats (SLDDRW, DFT ...) are not counted and stay blank. `File_Level.csv` has `sheets` (as read, blank if unread), `sheets_confidence`, `sheets_status`, `sheets_used` and `sheets_basis` per DWG/DXF; `Project_Stats.csv` has `drawing_sheets`, `sheet_files_counted`, `sheet_files_not_counted`, `sheets_confidence_avg`, `sheets_confidence_min`; Review.csv says, per project, how many sheets, in how many files, with what confidence and why some were not counted (AutoCAD 2007 files are not supported; R13/R14 have no layouts). The confidence is computed on each file from checks on its own structure (DXF 99, DWG at most 95); it is NOT a probability of being right in every case. Validated on public test drawings (21 of 21 equal to the DXF export), not yet against AutoCAD's own count on client drawings - say so when you quote totals. The 11-column Project Compiled tab does not change; "Native 2D Drawings" still counts files.
@@ -169,7 +176,7 @@ duplicate; the compiler treats blank as unique).
 ## Categorisation and empty tabs
 
 - Classes come from `scripts/mapping/extensions.csv` (140 extensions, built from real CAD folders: Solid Edge `.pwd` weldments are assemblies, `.jt/.sat/.3dxml/.cgr` neutral 3D,
-  `.dgn` drawings, `.bak/.cfg/.dwl/.dwt/.dll/...` data, media as images). Creo version suffixes (`part.prt.7`) are resolved to `.prt`.
+  `.dgn` drawings, `.bak/.cfg/.dwl/.dwt/.dll/...` data, images as images, videos as OTHER). Creo version suffixes (`part.prt.7`) are resolved to `.prt`.
 - If an extension is unknown the file is classified by its **content tag** (STEP/IFC/IGES -> neutral 3D, DXF/DWG -> drawing, PDF -> document, ZIP -> archive ...). `Review.csv` has one
   `categorisation` line (how many by extension / by content / unmapped, and the % of bytes) and `Unmapped_Extensions.csv` lists what is still unknown with the tags seen - propose
   table rows for it.
@@ -179,7 +186,7 @@ duplicate; the compiler treats blank as unique).
 ## Editing the rules
 
 `scripts/mapping/extensions.csv` — `ext,class,software,domain,note`. Classes: `PART ASSEMBLY DRAWING NEUTRAL3D PDF
-SIM DOC DATA IMG ARCHIVE OTHER` (an unknown class aborts the run). `scripts/mapping/software_domain.csv` —
+SIM EDA DOC DATA IMG ARCHIVE OTHER` (an unknown class aborts the run). `scripts/mapping/software_domain.csv` —
 `tag,display,domain,role` (role `general` = no domain of its own); `scripts/mapping/domain_keywords.csv` — `domain,pattern` (regular expressions on file / folder names).
 
 For each *unmapped extension* in `Review.csv`, **propose** a row (class, software, domain) and wait for the user's yes

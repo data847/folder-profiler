@@ -23,7 +23,7 @@ check("Creo 'part.prt.12' is a part, not a '.12' file", [fp.ext_of(n) for n in (
       ["prt", "asm", "drw", "12", "c", "(none)", "(none)"])
 # --- the table covers what real data showed
 want = {"pwd": "ASSEMBLY", "jt": "NEUTRAL3D", "sat": "NEUTRAL3D", "3dxml": "NEUTRAL3D", "cgr": "NEUTRAL3D", "dgn": "DRAWING", "cfg": "DATA", "bak": "DATA",
-        "dwl": "DATA", "dwt": "DATA", "ctb": "DATA", "ipj": "DATA", "dll": "DATA", "exe": "DATA", "mp4": "IMG", "par": "PART", "asm": "ASSEMBLY", "dft": "DRAWING"}
+        "dwl": "DATA", "dwt": "DATA", "ctb": "DATA", "ipj": "DATA", "dll": "DATA", "exe": "DATA", "mp4": "OTHER", "par": "PART", "asm": "ASSEMBLY", "dft": "DRAWING"}
 check("extension table classes for formats seen in real CAD folders", {e: em[e]["class"] for e in want if e in em}, want)
 check("fallback by content: STEP/DXF/PDF/ZIP starts classify unknown extensions", [cp.class_from_signature(s) for s in ("STEP:AP214:SolidWorks", "DXF:AC1027:3D", "DWG:AC1032", "PDF", "ZIP", "TEXT", "BINARY")],
       ["NEUTRAL3D", "DRAWING", "DRAWING", "DOC", "ARCHIVE", None, None])

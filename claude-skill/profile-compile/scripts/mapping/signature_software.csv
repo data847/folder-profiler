@@ -4,3 +4,5 @@ OLE2:Inventor,Inventor,entry names RSeDb/RSeSegInfo - not yet checked on real In
 OLE2:Revit,Revit,entry name BasicFileInfo - not yet checked on real Revit files
 CATIA:V5,CATIA,file starts with V5_CFV2 - not yet checked on real CATIA files
 CREO,Creo,file starts with #UGC: - not yet checked on real Creo files
+EDA:Eagle,Eagle,file contains an <eagle> XML root - decides .sch / .brd that two programs share
+EDA:KiCad,KiCad,file starts with a (kicad_...) s-expression
