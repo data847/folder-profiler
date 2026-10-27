@@ -74,6 +74,10 @@ import sysmetrics
 from sysmetrics import now_utc
 
 VERSION = "1.7"
+try:
+    import name_anon
+except ImportError:          # optional feature: the profiler works without it, the option is then refused
+    name_anon = None
 HEAD_BYTES = 4096            # header peek for every file
 DXF_SCAN_BYTES = 1_048_576   # DXF only: scan up to 1 MB for 3D entity names (flag only, text discarded)
 
@@ -607,7 +611,18 @@ def unreadable_csv(units, rows, with_paths=True, files_with_paths=True):
     return out
 
 
-def quick_scan(root, out_dir, log=print, label=None, folders=None, workers=None, progress=None, project_depth=None):
+def _name_map(flag):
+    """A NameMap when name anonymisation is asked for (argument, else env PROFILER_ANON_NAMES), else None."""
+    if flag is None:
+        flag = os.environ.get("PROFILER_ANON_NAMES", "").lower() in ("1", "true", "yes")
+    if not flag:
+        return None
+    if name_anon is None:
+        raise SystemExit("name anonymisation needs name_anon.py next to file_profiler.py")
+    return name_anon.NameMap()
+
+
+def quick_scan(root, out_dir, log=print, label=None, folders=None, workers=None, progress=None, project_depth=None, anonymize_names=None):
     """STEP 1 - the quick count: how many files of each type, and how big, per project and overall. Metadata only: no file is opened,
     no archive is looked into, nothing is read - just the folder listings the operating system already holds (see scan_tree). Writes
     quick_<name>_<stamp>.zip: Extensions.csv (per project), Extensions_All.csv, Projects.csv, Unreadable.csv, Run_info.csv.
@@ -637,23 +652,32 @@ def quick_scan(root, out_dir, log=print, label=None, folders=None, workers=None,
         w.writerow(header)
         w.writerows(rows)
         return ("\ufeff" + buf.getvalue()).encode("utf-8")
+    nm = _name_map(anonymize_names)
+    pname = (lambda n: nm.project(n)) if nm else (lambda n: n)
     ext_rows = [[units[ui][0], ext, n, b, b // max(1, n)] for (ui, ext), (n, b) in sorted(ext_stats.items(), key=lambda kv: (units[kv[0][0]][0].lower(), -kv[1][0]))]
     all_rows = [[ext, n, b, f"{100 * n / max(1, nfiles):.2f}", f"{100 * b / max(1, nbytes):.2f}"] for ext, (n, b) in sorted(overall.items(), key=lambda kv: -kv[1][0])]
     proj_rows = [[units[ui][0], v[0], v[1], v[2]] for ui, v in sorted(proj.items(), key=lambda kv: units[kv[0]][0].lower())]
     # step 1 records no file names: unreadable FOLDERS are listed (the owner needs to know which), unreadable files only counted per project
     bad_rows = unreadable_csv(units, res["unreadable"], with_paths=True, files_with_paths=False)
-    info = [["tool_version", VERSION], ["run_utc", now_utc()], ["mode", "quick count (step 1)"], ["os", platform.platform()], ["folder_name", label],
+    if nm:                                  # only the output is renamed: project names, folder paths of unreadable folders, the root folder name
+        for u in units:
+            nm.project(u[0])                # codes follow the order of the projects
+        ext_rows = [[pname(r[0])] + r[1:] for r in ext_rows]
+        proj_rows = [[pname(r[0])] + r[1:] for r in proj_rows]
+        bad_rows = [[pname(r[0]), r[1], nm.folder_path(r[2]) if r[1] == "folder" else r[2], r[3]] for r in bad_rows]
+    info = [["tool_version", VERSION], ["run_utc", now_utc()], ["mode", "quick count (step 1)"], ["os", platform.platform()], ["folder_name", nm.root(label) if nm else label],
             ["projects", len(units)], ["project_depth", project_depth], ["files", nfiles], ["total_bytes", nbytes], ["folders", total["dirs"]],
             ["deepest_folder_level", total["max_depth"]], ["distinct_extensions", len(overall)], ["unreadable_folders", total["dir_errors"]],
             ["read_errors", total["errors"]], ["linked_folders_skipped", total["links_skipped"]], ["ignored_system_files", total["junk"]],
             ["cloud_tiered_files", total["tiered_files"]], ["deduplicated_files", total["dedup_files"]], ["network_retries", total["retries"]],
             ["threads", nthreads], ["seconds", round(secs, 1)], ["files_per_s", round(nfiles / max(secs, 0.01))],
-            ["files_opened", 0], ["hashing", "none"]]
+            ["files_opened", 0], ["hashing", "none"], ["names_anonymized", "yes" if nm else "no"]]
     what = ("This archive was made by the Folder Profiler QUICK COUNT (step 1).\r\n"
             "It lists, per project folder and overall, how many files of each type there are and how big they are. No file was opened,\r\n"
             "no archive was looked into, and no file names are recorded - only the project (folder) names, the file types, and the names of\r\n"
             "any folders that could not be read (Unreadable.csv).\r\n"
-            "Extensions.csv (per project), Extensions_All.csv (whole folder), Projects.csv, Unreadable.csv, Run_info.csv. Open them with Excel or Notepad.\r\n")
+            "Extensions.csv (per project), Extensions_All.csv (whole folder), Projects.csv, Unreadable.csv, Run_info.csv. Open them with Excel or Notepad.\r\n"
+            + ("Names are ANONYMISED: project and folder names are codes (P-xxxx-nnnn, D-xxxx-nnnnnn). The owner keeps the name map separately.\r\n" if nm else ""))
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr("Extensions.csv", csv_bytes(["project", "ext", "file_count", "total_bytes", "avg_bytes"], ext_rows))
         z.writestr("Extensions_All.csv", csv_bytes(["ext", "file_count", "total_bytes", "share_of_files_pct", "share_of_bytes_pct"], all_rows))
@@ -661,8 +685,11 @@ def quick_scan(root, out_dir, log=print, label=None, folders=None, workers=None,
         z.writestr("Unreadable.csv", csv_bytes(["project", "kind", "path", "reason"], bad_rows))
         z.writestr("Run_info.csv", csv_bytes(["key", "value"], info))
         z.writestr("WHAT_IS_IN_THIS_ZIP.txt", what.encode("utf-8"))
+    map_zip = ""
+    if nm:
+        map_zip = nm.write_zip(os.path.join(out_dir, f"name_map_{re.sub(r'[^A-Za-z0-9_.-]', '_', label)}_{stamp}.zip"), label)
     LAST_RUN.clear()
-    LAST_RUN.update(quick_zip=zip_path, top=[[e, n, b] for e, n, b, *_ in all_rows[:12]], total_bytes=nbytes, distinct_extensions=len(overall),
+    LAST_RUN.update(map_zip=map_zip, quick_zip=zip_path, top=[[e, n, b] for e, n, b, *_ in all_rows[:12]], total_bytes=nbytes, distinct_extensions=len(overall),
                     seconds=round(secs, 1))
     log(f"quick count: {nfiles:,} files, {nbytes / 1e9:.1f} GB, {len(overall)} file types in {len(units)} projects, {secs:.1f}s "
         f"({nfiles / max(secs, 0.01):,.0f} files/s; unreadable folders {total['dir_errors']}, linked folders skipped {total['links_skipped']}"
@@ -672,7 +699,7 @@ def quick_scan(root, out_dir, log=print, label=None, folders=None, workers=None,
 
 def profile(root, out_dir, log=print, label=None, folders=None, workers=None, progress=None,
             anonymize_assembly_names=None, tier=None, project_depth=None,
-            resume=True, metrics_interval=None, system_info=True, chunk_files=None):
+            resume=True, metrics_interval=None, system_info=True, chunk_files=None, anonymize_names=None):
     """Profile a folder tree. Streaming and resumable: every project is processed in chunks that are saved to
     <out_dir>/.resume/<run id>/ as they finish; a run that stops (crash, power cut, Ctrl+C) continues from the last saved chunk when
     started again with the same settings. The state is deleted when the run completes. Nothing is ever hashed except folder
@@ -688,7 +715,8 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
     if tier == 2 and cad_links is None:
         raise SystemExit("detail level 2 needs cad_links.py next to file_profiler.py")
     project_depth = max(1, env_int("PROFILER_PROJECT_DEPTH", 1) if project_depth is None else int(project_depth))
-    if tier >= 1:
+    nm = _name_map(anonymize_names)
+    if tier >= 1 or nm:                     # with name anonymisation the assembly names follow the same map as every other name
         anonymize_assembly_names = False
     if anonymize_assembly_names is None:
         anonymize_assembly_names = os.environ.get("PROFILER_ANON_ASM", "").lower() in ("1", "true", "yes")
@@ -696,10 +724,14 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
     # ---- what to profile
     units, label, data_paths = resolve_units(root, folders, label, project_depth)
     workers = max(1, workers or default_workers(data_paths))
+    if nm:
+        for u in units:
+            nm.project(u[0])                # codes follow the order of the projects
+    shown = (lambda n: nm.project(n)) if nm else (lambda n: n)      # project name as it may appear in the run log
 
     # ---- run identity, checkpoint state
     cfg = json.dumps({"v": VERSION, "units": [[u[0], u[1], u[2]] for u in units], "tier": tier, "depth": project_depth,
-                      "anon": bool(anonymize_assembly_names),
+                      "anon": bool(anonymize_assembly_names), "anon_names": bool(nm),
                       "chunk": chunk_files}, sort_keys=True)
     run_id = f"{zlib.crc32(cfg.encode()):08x}{zlib.adler32(cfg.encode()):08x}"
     state_dir = os.path.join(out_dir, ".resume", run_id)
@@ -853,17 +885,17 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
                 if not same:
                     u["complete"] = False                         # changed since it was saved: the chunk check below redoes what differs
                     C["stale_projects"] += 1
-                    rlog.event("process", f"[{ui + 1}/{len(units)}] {proj}: changed since it was saved in an earlier run - checking it again", "WARN")
+                    rlog.event("process", f"[{ui + 1}/{len(units)}] {shown(proj)}: changed since it was saved in an earlier run - checking it again", "WARN")
                 else:
-                    rlog.event("process", f"[{ui + 1}/{len(units)}] {proj}: unchanged since an earlier run ({time.time() - t_v:.1f}s check) - skipped")
+                    rlog.event("process", f"[{ui + 1}/{len(units)}] {shown(proj)}: unchanged since an earlier run ({time.time() - t_v:.1f}s check) - skipped")
                     continue
             elif u.get("complete"):
-                rlog.event("process", f"[{ui + 1}/{len(units)}] {proj}: already done in an earlier run - skipped")
+                rlog.event("process", f"[{ui + 1}/{len(units)}] {shown(proj)}: already done in an earlier run - skipped")
                 continue
             t_unit = time.time()
             chunks_done = u.get("chunks_done", 0)
             if chunks_done:
-                rlog.event("process", f"[{ui + 1}/{len(units)}] {proj}: resuming after chunk {chunks_done}")
+                rlog.event("process", f"[{ui + 1}/{len(units)}] {shown(proj)}: resuming after chunk {chunks_done}")
                 state["files"] += min(u.get("files", 0), chunks_done * chunk_files)
             n = 0
             pending, chunk_idx = [], 0
@@ -882,7 +914,7 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
                         return
                     C["stale_chunks"] += 1               # the folder changed since this chunk was saved: profile it again
                     state["files"] -= min(len(pending), state["files"])
-                    rlog.event("process", f"{proj}: chunk {chunk_idx + 1} was saved before the folder changed - profiled again", "WARN")
+                    rlog.event("process", f"{shown(proj)}: chunk {chunk_idx + 1} was saved before the folder changed - profiled again", "WARN")
                 t_c = time.time()
 
                 def work(e):
@@ -946,7 +978,7 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
                     fps.insert(chunk_idx, fp)
                     u["chunks_done"] = max(u.get("chunks_done", 0), chunk_idx + 1)
                     save_manifest()
-                rlog.event("process", f"{proj}: chunk {chunk_idx + 1} saved ({len(rows):,} files, {time.time() - t_c:.1f}s)")
+                rlog.event("process", f"{shown(proj)}: chunk {chunk_idx + 1} saved ({len(rows):,} files, {time.time() - t_c:.1f}s)")
                 if _TEST_HOOK:
                     _TEST_HOOK(ui, chunk_idx)
                 chunk_idx += 1
@@ -992,7 +1024,7 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
             n_loose = n
             if n != u.get("files", n):
                 C["changed_projects"] += 1
-                rlog.event("process", f"{proj}: the folder changed while profiling or between restarts ({u.get('files')} files when counted, "
+                rlog.event("process", f"{shown(proj)}: the folder changed while profiling or between restarts ({u.get('files')} files when counted, "
                                        f"{n} now) - run with --fresh if you need an exact result for this project", "WARN")
             # ---- project finished: remember its folder tree, mark it complete
             with act.timer("write_checkpoint"):
@@ -1001,7 +1033,7 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
                 u["complete"] = True
                 u["loose_files"] = n_loose
                 save_manifest()
-            rlog.event("process", f"[{ui + 1}/{len(units)}] {proj}: done ({n_loose:,} files, {time.time() - t_unit:.1f}s)")
+            rlog.event("process", f"[{ui + 1}/{len(units)}] {shown(proj)}: done ({n_loose:,} files, {time.time() - t_unit:.1f}s)")
         man["process_s"] += time.time() - t_proc0
         save_manifest()
     except BaseException as exc:
@@ -1047,8 +1079,23 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
             for ui in range(len(units)):
                 for fpath in chunk_files_of("rows", ui):
                     text = open(fpath, encoding="utf-8", newline="").read()
-                    out.write(text.encode("utf-8"))
-                    for row in csv.reader(io.StringIO(text)):
+                    rows_in = csv.reader(io.StringIO(text))
+                    if nm:                                         # rename on the way out: project, assembly name, path
+                        renamed = []
+                        for row in rows_in:
+                            row[0] = nm.project(row[0])
+                            if row[8]:
+                                row[8] = nm.file(row[8])
+                            if tier >= 1:
+                                row[9] = nm.file_path(row[9])
+                            renamed.append(row)
+                        buf_ = io.StringIO(newline="")
+                        csv.writer(buf_, lineterminator="\r\n").writerows(renamed)
+                        out.write(buf_.getvalue().encode("utf-8"))
+                        rows_in = renamed
+                    else:
+                        out.write(text.encode("utf-8"))
+                    for row in rows_in:
                         proj_, ext_, size_, mod_ = row[0], row[2], int(row[3]), row[4]
                         p = proj_stats.setdefault(proj_, [0, 0, mod_, mod_, set()])
                         p[0] += 1; p[1] += size_; p[4].add(ext_)
@@ -1069,11 +1116,20 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
                 out.write(("﻿" + "project,file_no,ext,kind,parent,child\r\n").encode("utf-8"))
                 for ui in range(len(units)):
                     for fpath in chunk_files_of("links", ui):
-                        out.write(open(fpath, encoding="utf-8", newline="").read().encode("utf-8"))
+                        ltext = open(fpath, encoding="utf-8", newline="").read()
+                        if nm:                                     # project, the referencing product (STEP) and the referenced name
+                            lrows = [[nm.project(r[0]), r[1], r[2], r[3], nm.file(r[4]), nm.file(r[5])] for r in csv.reader(io.StringIO(ltext))]
+                            lbuf = io.StringIO(newline="")
+                            csv.writer(lbuf, lineterminator="\r\n").writerows(lrows)
+                            ltext = lbuf.getvalue()
+                        out.write(ltext.encode("utf-8"))
         put("Unreadable.csv", ["project", "kind", "path", "reason"],
-            [[proj_, kind, (rel if tier >= 1 else ""), why] for proj_, uu in man["units"].items() for rel, kind, why in uu.get("unreadable", [])])
+            [[nm.project(proj_) if nm else proj_, kind,
+              ((nm.folder_path(rel) if kind == "folder" else nm.file_path(rel)) if nm else rel) if tier >= 1 else "", why]
+             for proj_, uu in man["units"].items() for rel, kind, why in uu.get("unreadable", [])])
         put("Dirs.csv", ["dir_id", "project", "parent_dir_id", "depth"] + (["name"] if tier >= 1 else []),
-            [[d, v[0], v[1], v[2]] + ([v[3]] if tier >= 1 else [])
+            [[d, nm.project(v[0]) if nm else v[0], v[1], v[2]]
+             + ([(nm.project(v[3]) if v[2] == 0 and v[3] == v[0] else nm.folder(v[3])) if nm else v[3]] if tier >= 1 else [])
              for d, v in sorted(all_dirs.items(), key=lambda kv: (kv[1][0], kv[1][2], kv[0]))])
         put("Projects.csv", ["project", "file_count", "total_bytes", "distinct_extensions", "first_modified_utc", "last_modified_utc"],
             [[p, s[0], s[1], len(s[4]), s[2], s[3]] for p, s in sorted(proj_stats.items())])
@@ -1084,9 +1140,10 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
         busy, calls = act.snapshot()
         proc_s = man["process_s"]
         info = [["tool_version", VERSION], ["run_utc", now_utc()], ["os", platform.platform()], ["python", platform.python_version()],
-                ["folder_name", label], ["mode", "docker" if os.environ.get("PROFILER_IN_DOCKER") else "native"],
+                ["folder_name", nm.root(label) if nm else label], ["mode", "docker" if os.environ.get("PROFILER_IN_DOCKER") else "native"],
                 ["projects", len(units)], ["workers", workers], ["files", nfiles_out], ["total_bytes", bytes_out],
-                ["hashing", "none"], ["assembly_names", "anonymized" if anonymize_assembly_names else "real"],
+                ["hashing", "none"], ["assembly_names", "anonymized" if (anonymize_assembly_names or nm) else "real"],
+                ["names_anonymized", "yes" if nm else "no"],
                 ["detail_level", tier], ["project_depth", project_depth],
                 ["link_files_read", C["link_read"]],
                 ["link_files_unreadable", C["link_unreadable"]], ["read_errors", C["errors"]],
@@ -1102,7 +1159,7 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
                 ["avg_MB_per_s", round(bytes_out / 1e6 / max(1.0, proc_s + man["prescan_s"]), 1)],
                 ["avg_files_per_s", round(nfiles_out / max(1.0, proc_s + man["prescan_s"]))]]
         put("Run_info.csv", ["key", "value"], info)
-        z.writestr("WHAT_IS_IN_THIS_ZIP.txt", what_is(tier, anonymize_assembly_names).encode("utf-8"))
+        z.writestr("WHAT_IS_IN_THIS_ZIP.txt", what_is(tier, anonymize_assembly_names, bool(nm)).encode("utf-8"))
         # ---- shareable run statistics
         phases = [["phase", "wall_seconds", "files", "GB", "MB_per_s", "files_per_s", "note"],
                   ["scan (count files and bytes)", round(man["prescan_s"], 1), total_files, round(total_bytes / 1e9, 2),
@@ -1130,20 +1187,23 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
         for name, data in log_files.items():
             z.writestr(name, data)
         z.writestr("README.txt", "Run statistics from the Folder Profiler: timings per step, a CPU / memory / read-speed sample every few seconds, and the "
-                                  "machine description. No file names, folder names or file contents. Safe to share.\r\n".encode("utf-8"))
+                                  "machine description. No file names or file contents; project folder names appear in Run_log.csv unless the run was made with name anonymisation.\r\n".encode("utf-8"))
     shutil.rmtree(state_dir, ignore_errors=True)
     try:
         os.rmdir(os.path.join(out_dir, ".resume"))
     except OSError:
         pass
-    LAST_RUN.update(zip=zip_path, stats_zip=stats_zip)
+    map_zip = ""
+    if nm:                                  # SEPARATE from the profile zip: whoever gets the profile cannot reverse the codes
+        map_zip = nm.write_zip(os.path.join(out_dir, f"name_map_{safe}_{stamp}.zip"), label)
+    LAST_RUN.update(zip=zip_path, stats_zip=stats_zip, map_zip=map_zip)
     return zip_path, len(units), nfiles_out, C["errors"]
 
 
 LAST_RUN = {}                # paths of the most recent run's zip and run-statistics zip (used by the browser UI)
 
 
-def what_is(tier, anonymized):
+def what_is(tier, anonymized, names_anon=False):
     head = ("This archive was made by the Folder Profiler (detail level %d). You can open every file in it with Excel or Notepad.\r\n\r\n" % tier)
     if tier == 0:
         body = ("It contains METRICS only: extensions, sizes, dates and short format tags (no file is hashed), plus anonymous\r\n"
@@ -1160,8 +1220,12 @@ def what_is(tier, anonymized):
                 "counted (columns sheets, sheets_conf of Files.csv); the layout names are not kept.\r\n"
                 "Unreadable.csv lists the folders and files that could not be read (so their access can be fixed); files that exist only in the cloud\r\n"
                 "(tiered / online-only) are listed but never opened.\r\n")
+    if names_anon:
+        body += ("NAMES ARE ANONYMISED: project, folder and file names (and the file names referenced in Links.csv) are replaced by codes - "
+                 "P-xxxx-nnnn, D-xxxx-nnnnnn, F-xxxx-nnnnnn - with the file extension kept. The same name always has the same code, so the structure is intact. "
+                 "The table of codes and real names is NOT in this zip; the data owner keeps it.\r\n")
     return head + body + ("Run_log.csv, Run_phases.csv, Run_metrics.csv and System_info.csv describe how the run went and what machine it ran\r\n"
-                          "on (no file or folder names). "
+                          "on (no file names; project folder names appear in Run_log.csv unless the names are anonymised). "
                           "Compressed files (zip, rar, 7z, tar ...) are counted as one file each; nothing is looked into them.\r\n")
 
 
@@ -1210,6 +1274,9 @@ def main(argv=None):
     ap.add_argument("--workers", type=int, help="parallel reader threads (default: auto, max 16; env PROFILER_WORKERS)")
     ap.add_argument("--anonymize-assembly-names", action="store_true",
                     help="write codes like ASM-3F9A1C2B.SLDASM instead of the real assembly file names")
+    ap.add_argument("--anonymize-names", action="store_true",
+                    help="optional: replace project, folder and file names in the OUTPUT by codes (extensions kept); the code-to-name table is written "
+                         "to a separate name_map_*.zip, never into the profile. Works for step 1 and step 2; files are never touched")
     ap.add_argument("--level", "--tier", dest="level", type=int, choices=[0, 1, 2], default=None,
                     help="detail level: 0 = metrics only, 1 = + file/folder names and paths, "
                          "2 (default) = + names of files referenced inside assemblies/drawings/STEP (env PROFILER_TIER)")
@@ -1233,7 +1300,8 @@ def main(argv=None):
     if a.quick:
         print(f"Quick count (step 1): {label or folder}\n(read-only; no file is opened; nothing is copied or sent anywhere)\n")
         try:
-            qz, nproj, nfiles, errors = quick_scan(folder, out_dir, label=label, workers=a.workers, project_depth=a.project_depth)
+            qz, nproj, nfiles, errors = quick_scan(folder, out_dir, label=label, workers=a.workers, project_depth=a.project_depth,
+                                                   anonymize_names=a.anonymize_names or None)
         except SystemExit as e:
             print(e)
             return 1
@@ -1250,7 +1318,8 @@ def main(argv=None):
                                                     anonymize_assembly_names=a.anonymize_assembly_names or None,
                                                     tier=a.level, project_depth=a.project_depth,
                                                     resume=not a.fresh, metrics_interval=a.metrics_interval,
-                                                    system_info=not a.no_system_info, chunk_files=a.chunk_files)
+                                                    system_info=not a.no_system_info, chunk_files=a.chunk_files,
+                                                    anonymize_names=a.anonymize_names or None)
     except SystemExit as e:
         print(e)
         return 1

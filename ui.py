@@ -62,6 +62,7 @@ table.qt{border-collapse:collapse}table.qt td,table.qt th{border:1px solid #8884
 <ul id="ls"></ul>
 <div id="selbox" style="display:none;margin-top:12px"><span class="mut" id="selcount"></span><ul id="sel" style="max-height:150px"></ul></div></div>
 <div class="card"><b>3. Run</b>
+<label style="display:block;margin-top:8px"><input type="checkbox" id="anonn"> Anonymise file and folder names in the result <span class="mut">(optional; applies to Step 1 and Step 2. Only the result is renamed, never your files. You also get a separate name map to keep private; extra time is negligible)</span></label>
 <label style="display:block;margin-top:8px"><input type="checkbox" id="fresh"> Start from scratch <span class="mut">(normally a stopped run continues where it stopped; tick this to ignore saved progress)</span></label>
 <div class="row" style="margin-top:8px"><button id="goquick" title="Counts the files of each type and their size. Nothing is opened, so it is very fast.">Step 1: quick count</button>
 <button id="go" title="The complete profile (file details, references inside assemblies, drawing sheets). Takes much longer.">Step 2: full profile</button></div>
@@ -111,7 +112,7 @@ const busy=v=>{$("go").disabled=v;$("goquick").disabled=v};
 async function start(kind){$("res").textContent="";$("bar").style.display="none";$("barlabel").textContent="";
  if(mode=="pick"&&!sel.length){$("res").innerHTML="<span class='er'>Tick at least one folder first.</span>";return}
  busy(true);
- const o={fresh:$("fresh").checked,kind:kind};
+ const o={fresh:$("fresh").checked,kind:kind,anon_names:$("anonn").checked};
  const body=mode=="pick"?{t:T,paths:sel,...o}:{t:T,path:$("p").value,...o};
  const r=await fetch("/api/start",{method:"POST",body:JSON.stringify(body)});const j=await r.json();
  if(j.error){$("res").innerHTML="<span class='er'>"+esc(j.error)+"</span>";busy(false);return}poll()}
@@ -132,10 +133,10 @@ async function poll(){const j=await (await fetch("/api/status?t="+T)).json();bar
  if(j.state=="done"&&j.result.quick){let t="<table class='qt'><tr><th>File type</th><th>Files</th><th>Size</th></tr>";
   j.result.top.forEach(x=>{t+="<tr><td>."+esc(x[0])+"</td><td>"+x[1].toLocaleString()+"</td><td>"+mb(x[2])+"</td></tr>"});t+="</table>";
   $("res").innerHTML="<span class='ok'>Step 1 done: "+j.result.files.toLocaleString()+" files, "+mb(j.result.total_bytes)+", "+j.result.types+" file types in "+j.result.projects+" folders ("+j.result.seconds+" s).</span><br><br>"+t+
-   "<br><a class='btn' href='/api/download?t="+T+"'>Download quick count zip</a> <span class='mut'>"+esc(j.result.name)+"</span><br><br><span class='mut'>When you are ready, click <b>Step 2: full profile</b> for the complete profile.</span>"}
+   "<br><a class='btn' href='/api/download?t="+T+"'>Download quick count zip</a> <span class='mut'>"+esc(j.result.name)+"</span><br><br><span class='mut'>When you are ready, click <b>Step 2: full profile</b> for the complete profile.</span>"+(j.result.map_name?"<br><br><a class='btn' style='background:var(--er)' href='/api/download_map?t="+T+"'>Download name map</a> <span class='mut'>"+esc(j.result.map_name)+" - KEEP PRIVATE: it turns the codes back into the real names. Do not send it with the profile.</span>":"")}
  else if(j.state=="done")$("res").innerHTML="<span class='ok'>Done: "+j.result.projects+" folders, "+j.result.files.toLocaleString()+" files"+(j.result.errors?", "+j.result.errors+" unreadable":"")+
   ".</span><br><br><a class='btn' href='/api/download?t="+T+"'>Download metrics zip</a> <span class='mut'>"+esc(j.result.name)+"</span><br><br>"+
-  (j.result.stats_name?"<a class='btn' style='background:var(--ac)' href='/api/download_log?t="+T+"'>Download run statistics</a> <span class='mut'>timings and your machine's speed - no file or folder names, safe to share</span>":"");
+  (j.result.stats_name?"<a class='btn' style='background:var(--ac)' href='/api/download_log?t="+T+"'>Download run statistics</a> <span class='mut'>timings and your machine's speed - no file names; safe to share</span>":"")+(j.result.map_name?"<br><br><a class='btn' style='background:var(--er)' href='/api/download_map?t="+T+"'>Download name map</a> <span class='mut'>"+esc(j.result.map_name)+" - KEEP PRIVATE: it turns the codes back into the real names. Do not send it with the profile.</span>":"");
  else if(j.state=="error")$("res").innerHTML="<span class='er'>"+esc(j.error)+"</span>"}
 function showTab(n){["folder","fusion"].forEach(x=>{$("tab_"+x).style.display=x==n?"":"none";$("t_"+x).classList.toggle("on",x==n)});if(n=="fusion")fstatus()}
 $("t_folder").onclick=()=>showTab("folder");$("t_fusion").onclick=()=>showTab("fusion");
@@ -253,7 +254,7 @@ table{border-collapse:collapse;width:100%}td,th{border:1px solid var(--bd);paddi
 </main><script>document.getElementById("cb").textContent="http://localhost:"+location.port+"/callback"</script></body></html>"""
 
 
-def _run(path, folders=None, anon=False, tier=2, depth=1, fresh=False, quick=False):
+def _run(path, folders=None, anon=False, tier=2, depth=1, fresh=False, quick=False, anon_names=False):
     def log(msg):
         with LOCK:
             STATE["log"].append(msg.rstrip())
@@ -264,20 +265,23 @@ def _run(path, folders=None, anon=False, tier=2, depth=1, fresh=False, quick=Fal
     try:
         label = os.environ.get("PROFILER_FOLDER_NAME") if IN_DOCKER and path == DATA_ROOT else None
         if quick:
-            zip_path, nproj, nfiles, errors = fp.quick_scan(path, OUT_DIR, log=log, label=label, folders=folders, progress=progress, project_depth=depth)
+            zip_path, nproj, nfiles, errors = fp.quick_scan(path, OUT_DIR, log=log, label=label, folders=folders, progress=progress, project_depth=depth,
+                                                            anonymize_names=anon_names or None)
             with LOCK:
                 STATE.update(state="done", result={"path": zip_path, "name": os.path.basename(zip_path), "stats_path": "", "stats_name": "",
+                                                   "map_path": fp.LAST_RUN.get("map_zip", ""), "map_name": os.path.basename(fp.LAST_RUN.get("map_zip", "")),
                                                    "projects": nproj, "files": nfiles, "errors": errors, "quick": True,
                                                    "top": fp.LAST_RUN.get("top", []), "total_bytes": fp.LAST_RUN.get("total_bytes", 0),
                                                    "types": fp.LAST_RUN.get("distinct_extensions", 0), "seconds": fp.LAST_RUN.get("seconds", 0)})
             return
         zip_path, nproj, nfiles, errors = fp.profile(path, OUT_DIR, log=log, label=label, folders=folders, progress=progress,
                                                       anonymize_assembly_names=anon, tier=tier, project_depth=depth,
-                                                      resume=not fresh)
+                                                      resume=not fresh, anonymize_names=anon_names or None)
         sz = fp.LAST_RUN.get("stats_zip") or ""
         with LOCK:
             STATE.update(state="done", result={"path": zip_path, "name": os.path.basename(zip_path), "stats_path": sz,
-                                               "stats_name": os.path.basename(sz), "projects": nproj, "files": nfiles, "errors": errors})
+                                               "stats_name": os.path.basename(sz), "projects": nproj, "files": nfiles, "errors": errors,
+                                               "map_path": fp.LAST_RUN.get("map_zip", ""), "map_name": os.path.basename(fp.LAST_RUN.get("map_zip", ""))})
     except SystemExit as e:
         with LOCK:
             STATE.update(state="error", error=str(e))
@@ -405,10 +409,10 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/status":
             with LOCK:
                 return self._json(STATE)
-        if u.path in ("/api/download", "/api/download_log"):
+        if u.path in ("/api/download", "/api/download_log", "/api/download_map"):
             with LOCK:
                 res = STATE.get("result")
-            key = ("stats_path", "stats_name") if u.path.endswith("_log") else ("path", "name")
+            key = ("stats_path", "stats_name") if u.path.endswith("_log") else ("map_path", "map_name") if u.path.endswith("_map") else ("path", "name")
             if not res or not res.get(key[0]) or not os.path.exists(res[key[0]]):
                 return self._send(404, "no result", "text/plain")
             size = os.path.getsize(res[key[0]])
@@ -490,7 +494,7 @@ class Handler(BaseHTTPRequestHandler):
             STATE.update(state="running", log=[], result=None, error=None,
                          progress={"phase": "scan", "files": 0, "total_files": 0, "bytes": 0, "total_bytes": 0})
         threading.Thread(target=_run, args=(path, folders or None, bool(body.get("anon")), 2, 1,
-                                                          bool(body.get("fresh")), body.get("kind") == "quick"), daemon=True).start()
+                                                          bool(body.get("fresh")), body.get("kind") == "quick", bool(body.get("anon_names"))), daemon=True).start()
         self._json({"ok": True})
 
 
