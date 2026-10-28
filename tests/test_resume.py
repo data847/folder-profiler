@@ -43,7 +43,7 @@ with tempfile.TemporaryDirectory() as t:
     # ---- baseline: one uninterrupted run
     CALLS[0] = 0
     base = rows_of(run(src, os.path.join(t, "base"))); total_calls = CALLS[0]
-    check("baseline read every loose file once", total_calls, 3 * 14 + 3 * 0 + 3)      # 42 files in P0..P2 + 3 zip files (zips are files too)
+    check("baseline read every loose file once", total_calls, 3 * 14)      # 42 files in P0..P2; the 3 zip files are a skipped type (NO_HEAD_EXTS): listed, not opened
     # ---- 1. crash right after a chunk was saved
     out = os.path.join(t, "o1")
     def boom_after_chunk(ui, ch):

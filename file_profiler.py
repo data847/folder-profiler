@@ -78,7 +78,7 @@ try:
     import name_anon
 except ImportError:          # optional feature: the profiler works without it, the option is then refused
     name_anon = None
-HEAD_BYTES = 4096            # header peek for every file
+HEAD_BYTES = 4096            # header peek (not for NO_HEAD_EXTS: see below)
 DXF_SCAN_BYTES = 1_048_576   # DXF only: scan up to 1 MB for 3D entity names (flag only, text discarded)
 
 # ---- closed vocabularies: every header tag is built from these, never from file text ----
@@ -107,6 +107,13 @@ TEXT_FORMATS = [  # (lowercase pattern in first 4 KB, tag) - first match wins; t
     (b"$meshformat", "MESH:GMSH"),
     (b"<vtkfile", "VTK:XML"),
 ]
+# Extensions whose header tag nobody uses: images, video, audio, documents, archives, fonts, web files, binaries and SketchUp (which has no
+# content tag at all). Opening a file just to peek at 4 KB costs one network round trip each (about 0.37 s on a file server); on a real
+# 385,000-file run those opens were 68% of the time and 62% of the files were of these types. They are listed with sig NOTAG and are NOT opened.
+# The compiler classifies every one of these extensions by name (tests/test_notag_exts.py checks that). PROFILER_READ_ALL_HEADERS=1 reads them anyway.
+NO_HEAD_EXTS = frozenset("""jpg jpeg jpe png gif bmp tif tiff webp heic heif ico psd psb cr2 nef arw dng raw svg
+    mp4 mov avi mkv wmv flv m4v webm mp3 wav m4a aac flac ogg pdf doc docx xls xlsx ppt pptx zip rar 7z gz tar tgz
+    dll exe msi so ttf otf woff woff2 js css map html htm skp skb""".split())
 SHEET_EXTS = {"dwg", "dxf"}               # level 2: AutoCAD drawings - the number of sheets (layouts) is counted, with a confidence
 LINK_READ_EXTS = {"sldasm", "asm", "pwd", "iam", "slddrw", "dft", "idw", "step", "stp", "catproduct", "catdrawing", "drw", "prt"}   # level 2: assemblies, drawings, STEP
 ASSEMBLY_EXTS = {"sldasm", "asm", "pwd", "iam", "catproduct"}   # the only files whose NAME is recorded (Assembly Breakdown tab)
@@ -228,6 +235,52 @@ def _signature_file(f, ext):
         return "TEXT"
     except UnicodeDecodeError:
         return "BINARY"
+
+
+class MemGate:
+    """Caps how many bytes of whole-file reads (DWG sheet counting, assembly references) are in flight at once, so many workers meeting
+    several huge drawings together cannot exhaust a small machine's RAM. A file bigger than the whole budget is read alone."""
+    def __init__(self, budget):
+        self.budget, self.used, self.cv = int(budget), 0, threading.Condition()
+        self.waits = 0
+
+    def hold(self, cost):
+        gate = self
+
+        class _Held:
+            def __enter__(self_):
+                self_.cost = min(int(cost), gate.budget)
+                with gate.cv:
+                    if gate.used + self_.cost > gate.budget:
+                        gate.waits += 1
+                    while gate.used + self_.cost > gate.budget:
+                        gate.cv.wait()
+                    gate.used += self_.cost
+
+            def __exit__(self_, *a):
+                with gate.cv:
+                    gate.used -= self_.cost
+                    gate.cv.notify_all()
+        return _Held()
+
+
+def memory_budget():
+    """Bytes of file data (times a safety factor, see MEM_FACTOR) that may be held in memory at once: 20% of the installed RAM, between
+    256 MB and 2 GB; PROFILER_MEM_BUDGET_MB overrides. Unknown RAM -> 512 MB."""
+    env = os.environ.get("PROFILER_MEM_BUDGET_MB", "")
+    if env.isdigit() and int(env) > 0:
+        return int(env) * 1024 * 1024
+    try:
+        import sysmetrics
+        total = sysmetrics.total_ram_bytes()
+    except Exception:
+        total = 0
+    if not total:
+        return 512 * 1024 * 1024
+    return max(256 * 1024 * 1024, min(2 * 1024 ** 3, total // 5))
+
+
+MEM_FACTOR = 3        # a DWG / assembly held in memory costs about this many times its size while it is parsed (data + decompressed copies)
 
 
 def default_workers(paths=None):
@@ -729,12 +782,15 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
             nm.project(u[0])                # codes follow the order of the projects
     shown = (lambda n: nm.project(n)) if nm else (lambda n: n)      # project name as it may appear in the run log
 
+    gate = MemGate(memory_budget())
+    no_head = frozenset() if os.environ.get("PROFILER_READ_ALL_HEADERS", "").lower() in ("1", "true", "yes") else NO_HEAD_EXTS
     # ---- run identity, checkpoint state
-    cfg = json.dumps({"v": VERSION, "units": [[u[0], u[1], u[2]] for u in units], "tier": tier, "depth": project_depth,
+    cfg = json.dumps({"v": VERSION, "nohead": bool(no_head), "units": [[u[0], u[1], u[2]] for u in units], "tier": tier, "depth": project_depth,
                       "anon": bool(anonymize_assembly_names), "anon_names": bool(nm),
                       "chunk": chunk_files}, sort_keys=True)
     run_id = f"{zlib.crc32(cfg.encode()):08x}{zlib.adler32(cfg.encode()):08x}"
     state_dir = os.path.join(out_dir, ".resume", run_id)
+    LAST_RUN["state_dir"] = state_dir           # so a failed run's logs can be bundled (make_fail_log)
     if not resume:
         shutil.rmtree(state_dir, ignore_errors=True)
     for sub in ("rows", "links", "dirs"):
@@ -921,9 +977,11 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
                     path, name, ext, size, mtime, dir_id, depth, asm, relpath, nn, tiered = e
                     if tiered:                                 # not really on this disk (cloud-tiered / online-only): opening it would download it
                         return "TIERED", None, False, (TIERED_SHEET if tier >= 2 and ext in SHEET_EXTS and dwg_sheets is not None else None)
+                    if ext in no_head:                         # nothing in the header would be used: do not open the file at all
+                        return ("NOTAG" if size else "EMPTY"), None, False, None
                     if tier >= 2 and ext in SHEET_EXTS and dwg_sheets is not None and size > 0:
                         def read_sheets():                     # ONE open: format tag and sheet count from the same read
-                            with open(path, "rb") as fh:
+                            with gate.hold(size * MEM_FACTOR), open(path, "rb") as fh:
                                 with act.timer("format_tag_read"):
                                     sig = signature_stream(fh, ext, size)
                                 fh.seek(0)
@@ -936,7 +994,7 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
                         return sig, None, False, sh
                     if tier >= 2 and ext in LINK_READ_EXTS and cad_links is not None and size > 0:
                         def read_refs():                       # ONE open: the format tag and the references come from the same read
-                            with open(path, "rb") as fh:
+                            with gate.hold((min(size, 8 << 20) if ext in ("step", "stp") else size) * MEM_FACTOR), open(path, "rb") as fh:
                                 with act.timer("format_tag_read"):
                                     sig = signature_stream(fh, ext, size)
                                 fh.seek(0)
@@ -954,6 +1012,8 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
                 rows, lrows = [], []
                 for e, (sig, res, was_link, sh) in zip(pending, pool.map(work, pending)):
                     path, name, ext, size, mtime, dir_id, depth, asm, relpath, nn, tiered = e
+                    if sig == "NOTAG":
+                        C["head_skipped"] += 1
                     if "UNREADABLE" in sig:
                         C["errors"] += 1
                         if len(u.setdefault("unreadable", [])) < 5000:
@@ -1145,7 +1205,7 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
                 ["hashing", "none"], ["assembly_names", "anonymized" if (anonymize_assembly_names or nm) else "real"],
                 ["names_anonymized", "yes" if nm else "no"],
                 ["detail_level", tier], ["project_depth", project_depth],
-                ["link_files_read", C["link_read"]],
+                ["header_reads_skipped", C["head_skipped"]], ["memory_budget_MB", gate.budget >> 20], ["reads_that_waited_for_memory", gate.waits], ["link_files_read", C["link_read"]],
                 ["link_files_unreadable", C["link_unreadable"]], ["read_errors", C["errors"]],
                 ["cloud_tiered_files_not_opened", sum(uu.get("tiered", 0) for uu in man["units"].values())],
                 ["deduplicated_files", sum(uu.get("dedup", 0) for uu in man["units"].values())], ["network_retries", C["retries"]],
@@ -1239,6 +1299,82 @@ def scrub_paths(text, scanned=""):
     return text
 
 
+def make_fail_log(out_dir, problem, scanned="", context=None, ui_log=None, redact_paths=False):
+    """After a failed run: ONE zip the data owner can send for remote debugging. It holds the error (traceback or message), the run's own
+    log and metrics, the settings and the machine description - never file contents. Paths of the owner's machine are replaced
+    (<scanned-folder>, <home>, <user>, <tool-folder>), access tokens are removed, and with redact_paths everything below the scanned
+    folder is hidden too. Names of files or folders can still appear inside error messages, so the README tells the owner to look first.
+    -> path of the zip."""
+    import json as _json
+    import tempfile
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+        if not os.access(out_dir, os.W_OK):
+            raise OSError("not writable")
+    except OSError:                               # the failure may BE the output folder (read-only, full, share gone): use the temp folder
+        out_dir = tempfile.gettempdir()
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    path = os.path.join(out_dir, f"fail_log_{stamp}.zip")
+
+    def clean(text):
+        text = scrub_paths(str(text), scanned)
+        text = re.sub(r"(?i)(bearer|token|authorization)([\s:=\"']+)[A-Za-z0-9._~+/=-]{12,}", r"\1\2<removed>", text)
+        if redact_paths:
+            text = re.sub(r"(<scanned-folder>)[^\s'\"<>|]*", r"\1/<hidden>", text)
+        return text
+    files = {}
+    files["problem.txt"] = clean(problem or "(no message)")
+    ctx = dict(context or {})
+    try:
+        import sysmetrics
+        ram = sysmetrics.total_ram_bytes()
+    except Exception:
+        ram = 0
+    lines = [f"tool_version: {VERSION}", f"time_utc: {now_utc()}", f"python: {platform.python_version()}", f"platform: {platform.platform()}",
+             f"cpus: {os.cpu_count()}", f"ram_gb: {ram / 1024 ** 3:.1f}" if ram else "ram_gb: unknown",
+             f"memory_budget_MB: {memory_budget() >> 20}", f"frozen_exe: {bool(getattr(sys, 'frozen', False))}",
+             f"in_docker: {bool(os.environ.get('PROFILER_IN_DOCKER'))}"]
+    lines += [f"{k}: {clean(v)}" for k, v in sorted(ctx.items())]
+    lines += [f"env {k}={clean(v)}" for k, v in sorted(os.environ.items()) if k.startswith("PROFILER_")]
+    files["settings.txt"] = "\r\n".join(lines) + "\r\n"
+    if ui_log:
+        files["screen_log.txt"] = clean("\n".join(ui_log)) + "\n"
+    sd = LAST_RUN.get("state_dir") or ""
+    for name, tail in (("Run_log.csv", 2000), ("Run_metrics.csv", 600)):
+        fp_ = os.path.join(sd, name) if sd else ""
+        if fp_ and os.path.exists(fp_):
+            try:
+                rows = open(fp_, encoding="utf-8", errors="replace").read().splitlines()
+                files[name] = clean("\n".join(rows[:1] + rows[1:][-tail:])) + "\n"
+            except OSError:
+                pass
+    mp = os.path.join(sd, "manifest.json") if sd else ""
+    if mp and os.path.exists(mp):
+        try:
+            man_ = _json.load(open(mp, encoding="utf-8"))
+            us = man_.get("units", {}).values()
+            files["progress.txt"] = (f"projects: {len(man_.get('units', {}))}\r\nprojects complete: {sum(1 for u in us if u.get('complete'))}\r\n"
+                                     f"chunks saved: {sum(u.get('chunks_done', 0) for u in us)}\r\nrestarts: {man_.get('restarts')}\r\n"
+                                     f"unreadable entries listed: {sum(len(u.get('unreadable', [])) for u in us)}\r\n")
+        except Exception:
+            pass
+    try:
+        import sysmetrics
+        rows = sysmetrics.system_info((), out_dir, deep=False)
+        files["System_info.txt"] = clean("\r\n".join(f"{k}: {v}" for k, v in rows)) + "\r\n"
+    except Exception:
+        pass
+    files["README.txt"] = ("Fail log of the Folder Profiler. It lets the developer see why a run stopped; it contains no file contents.\r\n"
+                           "Your computer's paths, user name and any access tokens are removed. The names of files or folders can still appear\r\n"
+                           "inside error messages: open problem.txt and screen_log.txt in Notepad and look before you send it.\r\n"
+                           + ("Everything below the scanned folder was hidden because name anonymisation was on.\r\n" if redact_paths else ""))
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        for n, t in files.items():
+            z.writestr(n, t.encode("utf-8"))
+    LAST_RUN["fail_log"] = path
+    return path
+
+
 def ask_folder():
     try:
         import tkinter
@@ -1328,8 +1464,14 @@ def main(argv=None):
     except Exception:
         log = os.path.join(out_dir, "error_log.txt")
         os.makedirs(out_dir, exist_ok=True)
-        open(log, "w").write(scrub_paths(traceback.format_exc(), folder))
-        print(f"\nSomething went wrong. Please send us this file: {log}")
+        tb = traceback.format_exc()
+        open(log, "w").write(scrub_paths(tb, folder))
+        try:
+            fl = make_fail_log(out_dir, tb, scanned=folder, context={"mode": "full profile", "level": a.level, "workers": a.workers,
+                                                                      "anonymize_names": a.anonymize_names}, redact_paths=a.anonymize_names)
+            print(f"\nSomething went wrong. Please send us this file: {fl}")
+        except Exception:
+            print(f"\nSomething went wrong. Please send us this file: {log}")
         return 1
     print(f"\nDone: {nproj} folders, {nfiles:,} files" + (f", {errors} unreadable" if errors else ""))
     if LAST_RUN.get("stats_zip"):

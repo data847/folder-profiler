@@ -177,6 +177,22 @@ def _mac_mem():
 
 
 # ------------------------------------------------------------------------------------ system information
+def total_ram_bytes():
+    """Installed RAM in bytes, or 0 if the system will not say."""
+    try:
+        if IS_WIN and _win():
+            m = _win().memory()
+            return int(m[0]) if m else 0
+        if IS_LINUX:
+            return int(_linux_mem()[0])
+        if IS_MAC:
+            m = _mac_mem()
+            return int(m[0]) if m else 0
+    except Exception:
+        pass
+    return 0
+
+
 def system_info(data_paths=(), out_dir=".", extra=None, deep=True):
     """Static facts about the machine for the run report. `deep` also asks PowerShell about disks and antivirus on Windows."""
     rows = [("os", platform.platform()), ("machine", platform.machine()), ("python", platform.python_version()),

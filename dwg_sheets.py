@@ -602,6 +602,8 @@ def count_sheets_file(f, ext, size=None):
     try:
         if size is not None and size > MAX_BYTES:
             return _res(None, 0, ext, "file larger than the size limit", "too-large")
-        return count_sheets_bytes(f.read(MAX_BYTES + 1), ext)
+        # read exactly the file's size: asking for MAX_BYTES + 1 (150 MB) of a 3 MB drawing makes the allocator hold a block that big per call,
+        # and with many workers that is what filled small machines' RAM
+        return count_sheets_bytes(f.read((size if size is not None else MAX_BYTES) + 1), ext)
     except OSError:
         return _res(None, 0, ext, "unreadable", "unreadable")

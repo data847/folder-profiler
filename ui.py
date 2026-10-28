@@ -19,7 +19,7 @@ sys.path.insert(0, HERE)  # the bundled embeddable Python runs isolated and does
 import file_profiler as fp  # noqa: E402
 import fusion_cloud_profiler as fcp  # noqa: E402
 TOKEN = os.urandom(16).hex()
-STATE = {"state": "idle", "log": [], "result": None, "error": None,
+STATE = {"state": "idle", "log": [], "result": None, "error": None, "fail": None,
          "progress": {"phase": "", "files": 0, "total_files": 0, "bytes": 0, "total_bytes": 0}}
 LOCK = threading.Lock()
 # Fusion 360 (Autodesk cloud) sign-in: lives in memory only, never written to disk
@@ -123,7 +123,7 @@ function bar(j){const p=j.progress,b=$("bar");
  if(j.state=="idle"){b.style.display="none";$("barlabel").textContent="";return}
  b.style.display="block";
  if(j.state=="done"){b.classList.remove("ind");$("barfill").style.width="100%";b.setAttribute("aria-valuenow",100);$("barlabel").textContent="100% complete";return}
- if(j.state=="error"){b.classList.remove("ind");return}
+ if(j.state=="error"){b.classList.remove("ind");b.style.display="none";$("barlabel").textContent="";return}
  if(p.phase=="links"){b.classList.remove("ind");$("barfill").style.width=Math.round(100*p.files/Math.max(1,p.total_files))+"%";$("barlabel").textContent="Reading references inside assemblies... "+p.files.toLocaleString()+" of "+p.total_files.toLocaleString();return}
  if(p.phase=="scan"||!p.total_files){b.classList.add("ind");$("barlabel").textContent="Counting files... "+p.total_files.toLocaleString()+" found";return}
  b.classList.remove("ind");
@@ -139,7 +139,7 @@ async function poll(){const j=await (await fetch("/api/status?t="+T)).json();bar
  else if(j.state=="done")$("res").innerHTML="<span class='ok'>Done: "+j.result.projects+" folders, "+j.result.files.toLocaleString()+" files"+(j.result.errors?", "+j.result.errors+" unreadable":"")+
   ".</span><br><br><a class='btn' href='/api/download?t="+T+"'>Download metrics zip</a> <span class='mut'>"+esc(j.result.name)+"</span><br><br>"+
   (j.result.stats_name?"<a class='btn' style='background:var(--ac)' href='/api/download_log?t="+T+"'>Download run statistics</a> <span class='mut'>timings and your machine's speed - no file names; safe to share</span>":"")+(j.result.map_name?"<br><br><a class='btn' style='background:var(--er)' href='/api/download_map?t="+T+"'>Download name map</a> <span class='mut'>"+esc(j.result.map_name)+" - KEEP PRIVATE: it turns the codes back into the real names. Do not send it with the profile.</span>":"");
- else if(j.state=="error")$("res").innerHTML="<span class='er'>"+esc(j.error)+"</span>"}
+ else if(j.state=="error")$("res").innerHTML="<span class='er'>"+esc(j.error)+"</span>"+(j.fail?"<br><br><a class='btn' style='background:var(--er)' href='/api/download_fail?t="+T+"'>Download fail log</a> <span class='mut'>"+esc(j.fail.name)+" - send this ONE file to us. Your computer's paths and user name are removed; look inside before sending if the folder names are sensitive.</span>":"")}
 function showTab(n){["folder","fusion"].forEach(x=>{$("tab_"+x).style.display=x==n?"":"none";$("t_"+x).classList.toggle("on",x==n)});if(n=="fusion")fstatus()}
 $("t_folder").onclick=()=>showTab("folder");$("t_fusion").onclick=()=>showTab("fusion");
 $("fcb").value="http://localhost:"+location.port+"/callback";
@@ -175,7 +175,7 @@ async function fpoll(){const j=await (await fetch("/api/status?t="+T)).json();$(
  if(j.state=="running"){$("fres").innerHTML="<span class='mut'>Reading the hub...</span>";setTimeout(fpoll,1000);return}$("fgo").disabled=false;
  if(j.state=="done"){const r=j.result;$("fres").innerHTML="<span class='ok'>Done: "+r.projects+" projects, "+r.files.toLocaleString()+" items"+(r.errors?", "+r.errors+" folder(s) could not be read":"")+".</span><br>"+
   (r.notes||[]).map(n=>"<div class='mut'>"+esc(n)+"</div>").join("")+"<br><a class='btn' href='/api/download?t="+T+"'>Download profile zip</a> <span class='mut'>"+esc(r.name)+"</span>"}
- else if(j.state=="error")$("fres").innerHTML="<span class='er'>"+esc(j.error)+"</span>"}
+ else if(j.state=="error")$("fres").innerHTML="<span class='er'>"+esc(j.error)+"</span>"+(j.fail?"<br><br><a class='btn' style='background:var(--er)' href='/api/download_fail?t="+T+"'>Download fail log</a> <span class='mut'>"+esc(j.fail.name)+" - send this ONE file to us. Your computer's paths and user name are removed; look inside before sending if the folder names are sensitive.</span>":"")}
 renderSel();ls("");
 </script></body></html>"""
 
@@ -256,6 +256,47 @@ table{border-collapse:collapse;width:100%}td,th{border:1px solid var(--bd);paddi
 </main><script>document.getElementById("cb").textContent="http://localhost:"+location.port+"/callback"</script></body></html>"""
 
 
+def _write_error_log(text, scanned=""):
+    """error_log.txt next to the output; if the output folder is the problem, in the temp folder. Never raises."""
+    import tempfile
+    for d in (OUT_DIR, tempfile.gettempdir()):
+        try:
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, "error_log.txt"), "w") as f:
+                f.write(fp.scrub_paths(text, scanned))
+            return
+        except OSError:
+            continue
+
+
+def _guarded(fn, *args):
+    """Thread target: whatever happens inside fn, the page must not be left on 'running'."""
+    try:
+        fn(*args)
+    except BaseException:
+        tb = traceback.format_exc()
+        _write_error_log(tb)
+        _fail("The run stopped unexpectedly. Click Download fail log and send us that file.", "", tb, {"mode": "unexpected"}, False)
+    finally:
+        with LOCK:
+            if STATE["state"] == "running":
+                STATE.update(state="error", error="The run ended without a result. Click Download fail log and send us that file.")
+
+
+def _fail(message, scanned, problem, context, redact):
+    """A run failed: remember the message for the page and build the fail-log zip the data owner can download and send."""
+    with LOCK:
+        screen = list(STATE["log"])
+    fail = None
+    try:
+        zp = fp.make_fail_log(OUT_DIR, problem, scanned=scanned or "", context=context, ui_log=screen, redact_paths=redact)
+        fail = {"path": zp, "name": os.path.basename(zp)}
+    except Exception:
+        pass
+    with LOCK:
+        STATE.update(state="error", error=message, fail=fail)
+
+
 def _run(path, folders=None, anon=False, tier=2, depth=1, fresh=False, quick=False, anon_names=False, anon_map=True):
     def log(msg):
         with LOCK:
@@ -285,15 +326,13 @@ def _run(path, folders=None, anon=False, tier=2, depth=1, fresh=False, quick=Fal
                                                "stats_name": os.path.basename(sz), "projects": nproj, "files": nfiles, "errors": errors,
                                                "map_path": fp.LAST_RUN.get("map_zip", ""), "map_name": os.path.basename(fp.LAST_RUN.get("map_zip", ""))})
     except SystemExit as e:
-        with LOCK:
-            STATE.update(state="error", error=str(e))
+        _fail(str(e), path, str(e), dict(mode="quick count" if quick else "full profile", depth=depth, tier=tier, fresh=fresh, anonymize_names=anon_names), anon_names)
     except Exception:
-        os.makedirs(OUT_DIR, exist_ok=True)
-        with open(os.path.join(OUT_DIR, "error_log.txt"), "w") as f:
-            f.write(fp.scrub_paths(traceback.format_exc(), path))
-        with LOCK:
-            STATE.update(state="error", error="The run stopped. Everything finished so far is saved: click Start profiling again (same settings) and it "
-                                              "continues where it stopped. If it keeps failing, send us output/error_log.txt")
+        tb = traceback.format_exc()
+        _write_error_log(tb, path)
+        _fail("The run stopped. Everything finished so far is saved: click the button again (same settings) and it continues where it stopped. "
+              "If it keeps failing, click Download fail log below and send us that file.", path, tb,
+              dict(mode="quick count" if quick else "full profile", depth=depth, tier=tier, fresh=fresh, anonymize_names=anon_names), anon_names)
 
 
 def _run_fusion(hub_id, hub_name, names):
@@ -312,14 +351,12 @@ def _run_fusion(hub_id, hub_name, names):
             STATE.update(state="done", result={"path": path, "name": os.path.basename(path), "stats_path": "", "stats_name": "",
                                                "projects": nproj, "files": n, "errors": len(stats["unreadable"]), "notes": notes})
     except (fcp.ApiError, SystemExit) as e:
-        with LOCK:
-            STATE.update(state="error", error=str(e))
+        _fail(str(e), "", str(e), {"mode": "fusion cloud", "projects_selected": len(names)}, False)
     except Exception:
-        os.makedirs(OUT_DIR, exist_ok=True)
-        with open(os.path.join(OUT_DIR, "error_log.txt"), "w") as f:
-            f.write(traceback.format_exc())
-        with LOCK:
-            STATE.update(state="error", error="The cloud run stopped unexpectedly. Details are in output/error_log.txt (no access token is written there).")
+        tb = traceback.format_exc()
+        _write_error_log(tb)
+        _fail("The cloud run stopped unexpectedly. Click Download fail log and send us that file (no access token is in it).", "", tb,
+              {"mode": "fusion cloud", "projects_selected": len(names)}, False)
 
 
 def _in_data(p):
@@ -411,10 +448,10 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/status":
             with LOCK:
                 return self._json(STATE)
-        if u.path in ("/api/download", "/api/download_log", "/api/download_map"):
+        if u.path in ("/api/download", "/api/download_log", "/api/download_map", "/api/download_fail"):
             with LOCK:
-                res = STATE.get("result")
-            key = ("stats_path", "stats_name") if u.path.endswith("_log") else ("map_path", "map_name") if u.path.endswith("_map") else ("path", "name")
+                res = STATE.get("fail") if u.path.endswith("_fail") else STATE.get("result")
+            key = ("stats_path", "stats_name") if u.path.endswith("_log") else ("map_path", "map_name") if u.path.endswith("_map") else ("path", "name")   # fail: same keys
             if not res or not res.get(key[0]) or not os.path.exists(res[key[0]]):
                 return self._send(404, "no result", "text/plain")
             size = os.path.getsize(res[key[0]])
@@ -473,9 +510,9 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK:
                 if STATE["state"] == "running":
                     return self._json({"error": "A run is already in progress"})
-                STATE.update(state="running", log=[], result=None, error=None,
+                STATE.update(state="running", log=[], result=None, error=None, fail=None,
                              progress={"phase": "scan", "files": 0, "total_files": 0, "bytes": 0, "total_bytes": 0})
-            threading.Thread(target=_run_fusion, args=(hub, str(body.get("hub_name") or "hub"), names), daemon=True).start()
+            threading.Thread(target=_guarded, args=(_run_fusion, hub, str(body.get("hub_name") or "hub"), names), daemon=True).start()
             return self._json({"ok": True})
         folders = [str(p).strip().strip('"') for p in body.get("paths") or []]
         path = (body.get("path") or "").strip().strip('"')
@@ -493,9 +530,9 @@ class Handler(BaseHTTPRequestHandler):
         with LOCK:
             if STATE["state"] == "running":
                 return self._json({"error": "A run is already in progress"})
-            STATE.update(state="running", log=[], result=None, error=None,
+            STATE.update(state="running", log=[], result=None, error=None, fail=None,
                          progress={"phase": "scan", "files": 0, "total_files": 0, "bytes": 0, "total_bytes": 0})
-        threading.Thread(target=_run, args=(path, folders or None, bool(body.get("anon")), 2, 1,
+        threading.Thread(target=_guarded, args=(_run, path, folders or None, bool(body.get("anon")), 2, 1,
                                                           bool(body.get("fresh")), body.get("kind") == "quick", bool(body.get("anon_names")), body.get("anon_map", True) is not False), daemon=True).start()
         self._json({"ok": True})
 

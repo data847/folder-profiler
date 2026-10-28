@@ -244,3 +244,17 @@ f2d,DRAWING,Fusion360,,Fusion drawing
 fsch,EDA,FusionElectronics,Electronics,Fusion Electronics schematic
 fbrd,EDA,FusionElectronics,Electronics,Fusion Electronics board
 flbr,EDA,FusionElectronics,Electronics,Fusion Electronics library
+jpe,IMG,,,
+heif,IMG,,,
+cr2,IMG,,,camera raw
+nef,IMG,,,camera raw
+dng,IMG,,,camera raw
+raw,IMG,,,camera raw
+mp3,OTHER,,,audio
+wav,OTHER,,,audio
+m4a,OTHER,,,audio
+aac,OTHER,,,audio
+flac,OTHER,,,audio
+ogg,OTHER,,,audio
+tgz,ARCHIVE,,,
+so,DATA,,,shared library
