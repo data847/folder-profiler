@@ -47,6 +47,33 @@ for v in (b"AC1012", b"AC1014", b"AC1015", b"AC1018", b"AC1021", b"AC1024", b"AC
 check("unknown extension", ds.count_sheets_bytes(b"x", "txt")["sheets"], None)
 
 # ---- real files (optional)
+# ---------- header-only verdicts: same answer as reading the whole file, but only 6 bytes are read
+import io as _io
+class _Spy(_io.BytesIO):
+    def __init__(s, b): super().__init__(b); s.read_bytes = 0
+    def read(s, n=-1):
+        r = super().read(n); s.read_bytes += len(r); return r
+_ok = True; _lines = []
+for hdr in (b"AC1012", b"AC1014", b"AC1021", b"XXXXXX", b"%PDF-1"):
+    body = hdr + b"\x00" * 200_000
+    sp = _Spy(body); got = ds.count_sheets_file(sp, "dwg", len(body)); want = ds.count_sheets_bytes(body, "dwg")
+    same = got == want and sp.read_bytes <= 6
+    _ok &= same; _lines.append((hdr.decode(), got["code"], sp.read_bytes, same))
+check("R13 / R14 / R2007 / not-a-DWG: identical result, only the 6 header bytes are read", _ok, True)
+big = b"AC1014" + b"\x00" * 1000
+check("an oversized R14 file keeps its 'too-large' verdict (the size check still comes first)", ds.count_sheets_file(_Spy(big), "dwg", ds.MAX_BYTES + 5)["code"], "too-large")
+sp = _Spy(b"AC1032" + b"\x00" * 5000); ds.count_sheets_file(sp, "dwg", 5006)
+check("a supported version is still read whole", sp.read_bytes >= 5006, True)
+
+
+# with the version already known (the profiler read it for the format tag) no byte is read twice and the answer is the same
+for hdr in (b"AC1014", b"AC1021", b"AC1032"):
+    body = hdr + b"\x00" * 5000
+    sp = _Spy(body); a = ds.count_sheets_file(sp, "dwg", len(body), head=hdr); b = ds.count_sheets_bytes(body, "dwg")
+    check(f"known version {hdr.decode()}: same answer as reading it all", a == b, True)
+sp = _Spy(b"AC1014" + b"\x00" * 5000); ds.count_sheets_file(sp, "dwg", 5006, head=b"AC1014")
+check("known old version: nothing is read at all", sp.read_bytes, 0)
+
 base = os.environ.get("DWG_SAMPLES", "")
 dirs = sorted(glob.glob(os.path.join(base, "dwgsrc*"))) if base else []
 if not dirs:

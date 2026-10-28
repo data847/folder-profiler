@@ -783,6 +783,7 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
     shown = (lambda n: nm.project(n)) if nm else (lambda n: n)      # project name as it may appear in the run log
 
     gate = MemGate(memory_budget())
+    copies = {}                                  # (ext, name, size, date) -> (tag, sheet result): exact copies of a drawing are not read twice
     no_head = frozenset() if os.environ.get("PROFILER_READ_ALL_HEADERS", "").lower() in ("1", "true", "yes") else NO_HEAD_EXTS
     # ---- run identity, checkpoint state
     cfg = json.dumps({"v": VERSION, "nohead": bool(no_head), "units": [[u[0], u[1], u[2]] for u in units], "tier": tier, "depth": project_depth,
@@ -817,7 +818,8 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
 
     def ident(*parts, n=16):
         return hashlib.sha256((salt + "\0" + "\0".join(parts)).encode("utf-8", "surrogatepass")).hexdigest()[:n]
-    dirs = {}                                           # dir_id -> (project, parent_dir_id, depth, name)
+    dirs = {}                                           # dir_id -> (project, parent_dir_id, depth, name); a project's entries are dropped once it is checkpointed
+    dirs_of = collections.defaultdict(list)             # project -> its dir ids (so finishing a project does not scan every folder of the run)
 
     def reg(proj, rel, depth, name, parent=None):
         i = ident(proj, rel)
@@ -825,6 +827,7 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
             if parent is None:
                 parent = "" if rel == "." else ident(proj, os.path.dirname(rel) or ".")
             dirs[i] = (proj, parent, depth, name)
+            dirs_of[proj].append(i)
         return i
 
     # ---- logs, metrics, system info (Run_log.csv / Run_metrics.csv live in the state dir so they survive a restart)
@@ -848,9 +851,19 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
                f"v{VERSION}: level {tier}, project depth {project_depth}, {workers} workers, "
                f"{len(units)} projects, hashing: none")
 
-    def save_manifest():
-        man["elapsed"] = elapsed_before + (time.time() - t_run0)
+    manifest_clock = [0.0, 0.0]               # when the progress file was last written, and how long that took
+
+    def save_manifest(force=False):
+        """Write the progress file. It holds every project, so on a run with thousands of projects rewriting it after every chunk made the run
+        slower and slower (quadratic). Unless forced, it is not rewritten before 20x the time the last write took has passed: the bookkeeping
+        stays below ~5% of the run, and a stop loses at most those few seconds of progress (the chunks are simply redone)."""
+        now = time.time()
+        if not force and now - manifest_clock[0] < 20 * manifest_clock[1]:
+            return
+        man["elapsed"] = elapsed_before + (now - t_run0)
         _save_json(mpath, man)
+        manifest_clock[0] = time.time()
+        manifest_clock[1] = manifest_clock[0] - now
 
     def on_walk_error(e):
         C["dir_errors"] += 1
@@ -892,7 +905,7 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
                                    "(opening them would download them)")
             if cnt["retries"]:
                 rlog.event("scan", f"the network dropped {cnt['retries']} time(s); the folder was listed again each time")
-            save_manifest()
+            save_manifest(force=True)
         for proj, _b, _r in units:
             u = man["units"][proj]
             total_files += u["files"]
@@ -980,17 +993,24 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
                     if ext in no_head:                         # nothing in the header would be used: do not open the file at all
                         return ("NOTAG" if size else "EMPTY"), None, False, None
                     if tier >= 2 and ext in SHEET_EXTS and dwg_sheets is not None and size > 0:
+                        ck = (ext, name.lower(), size, mtime)          # an exact copy (same name, size, date: the compiler's own duplicate rule) was already read
+                        hit = copies.get(ck)
+                        if hit is not None:
+                            return hit[0], None, False, dict(hit[1], reused=True)
                         def read_sheets():                     # ONE open: format tag and sheet count from the same read
                             with gate.hold(size * MEM_FACTOR), open(path, "rb") as fh:
                                 with act.timer("format_tag_read"):
                                     sig = signature_stream(fh, ext, size)
                                 fh.seek(0)
                                 with act.timer("sheet_count"):
-                                    return sig, dwg_sheets.count_sheets_file(fh, ext, size)
+                                    known = sig[4:10].encode() if ext == "dwg" and sig.startswith("DWG:") else None      # version already read for the tag
+                                    return sig, dwg_sheets.count_sheets_file(fh, ext, size, head=known)
                         try:
                             sig, sh = retry(read_sheets, C)
                         except OSError:
                             return "UNREADABLE", None, False, None
+                        if len(copies) < 500_000:
+                            copies[ck] = (sig, sh)
                         return sig, None, False, sh
                     if tier >= 2 and ext in LINK_READ_EXTS and cad_links is not None and size > 0:
                         def read_refs():                       # ONE open: the format tag and the references come from the same read
@@ -1019,6 +1039,8 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
                         if len(u.setdefault("unreadable", [])) < 5000:
                             u["unreadable"].append([relpath if tier >= 1 else "", "file", "could not be read"])
                     if sh is not None:
+                        if sh.get("reused"):
+                            C["sheets_reused"] += 1
                         C["sheets_counted" if sh["sheets"] is not None else "sheets_not_counted"] += 1
                         C["sheet_status:" + sh["code"]] += 1
                     rows.append([proj, nn, ext, size, mtime, depth, sig, dir_id, asm] + ([relpath] if tier >= 1 else []) + sheet_cols(sh if ext in SHEET_EXTS else None))
@@ -1089,16 +1111,18 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
             # ---- project finished: remember its folder tree, mark it complete
             with act.timer("write_checkpoint"):
                 _write_csv_atomic(os.path.join(state_dir, "dirs", f"u{ui}.csv"),
-                                  [[i, v[1], v[2], v[3]] for i, v in dirs.items() if v[0] == proj])
+                                  [[i, dirs[i][1], dirs[i][2], dirs[i][3]] for i in dirs_of[proj]])
+                for i in dirs_of.pop(proj, ()):                  # saved to disk: free the memory (Dirs.csv is built from the saved files at the end)
+                    dirs.pop(i, None)
                 u["complete"] = True
                 u["loose_files"] = n_loose
                 save_manifest()
             rlog.event("process", f"[{ui + 1}/{len(units)}] {shown(proj)}: done ({n_loose:,} files, {time.time() - t_unit:.1f}s)")
         man["process_s"] += time.time() - t_proc0
-        save_manifest()
+        save_manifest(force=True)
     except BaseException as exc:
         rlog.event(state["phase"], f"run stopped: {type(exc).__name__}. Progress is saved - start again with the same settings to resume.", "ERROR")
-        save_manifest()
+        save_manifest(force=True)
         mon.stop()
         pool.shutdown(wait=False, cancel_futures=True)
         raise
@@ -1119,11 +1143,19 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
     stats_zip = os.path.join(out_dir, f"run_stats_{safe}_{stamp}.zip")
     proj_stats, ext_stats, nfiles_out, bytes_out = {}, {}, 0, 0
 
+    chunk_index = {}                                    # sub folder -> {unit index: [chunk file names]}: listed ONCE (listing it per project was quadratic)
+
     def chunk_files_of(sub, ui):
         d = os.path.join(state_dir, sub)
+        if sub not in chunk_index:
+            groups = collections.defaultdict(list)
+            for f in os.listdir(d):
+                m = re.match(r"u(\d+)_([ca])", f)
+                if m and f.endswith(".csv"):
+                    groups[int(m.group(1))].append(f)
+            chunk_index[sub] = groups
         pre = f"u{ui}_"
-        names = sorted((f for f in os.listdir(d) if f.startswith(pre) and f.endswith(".csv") and f[len(pre)] in "ca"),
-                       key=lambda f: (f[len(pre)] != "c", f))          # chunks in order
+        names = sorted(chunk_index[sub].get(ui, ()), key=lambda f: (f[len(pre)] != "c", f))          # chunks in order
         return [os.path.join(d, f) for f in names]
 
     all_dirs = dict(dirs)
@@ -1205,7 +1237,7 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
                 ["hashing", "none"], ["assembly_names", "anonymized" if (anonymize_assembly_names or nm) else "real"],
                 ["names_anonymized", "yes" if nm else "no"],
                 ["detail_level", tier], ["project_depth", project_depth],
-                ["header_reads_skipped", C["head_skipped"]], ["memory_budget_MB", gate.budget >> 20], ["reads_that_waited_for_memory", gate.waits], ["link_files_read", C["link_read"]],
+                ["header_reads_skipped", C["head_skipped"]], ["memory_budget_MB", gate.budget >> 20], ["reads_that_waited_for_memory", gate.waits], ["dwg_sheets_reused_from_identical_copies", C["sheets_reused"]], ["link_files_read", C["link_read"]],
                 ["link_files_unreadable", C["link_unreadable"]], ["read_errors", C["errors"]],
                 ["cloud_tiered_files_not_opened", sum(uu.get("tiered", 0) for uu in man["units"].values())],
                 ["deduplicated_files", sum(uu.get("dedup", 0) for uu in man["units"].values())], ["network_retries", C["retries"]],

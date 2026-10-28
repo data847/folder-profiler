@@ -597,11 +597,22 @@ def count_sheets_bytes(data, ext):
     return _res(None, 0, ext, "not a drawing format", "not-dwg")
 
 
-def count_sheets_file(f, ext, size=None):
-    """Same for an open binary file positioned at 0."""
+def count_sheets_file(f, ext, size=None, head=None):
+    """Same for an open binary file positioned at 0. `head` = the first 6 bytes if the caller already read them (the profiler has, for the
+    format tag): then no extra read is made."""
     try:
         if size is not None and size > MAX_BYTES:
             return _res(None, 0, ext, "file larger than the size limit", "too-large")
+        if (ext or "").lower() == "dwg":
+            # the verdict for AutoCAD R13 / R14 (no layouts), R2007 (not supported) and "not a DWG" depends on the first 6 bytes only:
+            # do not read the rest of the file (on real data that was 17% of all drawings, read whole for nothing)
+            fresh = head is None
+            if fresh:
+                head = f.read(6)
+            if VERSIONS.get(bytes(head)) in (None, "R13", "R14", "R2007"):
+                return count_sheets_bytes(head, ext)
+            if fresh:
+                f.seek(0)
         # read exactly the file's size: asking for MAX_BYTES + 1 (150 MB) of a 3 MB drawing makes the allocator hold a block that big per call,
         # and with many workers that is what filled small machines' RAM
         return count_sheets_bytes(f.read((size if size is not None else MAX_BYTES) + 1), ext)
