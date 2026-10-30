@@ -3,7 +3,7 @@ FROM python:3.12-alpine
 
 RUN adduser -D -u 10001 profiler
 WORKDIR /app
-COPY file_profiler.py cad_links.py dwg_sheets.py sysmetrics.py ui.py ./
+COPY file_profiler.py cad_links.py dwg_sheets.py sysmetrics.py diag.py name_anon.py fusion_cloud_profiler.py ext_classes.csv ui.py ./
 COPY tests ./tests
 
 ENV PROFILER_IN_DOCKER=1 \

@@ -21,6 +21,13 @@ import re
 import struct
 import zlib
 
+try:
+    import diag
+except ImportError:                       # standalone use: the reasons are simply not kept
+    class diag:
+        fail = staticmethod(lambda exc, stage="references": None)
+        note = staticmethod(lambda stage, why: None)
+
 CAD_EXTS = ("par", "psm", "asm", "pwd", "dft", "iam", "ipt", "ipn", "idw", "sldprt", "sldasm", "slddrw", "prt",
             "catpart", "catproduct", "catdrawing", "x_t", "x_b", "step", "stp", "igs", "iges", "3dm", "f3d")
 MAX_FILE_BYTES = 256 * 1024 * 1024       # larger files are skipped (None)
@@ -62,12 +69,12 @@ def _clean(refs, own_name=""):
 def solidworks_refs(path):
     try:
         if os.path.getsize(path) > MAX_FILE_BYTES:
-            return None
+            return diag.note("references", "file too large")
         with open(path, "rb") as f:
             b = f.read()
         return _sw_from_bytes(b, os.path.basename(path))
-    except Exception:
-        return None
+    except Exception as exc:
+        return diag.fail(exc)
 
 
 def _sw_from_bytes(b, own_name=""):
@@ -88,10 +95,10 @@ def _sw_from_bytes(b, own_name=""):
             if budget <= 0:
                 break
         if not refs and not _SW_MARK.search(b):
-            return None                              # not a container we understand
+            return diag.note("references", "container not understood")                              # not a container we understand
         return _clean(refs, own_name)
-    except Exception:
-        return None
+    except Exception as exc:
+        return diag.fail(exc)
 
 
 # ------------------------------------------------------------------------- OLE / compound document
@@ -197,12 +204,12 @@ def ole_refs(path):
     """File names referenced from inside an OLE compound document (Solid Edge, Inventor, ...). None if not OLE."""
     try:
         if os.path.getsize(path) > MAX_FILE_BYTES:
-            return None
+            return diag.note("references", "file too large")
         with open(path, "rb") as f:
             data = f.read()
         return _ole_from_bytes(data, os.path.basename(path))
-    except Exception:
-        return None
+    except Exception as exc:
+        return diag.fail(exc)
 
 
 def _ole_from_bytes(data, own_name=""):
@@ -212,8 +219,8 @@ def _ole_from_bytes(data, own_name=""):
         for _name, blob in cfb.streams():
             _refs_in(blob, refs)
         return _clean(refs, own_name)
-    except Exception:
-        return None
+    except Exception as exc:
+        return diag.fail(exc)
 
 
 # ------------------------------------------------------------------------- STEP
@@ -289,15 +296,15 @@ def step_structure_stream(f):
             _step_block(buf[:cut + 1], prod, form, pdef, nauo)
             buf = buf[cut + 1:]
         return _step_finish(prod, form, pdef, nauo)
-    except Exception:
-        return None
+    except Exception as exc:
+        return diag.fail(exc)
 
 
 def step_structure_bytes(data):
     """Same as step_structure() for content already in memory (a file already read into memory)."""
     import io
     if len(data) > MAX_STEP_BYTES:
-        return None
+        return diag.note("references", "file too large")
     return step_structure_stream(io.BytesIO(data))
 
 
@@ -306,11 +313,11 @@ def step_structure(path):
     PRODUCT id and name are returned as candidates), or None when unreadable. {} parents = a single part, no assembly."""
     try:
         if os.path.getsize(path) > MAX_STEP_BYTES:
-            return None
+            return diag.note("references", "file too large")
         with open(path, "rb") as f:
             return step_structure_stream(f)
-    except Exception:
-        return None
+    except Exception as exc:
+        return diag.fail(exc)
 
 
 def _step_from_lines(lines):
@@ -348,8 +355,8 @@ def _step_from_lines(lines):
                 if len(r) >= 2:
                     nauo.append((int(r[0]), int(r[1])))
         return _step_finish(prod, form, pdef, nauo)
-    except Exception:
-        return None
+    except Exception as exc:
+        return diag.fail(exc)
 
 
 # ------------------------------------------------------------------------- other native formats (string scan)
@@ -364,8 +371,8 @@ def scan_refs(data, own_name=""):
         refs = collections.Counter()
         _refs_in(data[:SCAN_MAX_BYTES], refs)
         return _clean(refs, own_name)
-    except Exception:
-        return None
+    except Exception as exc:
+        return diag.fail(exc)
 
 
 # ------------------------------------------------------------------------- dispatch
@@ -392,7 +399,7 @@ def read_links_bytes(data, ext, name=""):
     if ext in STEP_EXTS:
         r = step_structure_bytes(data)
         return ("step", r["parents"]) if r is not None else None
-    return None
+    return diag.note("references", "format not supported")
 
 
 def read_links_file(f, ext, name="", size=None):
@@ -403,7 +410,7 @@ def read_links_file(f, ext, name="", size=None):
             size = os.fstat(f.fileno()).st_size
         if ext in STEP_EXTS:
             if size > MAX_STEP_BYTES:
-                return None
+                return diag.note("references", "file too large")
             r = step_structure_stream(f)
             return ("step", r["parents"]) if r is not None else None
         if ext in SCAN_EXTS:                                   # CATIA / Creo / NX: only the first SCAN_MAX_BYTES are searched
@@ -412,10 +419,10 @@ def read_links_file(f, ext, name="", size=None):
             if not (ext in OLE_EXTS and head == OLE_MAGIC):    # a Solid Edge .asm is an OLE file: read it whole below
                 return read_links_bytes(f.read(SCAN_MAX_BYTES), ext, name)
         if size > MAX_FILE_BYTES:
-            return None
+            return diag.note("references", "file too large")
         return read_links_bytes(f.read(), ext, name)
-    except Exception:
-        return None
+    except Exception as exc:
+        return diag.fail(exc)
 
 
 def read_links(path, ext):
@@ -423,5 +430,5 @@ def read_links(path, ext):
     try:
         with open(path, "rb") as f:
             return read_links_file(f, ext, os.path.basename(path))
-    except Exception:
-        return None
+    except Exception as exc:
+        return diag.fail(exc)

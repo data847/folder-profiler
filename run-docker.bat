@@ -4,7 +4,7 @@ rem Double-click, or drag the folder you want measured onto this file.
 rem The container sees your folder READ-ONLY and has NO network. The metrics zip appears in the "output" folder.
 setlocal
 cd /d "%~dp0"
-set "IMAGE=folder-profiler:1.7"
+set "IMAGE=folder-profiler:1.8"
 where docker >nul 2>nul || (echo Docker Desktop was not found. Install it from docker.com, or use run.bat instead. & pause & exit /b 1)
 docker info >nul 2>nul || (echo Docker is installed but not running. Start Docker Desktop, wait until it says "running", then try again. & pause & exit /b 1)
 set "SRC=%~1"

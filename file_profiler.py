@@ -71,9 +71,10 @@ try:
 except ImportError:
     dwg_sheets = None
 import sysmetrics
+import diag
 from sysmetrics import now_utc
 
-VERSION = "1.7"
+VERSION = "1.8"
 try:
     import name_anon
 except ImportError:          # optional feature: the profiler works without it, the option is then refused
@@ -116,6 +117,46 @@ NO_HEAD_EXTS = frozenset("""jpg jpeg jpe png gif bmp tif tiff webp heic heif ico
     dll exe msi so ttf otf woff woff2 js css map html htm skp skb""".split())
 SHEET_EXTS = {"dwg", "dxf"}               # level 2: AutoCAD drawings - the number of sheets (layouts) is counted, with a confidence
 LINK_READ_EXTS = {"sldasm", "asm", "pwd", "iam", "slddrw", "dft", "idw", "step", "stp", "catproduct", "catdrawing", "drw", "prt"}   # level 2: assemblies, drawings, STEP
+def _load_ext_classes():
+    """extension -> class, from ext_classes.csv next to this file (a copy of the compiler's extensions.csv; tests/test_header_policy.py keeps them equal).
+    Without the file every header is read as before (only NO_HEAD_EXTS are skipped)."""
+    out = {}
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "ext_classes.csv"), encoding="utf-8") as fh:
+            for line in fh.read().splitlines()[1:]:
+                e, _, c = line.partition(",")
+                if e:
+                    out[e] = c
+    except OSError:
+        pass
+    return out
+
+
+EXT_CLASSES = _load_ext_classes()
+CAD_CLASSES = frozenset(("PART", "ASSEMBLY", "DRAWING", "NEUTRAL3D", "SIM", "EDA"))
+GENERIC_EXTS = frozenset("(none) bak tmp temp dat bin old orig back backup txt xml json".split())     # can hold anything (a backup of a drawing, a renamed STEP)
+HIT_PREFIXES = ("STEP:", "IFC:", "IGES:", "DWG:", "DXF:", "STL:", "OLE2:SolidEdge", "OLE2:Inventor", "OLE2:Revit", "CATIA:", "CREO", "EDA:", "SIM:", "MESH:", "VTK:")
+SAMPLE_PER_CHUNK = max(1, int(os.environ.get("PROFILER_SAMPLE_PER_CHUNK", "3")))
+
+
+def head_policy(ext):
+    """What to do with the 4 KB header of a file of this type: 'read' (CAD / drawings / assemblies: the tag names the software and what is inside),
+    'sample' (a type the compiler does not know, or a container that can hold anything: only a few per chunk are read, and a type that shows CAD
+    content is read in full at the end) or 'skip' (the compiler classifies the type by its name; opening the file would add nothing)."""
+    if not EXT_CLASSES:
+        return "skip" if ext in NO_HEAD_EXTS else "read"
+    if ext in SHEET_EXTS or ext in LINK_READ_EXTS:
+        return "read"
+    if ext in NO_HEAD_EXTS:
+        return "skip"
+    c = EXT_CLASSES.get(ext)
+    if c is None:
+        return "sample"
+    if c in CAD_CLASSES:
+        return "read"
+    return "sample" if ext in GENERIC_EXTS else "skip"
+
+
 ASSEMBLY_EXTS = {"sldasm", "asm", "pwd", "iam", "catproduct"}   # the only files whose NAME is recorded (Assembly Breakdown tab)
 SYSTEM_JUNK = {".ds_store", "thumbs.db", "desktop.ini", "ehthumbs.db"}  # OS clutter, not project files
 MAGICS = [  # (prefix, tag)
@@ -135,16 +176,17 @@ OLE_APPS = [  # (entry names inside an OLE2 compound file, tag): the closed list
 ]
 
 
-def signature(path, ext, size):
-    """Closed-vocabulary tag describing the file's format. Never contains file text."""
+def signature(path, ext, size, counter=None):
+    """Closed-vocabulary tag describing the file's format. Never contains file text. On UNREADABLE the reason is left in diag.take()."""
     if size == 0:
         return "EMPTY"
     def go():
         with open(path, "rb") as f:
             return _signature_file(f, ext)
     try:
-        return retry(go)
-    except OSError:
+        return retry(go, counter)
+    except OSError as exc:
+        diag.note("header", reason_of(exc))
         return "UNREADABLE"
 
 
@@ -154,7 +196,8 @@ def signature_stream(f, ext, size):
         return "EMPTY"
     try:
         return _signature_file(f, ext)
-    except Exception:
+    except Exception as exc:
+        diag.note("header", reason_of(exc))
         return "UNREADABLE"
 
 
@@ -283,13 +326,30 @@ def memory_budget():
 MEM_FACTOR = 3        # a DWG / assembly held in memory costs about this many times its size while it is parsed (data + decompressed copies)
 
 
+def _usable_cpus():
+    """CPUs this process may use (container limit and affinity mask respected), 4 when unknown."""
+    try:
+        import sysmetrics
+        return sysmetrics.effective_cpus()
+    except Exception:
+        return os.cpu_count() or 4
+
+
+def _peak_mb():
+    try:
+        import sysmetrics
+        return sysmetrics.peak_memory_mb()
+    except Exception:
+        return ""
+
+
 def default_workers(paths=None):
     env = os.environ.get("PROFILER_WORKERS", "")
     if env.isdigit() and int(env) > 0:
         return int(env)
     if paths and quick_threads(paths) > 4:      # a network share: every file open waits on the network, so many more readers hide the latency
         return 48
-    return min(16, (os.cpu_count() or 4) * 2)   # file reads release the GIL, so threads scale
+    return min(16, _usable_cpus() * 2)          # file reads release the GIL, so threads scale
 
 
 def build_units(root, depth):
@@ -301,7 +361,8 @@ def build_units(root, depth):
         for rel, ab in level:
             try:
                 items = sorted(os.listdir(ab), key=str.lower)
-            except OSError:
+            except OSError as exc:
+                diag.warn("project folders", rel or "(root)", f"could not be listed ({reason_of(exc)}) - it and everything below it is missing from this run")
                 continue
             if any(os.path.isfile(os.path.join(ab, f)) for f in items):
                 loose.append(("(root)" if not rel else f"{rel}/(files)", ab, False))
@@ -337,7 +398,10 @@ def ext_of(name):
 
 
 def iso(ts):
-    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (ValueError, OverflowError, OSError):         # a corrupt date (NTFS can hold the year 60369): no date, never a crash
+        return ""
 
 
 def walk_dirs(base, recurse, on_error, counts):
@@ -397,6 +461,7 @@ def chunk_fingerprints(base, recurse, chunk_files):
     return fps
 
 
+PIPELINE_CHUNKS = max(0, int(os.environ.get("PROFILER_PIPELINE_CHUNKS", "4")))      # chunks left in flight while the next one is listed (0 = wait for each chunk, as before)
 CHUNK_FILES = 5000           # files per checkpoint: after a crash at most this many files of one project are redone
 _TEST_HOOK = None            # tests set this to a callable(unit_index, chunk_index) to simulate a crash after a chunk is saved
 
@@ -457,6 +522,86 @@ DEDUP_TAG = 0x80000013                                   # reparse tag of a Wind
 TRANSIENT_WINERRORS = {53, 59, 64, 67, 121, 1231, 1232}  # bad network path, unexpected network error, name deleted, bad share, timeout, unreachable
 TRANSIENT_ERRNOS = {errno.ETIMEDOUT, errno.ECONNRESET, errno.ECONNABORTED, errno.EHOSTUNREACH, errno.ENETUNREACH, errno.ENETDOWN, errno.ESTALE}
 RETRY_DELAYS = (0.5, 2.0, 5.0)
+class PathStore:
+    """Step 1's per-type file lists. Rows are kept in memory up to `mem_rows`, then appended to temp files, so memory stays flat however many
+    files there are (it was about 250 bytes per file, which killed a 512 MB container at 2 million files). One writer per scan thread, no locks.
+    chunks(ext) hands the rows back as (unit, folder, [(name, size, mtime), ...]); close() deletes the temp files."""
+
+    def __init__(self, nthreads, mem_rows):
+        self.mem = [collections.defaultdict(list) for _ in range(nthreads)]
+        self.held = [0] * nthreads
+        self.n = [collections.Counter() for _ in range(nthreads)]
+        self.limit = max(1, int(mem_rows) // max(1, nthreads))
+        self.dir = None
+        self._mk = threading.Lock()
+        self.files = [dict() for _ in range(nthreads)]          # per thread: ext -> temp file
+        self.spills = 0
+
+    def add(self, k, ext, ui, rel, lst):
+        self.mem[k][ext].append((ui, rel, lst))
+        self.n[k][ext] += len(lst)
+        self.held[k] += len(lst)
+        if self.held[k] >= self.limit:
+            self._spill(k)
+
+    def _spill(self, k):
+        import tempfile
+        with self._mk:                                          # two threads can spill at the same moment: one folder, not two
+            if self.dir is None:
+                import atexit
+                self.dir = tempfile.mkdtemp(prefix="profiler_paths_")      # TMPDIR / the OS temp folder; removed by close(), and at exit if an error got in the way
+                atexit.register(self.close)
+        for ext, chunks in self.mem[k].items():
+            fn = self.files[k].get(ext)
+            if fn is None:
+                fn = self.files[k][ext] = os.path.join(self.dir, f"{k}_{len(self.files[k])}.csv")
+            with open(fn, "a", encoding="utf-8", errors="surrogatepass", newline="") as f:
+                w = csv.writer(f, lineterminator="\n")
+                for ui, rel, lst in chunks:
+                    w.writerows([ui, rel, nm, sz, mt] for nm, sz, mt in lst)
+        self.mem[k].clear()
+        self.held[k] = 0
+        self.spills += 1
+
+    def exts(self):
+        return set().union(*[set(c) for c in self.n]) if self.n else set()
+
+    def count(self, ext):
+        return sum(c.get(ext, 0) for c in self.n)
+
+    def chunks(self, ext):
+        for k in range(len(self.mem)):
+            fn = self.files[k].get(ext)
+            if fn:
+                cur, buf = None, []
+                with open(fn, "r", encoding="utf-8", errors="surrogatepass", newline="") as f:
+                    for ui, rel, nm, sz, mt in csv.reader(f):
+                        if cur != (int(ui), rel):
+                            if buf:
+                                yield cur[0], cur[1], buf
+                            cur, buf = (int(ui), rel), []
+                        buf.append((nm, int(sz), float(mt)))
+                if buf:
+                    yield cur[0], cur[1], buf
+            yield from self.mem[k].get(ext, ())
+
+    def close(self):
+        if self.dir:
+            import shutil
+            shutil.rmtree(self.dir, ignore_errors=True)
+            self.dir = None
+
+
+def paths_mem_rows():
+    """File-path rows Step 1 may hold in memory before spilling to disk: about a thousandth of the memory budget in rows (a 256 MB budget
+    -> 268,000 rows, roughly 70 MB). PROFILER_PATHS_MEM_ROWS overrides."""
+    env = os.environ.get("PROFILER_PATHS_MEM_ROWS", "")
+    if env.isdigit() and int(env) > 0:
+        return int(env)
+    return memory_budget() // 1000
+
+
+PATHS_MAX_FILES = int(os.environ.get("PROFILER_PATHS_MAX_FILES", "6000000"))      # paths kept in memory for Step 1's file lists (about 130 bytes each)
 MAX_UNREADABLE = 20000                                   # listed in Unreadable.csv; the counts stay exact beyond this
 
 
@@ -513,10 +658,12 @@ def quick_threads(paths):
     return 32 if remote else 4
 
 
-def scan_tree(units, nthreads, progress=None, only=None):
+def scan_tree(units, nthreads, progress=None, only=None, paths=False):
     """The threaded folder listing used by BOTH steps: how many files of each type and how big, per unit, from folder listings only (no file is
     opened). units = [(name, folder, recurse)]; only = indexes of the units to scan (None = all). No depth limit; folder links / junctions
     are not followed. A folder is listed atomically (retried as a whole after a network hiccup), so nothing is ever counted twice.
+    paths=True also keeps, per file type, every file's name, size and date (taken from the stat the scan makes anyway): res["paths"] =
+    a PathStore (in memory up to paths_mem_rows(), then temp files; .chunks(ext) -> (unit, folder, [(name, size, mtime), ...])), capped at PATHS_MAX_FILES (counts["paths_dropped"] says how many were not kept).
     -> {"tally": {(unit, ext): [files, bytes]}, "unit": {unit: Counter(junk, tiered, dedup)}, "counts": Counter, "unreadable": [(unit, rel, kind, reason)]}"""
     import queue
     progress = progress or (lambda *a: None)
@@ -529,6 +676,8 @@ def scan_tree(units, nthreads, progress=None, only=None):
     extras = [collections.defaultdict(collections.Counter) for _ in range(nthreads)]
     ctr = [collections.Counter() for _ in range(nthreads)]
     bad = [[] for _ in range(nthreads)]
+    pstore = PathStore(nthreads, paths_mem_rows()) if paths else None
+    kept = [0]                                               # files whose path was kept (shared; guarded by `lock`)
     bases = {ui: lp(units[ui][1]) for ui in todo}
     for ui in todo:
         q.put((ui, bases[ui], 0, units[ui][2]))
@@ -542,6 +691,7 @@ def scan_tree(units, nthreads, progress=None, only=None):
         """One folder: ONE stat per entry (on Windows it arrives with the directory listing, no extra disk access) gives file / folder / link
         and the size. Everything is gathered locally and returned, so a retry after a dropped connection starts clean."""
         subdirs, loc, ferr = [], {}, []
+        locp = {} if paths else None
         nfiles = nbytes = njunk = nerr = nlinks = ntier = ndedup = 0
         with os.scandir(path) as it:
             for e in it:
@@ -579,10 +729,15 @@ def scan_tree(units, nthreads, progress=None, only=None):
                     t[1] += size
                     nfiles += 1
                     nbytes += size
+                    if locp is not None:
+                        lst = locp.get(ext)
+                        if lst is None:
+                            lst = locp[ext] = []
+                        lst.append((name, size, st.st_mtime))
                 except OSError as ex:
                     nerr += 1
                     ferr.append((e.name, reason_of(ex)))
-        return subdirs, loc, (nfiles, nbytes, njunk, nerr, nlinks, ntier, ndedup), ferr
+        return subdirs, loc, (nfiles, nbytes, njunk, nerr, nlinks, ntier, ndedup), ferr, locp
 
     def work(k):
         tally, c, ex_ = tallies[k], ctr[k], extras[k]
@@ -593,8 +748,19 @@ def scan_tree(units, nthreads, progress=None, only=None):
             ui, path, depth, recurse = item
             subdirs = []
             try:
-                subdirs, loc, nums, ferr = retry(lambda: list_dir(path, recurse), c)
+                subdirs, loc, nums, ferr, locp = retry(lambda: list_dir(path, recurse), c)
                 nfiles, nbytes, njunk, nerr, nlinks, ntier, ndedup = nums
+                if locp:
+                    with lock:
+                        room = kept[0] + nfiles <= PATHS_MAX_FILES
+                        if room:
+                            kept[0] += nfiles
+                    if room:
+                        rel_ = relpath(ui, path)
+                        for ext, lst in locp.items():
+                            pstore.add(k, ext, ui, rel_, lst)
+                    else:
+                        c["paths_dropped"] += nfiles
                 for ext, (n, b) in loc.items():
                     t = tally[(ui, ext)]
                     t[0] += n
@@ -617,10 +783,14 @@ def scan_tree(units, nthreads, progress=None, only=None):
                 if ferr and len(bad[k]) < MAX_UNREADABLE:
                     rel = relpath(ui, path)
                     bad[k] += [(ui, f"{rel}/{nm}" if rel else nm, "file", why) for nm, why in ferr]
+                elif ferr:
+                    c["unreadable_not_listed"] += len(ferr)
             except OSError as ex:
                 c["dir_errors"] += 1
                 if len(bad[k]) < MAX_UNREADABLE:
                     bad[k].append((ui, relpath(ui, path), "folder", reason_of(ex)))
+                else:
+                    c["unreadable_not_listed"] += 1
             with lock:
                 pending[0] += len(subdirs) - 1
                 done = pending[0] == 0
@@ -651,7 +821,9 @@ def scan_tree(units, nthreads, progress=None, only=None):
     for ex_ in extras:
         for ui, cn in ex_.items():
             unit[ui].update(cn)
-    return {"tally": dict(tally), "unit": dict(unit), "counts": counts, "unreadable": [x for lst in bad for x in lst][:MAX_UNREADABLE]}
+    flat = [x for lst in bad for x in lst]
+    counts["unreadable_not_listed"] += max(0, len(flat) - MAX_UNREADABLE)
+    return {"tally": dict(tally), "unit": dict(unit), "counts": counts, "unreadable": flat[:MAX_UNREADABLE], "paths": pstore}
 
 
 def unreadable_csv(units, rows, with_paths=True, files_with_paths=True):
@@ -675,16 +847,59 @@ def _name_map(flag):
     return name_anon.NameMap()
 
 
-def quick_scan(root, out_dir, log=print, label=None, folders=None, workers=None, progress=None, project_depth=None, anonymize_names=None, name_map=True):
+def _safe_member(ext, used):
+    """File name for the list of one file type inside the zip: lower case, safe characters, no Windows device names, unique."""
+    n = "no_extension" if ext == "(none)" else re.sub(r"[^a-z0-9_+.\-]", "_", ext.lower())[:40] or "_"
+    if n.split(".")[0] in {"con", "prn", "aux", "nul"} or re.fullmatch(r"(com|lpt)\d", n.split(".")[0]) or n.endswith("."):
+        n += "_"
+    base, k = n, 1
+    while n in used:
+        k += 1
+        n = f"{base}_{k}"
+    used.add(n)
+    return n
+
+
+def write_path_lists(z, units, paths, nm=None):
+    """Paths/<type>.csv for every file type: project, path inside the project, size_bytes, modified_utc (from the listing; no file is opened).
+    Names are the real ones, or the codes of `nm` when names are anonymised. -> (number of files written, {type: member name})"""
+    used, index, written = set(), {}, 0
+    for ext in sorted(paths.exts(), key=lambda e: (-paths.count(e), e)):
+        member = _safe_member(ext, used)
+        index[ext] = member
+        with z.open(f"Paths/{member}.csv", "w", force_zip64=True) as raw:
+            out = io.TextIOWrapper(raw, encoding="utf-8", newline="")
+            out.write("\ufeff")
+            w = csv.writer(out, lineterminator="\r\n")
+            w.writerow(["project", "path", "size_bytes", "modified_utc"])
+            for ui, rel, lst in paths.chunks(ext):
+                proj = units[ui][0]
+                if nm:
+                    proj = nm.project(proj)
+                pre = (rel + "/") if rel else ""
+                rows = [[proj, nm.file_path(pre + nm_) if nm else pre + nm_, sz, iso(mt)] for nm_, sz, mt in lst]
+                w.writerows(rows)
+                written += len(rows)
+            out.flush()
+            out.detach()
+    return written, index
+
+
+def quick_scan(root, out_dir, log=print, label=None, folders=None, workers=None, progress=None, project_depth=None, anonymize_names=None, name_map=True, list_paths=None):
     """STEP 1 - the quick count: how many files of each type, and how big, per project and overall. Metadata only: no file is opened,
     no archive is looked into, nothing is read - just the folder listings the operating system already holds (see scan_tree). Writes
     quick_<name>_<stamp>.zip: Extensions.csv (per project), Extensions_All.csv, Projects.csv, Unreadable.csv, Run_info.csv.
     -> (zip_path, number of projects, number of files, unreadable folders + files)."""
     t0 = time.time()
     project_depth = max(1, int(os.environ.get("PROFILER_PROJECT_DEPTH", 1)) if project_depth is None else int(project_depth))
+    diag.drain_warnings()
     units, label, data_paths = resolve_units(root, folders, label, project_depth)
+    setup_warnings = diag.drain_warnings()
+    for where, path_, why in setup_warnings:
+        log(f"WARNING ({where}): {path_}: {why}")
     nthreads = int(workers) if workers else quick_threads(data_paths)
-    res = scan_tree(units, nthreads, progress)
+    want_paths = (os.environ.get("PROFILER_PATHS", "1").lower() not in ("0", "false", "no")) if list_paths is None else bool(list_paths)
+    res = scan_tree(units, nthreads, progress, paths=want_paths)
     total = res["counts"]
     ext_stats = res["tally"]
     secs = time.time() - t0
@@ -723,11 +938,13 @@ def quick_scan(root, out_dir, log=print, label=None, folders=None, workers=None,
             ["deepest_folder_level", total["max_depth"]], ["distinct_extensions", len(overall)], ["unreadable_folders", total["dir_errors"]],
             ["read_errors", total["errors"]], ["linked_folders_skipped", total["links_skipped"]], ["ignored_system_files", total["junk"]],
             ["cloud_tiered_files", total["tiered_files"]], ["deduplicated_files", total["dedup_files"]], ["network_retries", total["retries"]],
-            ["threads", nthreads], ["seconds", round(secs, 1)], ["files_per_s", round(nfiles / max(secs, 0.01))],
-            ["files_opened", 0], ["hashing", "none"], ["names_anonymized", "yes" if nm else "no"]]
+            ["unreadable_not_listed_cap", total["unreadable_not_listed"]], ["setup_warnings", len(setup_warnings)],
+            ["threads", nthreads], ["usable_cpus", _usable_cpus()], ["seconds", round(secs, 1)], ["files_per_s", round(nfiles / max(secs, 0.01))],
+            ["files_opened", 0], ["hashing", "none"], ["names_anonymized", "yes" if nm else "no"],
+            ["file_paths_listed", "yes" if want_paths else "no"], ["file_paths_not_kept_over_limit", total["paths_dropped"] if want_paths else 0]]
     what = ("This archive was made by the Folder Profiler QUICK COUNT (step 1).\r\n"
             "It lists, per project folder and overall, how many files of each type there are and how big they are. No file was opened,\r\n"
-            "no archive was looked into, and no file names are recorded - only the project (folder) names, the file types, and the names of\r\n"
+            "no archive was looked into, and no file names are recorded unless a Paths folder is present - only the project (folder) names, the file types, and the names of\r\n"
             "any folders that could not be read (Unreadable.csv).\r\n"
             "Extensions.csv (per project), Extensions_All.csv (whole folder), Projects.csv, Unreadable.csv, Run_info.csv. Open them with Excel or Notepad.\r\n"
             + ("Names are ANONYMISED: project and folder names are codes (P-xxxx-nnnn, D-xxxx-nnnnnn). The owner keeps the name map separately.\r\n" if nm else ""))
@@ -736,8 +953,18 @@ def quick_scan(root, out_dir, log=print, label=None, folders=None, workers=None,
         z.writestr("Extensions_All.csv", csv_bytes(["ext", "file_count", "total_bytes", "share_of_files_pct", "share_of_bytes_pct"], all_rows))
         z.writestr("Projects.csv", csv_bytes(["project", "file_count", "total_bytes", "distinct_extensions"], proj_rows))
         z.writestr("Unreadable.csv", csv_bytes(["project", "kind", "path", "reason"], bad_rows))
-        z.writestr("Run_info.csv", csv_bytes(["key", "value"], info))
-        z.writestr("WHAT_IS_IN_THIS_ZIP.txt", what.encode("utf-8"))
+        if setup_warnings:
+            z.writestr("Setup_Warnings.csv", csv_bytes(["where", "path", "reason"], [[w, nm.folder_path(pp) if nm else pp, why] for w, pp, why in setup_warnings]))
+        t_paths = time.time()
+        n_paths, p_index = write_path_lists(z, units, res["paths"], nm) if want_paths and res.get("paths") else (0, {})
+        if want_paths:
+            z.writestr("Paths_Index.csv", csv_bytes(["file_type", "list", "files"], [[e, f"Paths/{m}.csv", res["paths"].count(e)] for e, m in p_index.items()]))
+        paths_s = time.time() - t_paths
+        z.writestr("Run_info.csv", csv_bytes(["key", "value"], info + ([["seconds_writing_path_lists", round(paths_s, 1)], ["path_list_spills_to_disk", res["paths"].spills]] if want_paths else []) + [["peak_memory_mb", _peak_mb()]]))
+        z.writestr("WHAT_IS_IN_THIS_ZIP.txt", (what + ("Paths/<type>.csv lists EVERY file of that type: project, path inside the project, size and modified date (read from the folder listing; "
+                                                       "no file was opened). Paths_Index.csv says how many files each list has.\r\n" if want_paths else "")).encode("utf-8"))
+    if res.get("paths"):
+        res["paths"].close()
     map_zip = ""
     if nm and name_map:
         map_zip = nm.write_zip(os.path.join(out_dir, f"name_map_{re.sub(r'[^A-Za-z0-9_.-]', '_', label)}_{stamp}.zip"), label)
@@ -775,7 +1002,9 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
         anonymize_assembly_names = os.environ.get("PROFILER_ANON_ASM", "").lower() in ("1", "true", "yes")
 
     # ---- what to profile
+    diag.drain_warnings()
     units, label, data_paths = resolve_units(root, folders, label, project_depth)
+    setup_warnings = diag.drain_warnings()
     workers = max(1, workers or default_workers(data_paths))
     if nm:
         for u in units:
@@ -784,7 +1013,10 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
 
     gate = MemGate(memory_budget())
     copies = {}                                  # (ext, name, size, date) -> (tag, sheet result): exact copies of a drawing are not read twice
-    no_head = frozenset() if os.environ.get("PROFILER_READ_ALL_HEADERS", "").lower() in ("1", "true", "yes") else NO_HEAD_EXTS
+    read_all = os.environ.get("PROFILER_READ_ALL_HEADERS", "").lower() in ("1", "true", "yes")
+    no_head = frozenset() if read_all else NO_HEAD_EXTS             # (kept: part of the run's identity, see cfg)
+    policy = (lambda ext: "read") if read_all else head_policy
+    hit_types = set()                                               # (project, ext) of sampled types whose sample showed CAD content
     # ---- run identity, checkpoint state
     cfg = json.dumps({"v": VERSION, "nohead": bool(no_head), "units": [[u[0], u[1], u[2]] for u in units], "tier": tier, "depth": project_depth,
                       "anon": bool(anonymize_assembly_names), "anon_names": bool(nm),
@@ -794,17 +1026,17 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
     LAST_RUN["state_dir"] = state_dir           # so a failed run's logs can be bundled (make_fail_log)
     if not resume:
         shutil.rmtree(state_dir, ignore_errors=True)
-    for sub in ("rows", "links", "dirs"):
+    for sub in ("rows", "links", "dirs", "problems"):
         os.makedirs(os.path.join(state_dir, sub), exist_ok=True)
     mpath = os.path.join(state_dir, "manifest.json")
-    man = None
+    man, man_problem = None, ""
     if os.path.exists(mpath):
         try:
             man = json.load(open(mpath, encoding="utf-8"))
             if man.get("cfg") != cfg:
                 man = None
-        except Exception:
-            man = None
+        except Exception as exc:
+            man, man_problem = None, type(exc).__name__
     resumed = man is not None
     if man is None:
         man = {"cfg": cfg, "salt": os.urandom(8).hex(), "created": now_utc(), "restarts": 0, "elapsed": 0.0, "units": {},
@@ -850,6 +1082,10 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
     rlog.event("start", ("RESUMED run (restart #%d) " % man["restarts"] if resumed else "started ") +
                f"v{VERSION}: level {tier}, project depth {project_depth}, {workers} workers, "
                f"{len(units)} projects, hashing: none")
+    if man_problem:
+        rlog.event("start", f"the saved progress of an earlier run could not be read ({man_problem}) - starting from the beginning", "WARN")
+    for where, path_, why in setup_warnings:
+        rlog.event("start", f"{where}: {(nm.folder_path(path_) if nm else path_)}: {why}", "WARN")
 
     manifest_clock = [0.0, 0.0]               # when the progress file was last written, and how long that took
 
@@ -868,7 +1104,7 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
     def on_walk_error(e):
         C["dir_errors"] += 1
         C["errors"] += 1
-        rlog.event(state["phase"], f"unreadable folder skipped ({type(e).__name__})", "WARN")
+        rlog.event(state["phase"], f"unreadable folder skipped ({reason_of(e)})", "WARN")
 
     walk_counts = collections.Counter()
     pool = ThreadPoolExecutor(max_workers=workers)
@@ -889,9 +1125,12 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
             for ui in need:
                 u = man["units"][units[ui][0]]
                 ex_ = res["unit"].get(ui, collections.Counter())
+                lst = [[rel, kind, why] for (i, rel, kind, why) in res["unreadable"] if i == ui]
+                C["unreadable_not_listed"] += max(0, len(lst) - 5000)
                 u.update(files=by_unit[ui][0], bytes=by_unit[ui][1], junk=ex_["junk"], tiered=ex_["tiered"], dedup=ex_["dedup"],
-                         unreadable=[[rel, kind, why] for (i, rel, kind, why) in res["unreadable"] if i == ui][:5000])
+                         unreadable=lst[:5000])
             cnt = res["counts"]
+            C["unreadable_not_listed"] += cnt["unreadable_not_listed"]
             C["dir_errors"] += cnt["dir_errors"]
             C["errors"] += cnt["dir_errors"] + cnt["errors"]
             C["retries"] += cnt["retries"]
@@ -970,7 +1209,13 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
             pending, chunk_idx = [], 0
             wbase = lp(base)
 
+            retries_seen = [C["retries"]]
+            inflight = collections.deque()               # chunks whose reads were submitted but whose rows are not yet written (kept in order)
+
             def flush_chunk():
+                """Submit this chunk's reads and go straight on listing the next chunk; the oldest chunk is finished (rows built, checkpoint
+                written) once PIPELINE_CHUNKS are in flight. Before, each chunk was waited for, so the readers idled while the next 5,000 files
+                were being listed."""
                 nonlocal pending, chunk_idx
                 fp = 0                                   # what this chunk's files looked like (names, sizes, dates) when seen now
                 for e in pending:
@@ -986,11 +1231,17 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
                     rlog.event("process", f"{shown(proj)}: chunk {chunk_idx + 1} was saved before the folder changed - profiled again", "WARN")
                 t_c = time.time()
 
-                def work(e):
+                def work(e, allow=True):
+                    diag.take()                                # forget the note of the previous file read by this thread
+                    r = work_core(e, allow)
+                    return r + (diag.take(),)                  # why the file was not fully read, '' when it was
+
+                def work_core(e, allow=True):
                     path, name, ext, size, mtime, dir_id, depth, asm, relpath, nn, tiered = e
                     if tiered:                                 # not really on this disk (cloud-tiered / online-only): opening it would download it
                         return "TIERED", None, False, (TIERED_SHEET if tier >= 2 and ext in SHEET_EXTS and dwg_sheets is not None else None)
-                    if ext in no_head:                         # nothing in the header would be used: do not open the file at all
+                    pol = policy(ext)
+                    if pol == "skip" or (pol == "sample" and not allow):      # nothing in the header would be used: do not open the file at all
                         return ("NOTAG" if size else "EMPTY"), None, False, None
                     if tier >= 2 and ext in SHEET_EXTS and dwg_sheets is not None and size > 0:
                         ck = (ext, name.lower(), size, mtime)          # an exact copy (same name, size, date: the compiler's own duplicate rule) was already read
@@ -1007,7 +1258,8 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
                                     return sig, dwg_sheets.count_sheets_file(fh, ext, size, head=known)
                         try:
                             sig, sh = retry(read_sheets, C)
-                        except OSError:
+                        except OSError as exc:
+                            diag.note("header", reason_of(exc))
                             return "UNREADABLE", None, False, None
                         if len(copies) < 500_000:
                             copies[ck] = (sig, sh)
@@ -1022,22 +1274,47 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
                                     return sig, cad_links.read_links_file(fh, ext, name, size)
                         try:
                             sig, res = retry(read_refs, C)
-                        except OSError:
+                        except OSError as exc:
+                            diag.note("header", reason_of(exc))
                             return "UNREADABLE", None, True, None
                         return sig, res, True, None
                     with act.timer("format_tag_read"):
-                        sig = signature(path, ext, size)
+                        sig = signature(path, ext, size, C)
                     return sig, None, False, None
 
-                rows, lrows = [], []
-                for e, (sig, res, was_link, sh) in zip(pending, pool.map(work, pending)):
+                seen = collections.Counter()
+                allow = []
+                for e in pending:                                    # sampled types: only the first few of each type in this chunk are read
+                    if policy(e[2]) == "sample":
+                        seen[e[2]] += 1
+                        allow.append(seen[e[2]] <= SAMPLE_PER_CHUNK)
+                    else:
+                        allow.append(True)
+                inflight.append((chunk_idx, pending, [pool.submit(work, e, a) for e, a in zip(pending, allow)], fp, t_c))
+                chunk_idx += 1
+                pending = []
+                while len(inflight) > PIPELINE_CHUNKS:
+                    finish_chunk(inflight.popleft())
+
+            def finish_chunk(job):
+                chunk_no, pend, futs, fp, t_c = job
+                fps = u.setdefault("fps", [])
+                rows, lrows, prows = [], [], []
+                for e, fut in zip(pend, futs):
+                    sig, res, was_link, sh, why = fut.result()
                     path, name, ext, size, mtime, dir_id, depth, asm, relpath, nn, tiered = e
                     if sig == "NOTAG":
                         C["head_skipped"] += 1
+                    elif sig != "EMPTY" and policy(ext) == "sample":
+                        C["head_sampled"] += 1
+                    why_txt = why.split(": ", 1)[-1] if why else ""
                     if "UNREADABLE" in sig:
                         C["errors"] += 1
                         if len(u.setdefault("unreadable", [])) < 5000:
-                            u["unreadable"].append([relpath if tier >= 1 else "", "file", "could not be read"])
+                            u["unreadable"].append([relpath if tier >= 1 else "", "file", why_txt or "could not be read"])
+                        else:
+                            C["unreadable_not_listed"] += 1
+                        prows.append([proj, nn, ext, "header", why_txt or "could not be read"])
                     if sh is not None:
                         if sh.get("reused"):
                             C["sheets_reused"] += 1
@@ -1047,24 +1324,33 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
                     if was_link:
                         if res is None:
                             C["link_unreadable"] += 1
+                            if "UNREADABLE" not in sig:
+                                prows.append([proj, nn, ext, "references", why_txt or "not understood"])
                         else:
                             C["link_read"] += 1
                             lrows += link_rows(proj, nn, ext, res)
                     state["files"] += 1
                     state["bytes"] += size
                     tick()
+                if prows:
+                    kinds = collections.Counter(f"{r[3]}: {r[4]}" for r in prows)
+                    rlog.event("process", f"{shown(proj)}: chunk {chunk_no + 1}: {len(prows)} file(s) not fully read ("
+                                          + ", ".join(f"{k} x{v}" for k, v in kinds.most_common(4)) + ") - listed in Read_Problems.csv", "WARN")
+                if C["retries"] > retries_seen[0]:             # reads run in several chunks at once: count what dropped since the previous chunk was written
+                    rlog.event("process", f"{shown(proj)}: chunk {chunk_no + 1}: the network dropped {C['retries'] - retries_seen[0]} time(s) while reading; "
+                                          "each read was tried again", "WARN")
+                retries_seen[0] = C["retries"]
                 with act.timer("write_checkpoint"):
-                    _write_csv_atomic(os.path.join(state_dir, "rows", f"u{ui}_c{chunk_idx:06d}.csv"), rows)
-                    _write_csv_atomic(os.path.join(state_dir, "links", f"u{ui}_c{chunk_idx:06d}.csv"), lrows)
-                    del fps[chunk_idx:chunk_idx + 1]
-                    fps.insert(chunk_idx, fp)
-                    u["chunks_done"] = max(u.get("chunks_done", 0), chunk_idx + 1)
+                    _write_csv_atomic(os.path.join(state_dir, "rows", f"u{ui}_c{chunk_no:06d}.csv"), rows)
+                    _write_csv_atomic(os.path.join(state_dir, "links", f"u{ui}_c{chunk_no:06d}.csv"), lrows)
+                    _write_csv_atomic(os.path.join(state_dir, "problems", f"u{ui}_c{chunk_no:06d}.csv"), prows)
+                    del fps[chunk_no:chunk_no + 1]
+                    fps.insert(chunk_no, fp)
+                    u["chunks_done"] = max(u.get("chunks_done", 0), chunk_no + 1)
                     save_manifest()
-                rlog.event("process", f"{shown(proj)}: chunk {chunk_idx + 1} saved ({len(rows):,} files, {time.time() - t_c:.1f}s)")
+                rlog.event("process", f"{shown(proj)}: chunk {chunk_no + 1} saved ({len(rows):,} files, {time.time() - t_c:.1f}s from submit)")
                 if _TEST_HOOK:
-                    _TEST_HOOK(ui, chunk_idx)
-                chunk_idx += 1
-                pending = []
+                    _TEST_HOOK(ui, chunk_no)
 
             proc_counts = collections.Counter()
             for dirpath, rel, depth, files in walk_dirs(wbase, recurse, lambda e: None, proc_counts):   # folders already counted by the scan
@@ -1081,6 +1367,8 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
                         C["errors"] += 1
                         if len(u.setdefault("unreadable", [])) < 5000:
                             u["unreadable"].append([relpath if tier >= 1 else "", "file", reason_of(ex)])
+                        else:
+                            C["unreadable_not_listed"] += 1
                         st = None
                     if st is not None:
                         ext = ext_of(name)
@@ -1094,9 +1382,11 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
             C["retries"] += proc_counts["retries"]
             if pending or (n and n % chunk_files):
                 flush_chunk()
+            while inflight:                                     # the project is only done when every chunk submitted for it has been written
+                finish_chunk(inflight.popleft())
             if chunk_idx < u.get("chunks_done", 0):             # the project shrank: drop saved chunks past its new end
                 for k in range(chunk_idx, u["chunks_done"]):
-                    for sub in ("rows", "links"):
+                    for sub in ("rows", "links", "problems"):
                         try:
                             os.remove(os.path.join(state_dir, sub, f"u{ui}_c{k:06d}.csv"))
                         except OSError:
@@ -1158,12 +1448,33 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
         names = sorted(chunk_index[sub].get(ui, ()), key=lambda f: (f[len(pre)] != "c", f))          # chunks in order
         return [os.path.join(d, f) for f in names]
 
-    all_dirs = dict(dirs)
-    for ui in range(len(units)):
-        fpath = os.path.join(state_dir, "dirs", f"u{ui}.csv")
-        if os.path.exists(fpath):
-            for d in csv.reader(open(fpath, newline="", encoding="utf-8")):
-                all_dirs.setdefault(d[0], (units[ui][0], d[1], int(d[2]), d[3]))
+    def dir_rows():
+        """Dirs.csv rows, one project at a time (sorted by project, depth, dir_id) from the saved per-project files: the folder table of a
+        big drive (400,000 folders) is never held whole in memory - doing so cost more than 100 MB."""
+        left = collections.defaultdict(dict)
+        for i, v in dirs.items():
+            left[v[0]][i] = v
+        by_name = {u[0]: ui for ui, u in enumerate(units)}
+        for pname in sorted(by_name):
+            cur = dict(left.get(pname, ()))
+            fpath = os.path.join(state_dir, "dirs", f"u{by_name[pname]}.csv")
+            if os.path.exists(fpath):
+                with open(fpath, newline="", encoding="utf-8") as fh:
+                    for d in csv.reader(fh):
+                        cur.setdefault(d[0], (pname, d[1], int(d[2]), d[3]))
+            for d, v in sorted(cur.items(), key=lambda kv: (kv[1][2], kv[0])):
+                yield d, v
+    hit_types = set()                                    # sampled types whose sample showed CAD content: rebuilt from the saved rows (also right after a restart)
+    hit_read = collections.Counter()                     # (project, ext) -> files of such a type read in full now
+    if EXT_CLASSES and not read_all:
+        for ui in range(len(units)):
+            for fpath in chunk_files_of("rows", ui):
+                with open(fpath, encoding="utf-8", newline="") as fh:
+                    for row in csv.reader(fh):
+                        if row[6].startswith(HIT_PREFIXES) and head_policy(row[2]) == "sample":
+                            hit_types.add((row[0], row[2]))
+    bases = {u[0]: u[1] for u in units}
+    post_pool = None
     tmp_zip = zip_path + ".tmp"
     with zipfile.ZipFile(tmp_zip, "w", zipfile.ZIP_DEFLATED) as z:
         with z.open("Files.csv", "w", force_zip64=True) as out:
@@ -1172,6 +1483,18 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
                 for fpath in chunk_files_of("rows", ui):
                     text = open(fpath, encoding="utf-8", newline="").read()
                     rows_in = csv.reader(io.StringIO(text))
+                    rewritten = False
+                    if hit_types and tier >= 1:                    # a sampled type showed CAD content: read the files of that type that were skipped
+                        rows_in = list(rows_in)
+                        todo = [r for r in rows_in if r[6] == "NOTAG" and (r[0], r[2]) in hit_types and int(r[3]) > 0]
+                        if todo:
+                            if post_pool is None:
+                                post_pool = ThreadPoolExecutor(max_workers=workers)
+                            sigs = list(post_pool.map(lambda r: signature(lp(os.path.join(bases[r[0]], *r[9].split("/"))), r[2], int(r[3])), todo))
+                            for r, sg in zip(todo, sigs):
+                                r[6] = sg
+                                hit_read[(r[0], r[2])] += 1
+                            rewritten = True
                     if nm:                                         # rename on the way out: project, assembly name, path
                         renamed = []
                         for row in rows_in:
@@ -1185,6 +1508,10 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
                         csv.writer(buf_, lineterminator="\r\n").writerows(renamed)
                         out.write(buf_.getvalue().encode("utf-8"))
                         rows_in = renamed
+                    elif rewritten:
+                        buf_ = io.StringIO(newline="")
+                        csv.writer(buf_, lineterminator="\r\n").writerows(rows_in)
+                        out.write(buf_.getvalue().encode("utf-8"))
                     else:
                         out.write(text.encode("utf-8"))
                     for row in rows_in:
@@ -1196,6 +1523,9 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
                         e = ext_stats.setdefault((proj_, ext_), [0, 0])
                         e[0] += 1; e[1] += size_
                         nfiles_out += 1; bytes_out += size_
+
+        if post_pool is not None:
+            post_pool.shutdown(wait=True)
 
         def put(name, header, rows):
             buf = io.StringIO(newline="")
@@ -1215,14 +1545,36 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
                             csv.writer(lbuf, lineterminator="\r\n").writerows(lrows)
                             ltext = lbuf.getvalue()
                         out.write(ltext.encode("utf-8"))
+        rp_rows = []
+        for ui in range(len(units)):
+            for fpath in chunk_files_of("problems", ui):
+                for r in csv.reader(open(fpath, newline="", encoding="utf-8")):
+                    rp_rows.append([nm.project(r[0]) if nm else r[0]] + r[1:])
+        if rp_rows:
+            put("Read_Problems.csv", ["project", "file_no", "ext", "stage", "reason"], rp_rows)
+            rlog.event("finalize", f"{len(rp_rows):,} file(s) could not be fully read - Read_Problems.csv gives the file number (see Files.csv) and the reason", "WARN")
+        if setup_warnings:
+            put("Setup_Warnings.csv", ["where", "path", "reason"], [[w, nm.folder_path(pp) if nm else pp, why] for w, pp, why in setup_warnings])
+        if C["unreadable_not_listed"]:
+            rlog.event("finalize", f"{C['unreadable_not_listed']:,} more unreadable item(s) than the Unreadable.csv lists hold; the counts in Run_info.csv are exact", "WARN")
         put("Unreadable.csv", ["project", "kind", "path", "reason"],
             [[nm.project(proj_) if nm else proj_, kind,
               ((nm.folder_path(rel) if kind == "folder" else nm.file_path(rel)) if nm else rel) if tier >= 1 else "", why]
              for proj_, uu in man["units"].items() for rel, kind, why in uu.get("unreadable", [])])
-        put("Dirs.csv", ["dir_id", "project", "parent_dir_id", "depth"] + (["name"] if tier >= 1 else []),
-            [[d, nm.project(v[0]) if nm else v[0], v[1], v[2]]
-             + ([(nm.project(v[3]) if v[2] == 0 and v[3] == v[0] else nm.folder(v[3])) if nm else v[3]] if tier >= 1 else [])
-             for d, v in sorted(all_dirs.items(), key=lambda kv: (kv[1][0], kv[1][2], kv[0]))])
+        with z.open("Dirs.csv", "w", force_zip64=True) as out:                  # streamed: written 5,000 rows at a time
+            out.write(("\ufeff" + ",".join(["dir_id", "project", "parent_dir_id", "depth"] + (["name"] if tier >= 1 else [])) + "\r\n").encode("utf-8"))
+            buf_, w_, n_ = io.StringIO(newline=""), None, 0
+            w_ = csv.writer(buf_, lineterminator="\r\n")
+            for d, v in dir_rows():
+                w_.writerow([d, nm.project(v[0]) if nm else v[0], v[1], v[2]]
+                            + ([(nm.project(v[3]) if v[2] == 0 and v[3] == v[0] else nm.folder(v[3])) if nm else v[3]] if tier >= 1 else []))
+                n_ += 1
+                if n_ % 5000 == 0:
+                    out.write(buf_.getvalue().encode("utf-8")); buf_.seek(0); buf_.truncate()
+            out.write(buf_.getvalue().encode("utf-8"))
+        if hit_read:
+            put("Content_Hits.csv", ["project", "ext", "files_read_after_the_sample_showed_cad_content"],
+                [[nm.project(pj) if nm else pj, ex, n_] for (pj, ex), n_ in sorted(hit_read.items())])
         put("Projects.csv", ["project", "file_count", "total_bytes", "distinct_extensions", "first_modified_utc", "last_modified_utc"],
             [[p, s[0], s[1], len(s[4]), s[2], s[3]] for p, s in sorted(proj_stats.items())])
         put("Extensions.csv", ["project", "ext", "file_count", "total_bytes", "avg_bytes"],
@@ -1237,8 +1589,10 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
                 ["hashing", "none"], ["assembly_names", "anonymized" if (anonymize_assembly_names or nm) else "real"],
                 ["names_anonymized", "yes" if nm else "no"],
                 ["detail_level", tier], ["project_depth", project_depth],
-                ["header_reads_skipped", C["head_skipped"]], ["memory_budget_MB", gate.budget >> 20], ["reads_that_waited_for_memory", gate.waits], ["dwg_sheets_reused_from_identical_copies", C["sheets_reused"]], ["link_files_read", C["link_read"]],
+                ["header_reads_skipped", C["head_skipped"]], ["header_reads_sampled", C["head_sampled"]],
+                ["types_with_cad_content_read_in_full", len(hit_types)], ["files_read_after_a_cad_hit", sum(hit_read.values())], ["memory_budget_MB", gate.budget >> 20], ["reads_that_waited_for_memory", gate.waits], ["dwg_sheets_reused_from_identical_copies", C["sheets_reused"]], ["link_files_read", C["link_read"]],
                 ["link_files_unreadable", C["link_unreadable"]], ["read_errors", C["errors"]],
+                ["read_problems_listed", len(rp_rows)], ["unreadable_not_listed_cap", C["unreadable_not_listed"]], ["setup_warnings", len(setup_warnings)],
                 ["cloud_tiered_files_not_opened", sum(uu.get("tiered", 0) for uu in man["units"].values())],
                 ["deduplicated_files", sum(uu.get("dedup", 0) for uu in man["units"].values())], ["network_retries", C["retries"]],
                 ["unreadable_folders", C["dir_errors"]], ["linked_folders_skipped", walk_counts["links_skipped"]],
@@ -1246,7 +1600,7 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
                 ["projects_changed_during_run", C["changed_projects"]], ["projects_changed_between_restarts", C["stale_projects"]], ["chunks_redone_after_change", C["stale_chunks"]],
                 ["drawing_sheets_counted", C["sheets_counted"]], ["drawing_sheets_not_counted", C["sheets_not_counted"]],
                 ["drawing_sheets_status", "; ".join(f"{k.split(':', 1)[1]} x{v}" for k, v in sorted(C.items(), key=lambda kv: -kv[1]) if k.startswith("sheet_status:"))], ["restarts_resumed", man["restarts"]],
-                ["seconds", round(active, 1)], ["seconds_scan", round(man["prescan_s"], 1)], ["seconds_process", round(proc_s, 1)],
+                ["peak_memory_mb", _peak_mb()], ["usable_cpus", _usable_cpus()], ["seconds", round(active, 1)], ["seconds_scan", round(man["prescan_s"], 1)], ["seconds_process", round(proc_s, 1)],
                 ["seconds_finalize", round(fin_s, 1)],
                 ["avg_MB_per_s", round(bytes_out / 1e6 / max(1.0, proc_s + man["prescan_s"]), 1)],
                 ["avg_files_per_s", round(nfiles_out / max(1.0, proc_s + man["prescan_s"]))]]
@@ -1316,7 +1670,9 @@ def what_is(tier, anonymized, names_anon=False):
         body += ("NAMES ARE ANONYMISED: project, folder and file names (and the file names referenced in Links.csv) are replaced by codes - "
                  "P-xxxx-nnnn, D-xxxx-nnnnnn, F-xxxx-nnnnnn - with the file extension kept. The same name always has the same code, so the structure is intact. "
                  "The table of codes and real names is NOT in this zip; the data owner keeps it.\r\n")
-    return head + body + ("Run_log.csv, Run_phases.csv, Run_metrics.csv and System_info.csv describe how the run went and what machine it ran\r\n"
+    return head + body + ("Read_Problems.csv (only when needed) lists files that could not be fully read - file number, type, step and the reason (an error type,\r\n"
+                          "never file text). Setup_Warnings.csv (only when needed) lists folders that could not be listed when the projects were chosen.\r\n"
+                          "Run_log.csv, Run_phases.csv, Run_metrics.csv and System_info.csv describe how the run went and what machine it ran\r\n"
                           "on (no file names; project folder names appear in Run_log.csv unless the names are anonymised). "
                           "Compressed files (zip, rar, 7z, tar ...) are counted as one file each; nothing is looked into them.\r\n")
 
@@ -1363,7 +1719,7 @@ def make_fail_log(out_dir, problem, scanned="", context=None, ui_log=None, redac
     except Exception:
         ram = 0
     lines = [f"tool_version: {VERSION}", f"time_utc: {now_utc()}", f"python: {platform.python_version()}", f"platform: {platform.platform()}",
-             f"cpus: {os.cpu_count()}", f"ram_gb: {ram / 1024 ** 3:.1f}" if ram else "ram_gb: unknown",
+             f"cpus: {os.cpu_count()} (usable {_usable_cpus()})", f"ram_gb: {ram / 1024 ** 3:.1f}" if ram else "ram_gb: unknown",
              f"memory_budget_MB: {memory_budget() >> 20}", f"frozen_exe: {bool(getattr(sys, 'frozen', False))}",
              f"in_docker: {bool(os.environ.get('PROFILER_IN_DOCKER'))}"]
     lines += [f"{k}: {clean(v)}" for k, v in sorted(ctx.items())]
@@ -1445,6 +1801,8 @@ def main(argv=None):
     ap.add_argument("--anonymize-names", action="store_true",
                     help="optional: replace project, folder and file names in the OUTPUT by codes (extensions kept); the code-to-name table is written "
                          "to a separate name_map_*.zip, never into the profile. Works for step 1 and step 2; files are never touched")
+    ap.add_argument("--no-paths", action="store_true",
+                    help="step 1 only: do NOT write the Paths/<type>.csv lists of every file (project, path, size, date); by default they are written (env PROFILER_PATHS=0 does the same)")
     ap.add_argument("--no-name-map", action="store_true",
                     help="with --anonymize-names: do not write the name_map_*.zip (the codes can then never be turned back into names)")
     ap.add_argument("--level", "--tier", dest="level", type=int, choices=[0, 1, 2], default=None,
@@ -1471,7 +1829,8 @@ def main(argv=None):
         print(f"Quick count (step 1): {label or folder}\n(read-only; no file is opened; nothing is copied or sent anywhere)\n")
         try:
             qz, nproj, nfiles, errors = quick_scan(folder, out_dir, label=label, workers=a.workers, project_depth=a.project_depth,
-                                                   anonymize_names=a.anonymize_names or None, name_map=not a.no_name_map)
+                                                   anonymize_names=a.anonymize_names or None, name_map=not a.no_name_map,
+                                                   list_paths=False if a.no_paths else None)
         except SystemExit as e:
             print(e)
             return 1

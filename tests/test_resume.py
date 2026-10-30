@@ -36,6 +36,7 @@ def run(src, out, **kw):
     z, *_ = fp.profile(src, out, log=lambda *_: None, workers=2, chunk_files=5, system_info=False, tier=1, metrics_interval=1.0, **kw)
     return z
 
+fp.PIPELINE_CHUNKS = 0        # these checks are about exact re-reads; with chunks in flight the reads started before a crash are redone (tests/test_pipeline.py)
 class Boom(Exception): pass
 
 with tempfile.TemporaryDirectory() as t:

@@ -9,6 +9,7 @@ import os
 import re
 import sys
 import threading
+import time
 import traceback
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -64,6 +65,7 @@ table.qt{border-collapse:collapse}table.qt td,table.qt th{border:1px solid #8884
 <div class="card"><b>3. Run</b>
 <label style="display:block;margin-top:8px"><input type="checkbox" id="anonn"> Anonymise file and folder names in the result <span class="mut">(optional; applies to Step 1 and Step 2. Only the result is renamed, never your files. You also get a separate name map to keep private; extra time is negligible)</span></label>
 <label style="display:block;margin:6px 0 0 24px"><input type="checkbox" id="anonmap" checked disabled> Also give me the name map <span class="mut">(a separate file, real name &rarr; anonymised name, with its own download button. Keep it private.)</span></label>
+<label style="display:block;margin-top:8px"><input type="checkbox" id="listpaths" checked> Step 1: also list every file's path, size and date by file type <span class="mut">(adds a few seconds on a fast disk, nothing noticeable on a slow disk or file server; the zip grows by about 11 bytes per file. Uncheck to keep file names out of the Step 1 result.)</span></label>
 <label style="display:block;margin-top:8px"><input type="checkbox" id="fresh"> Start from scratch <span class="mut">(normally a stopped run continues where it stopped; tick this to ignore saved progress)</span></label>
 <div class="row" style="margin-top:8px"><button id="goquick" title="Counts the files of each type and their size. Nothing is opened, so it is very fast.">Step 1: quick count</button>
 <button id="go" title="The complete profile (file details, references inside assemblies, drawing sheets). Takes much longer.">Step 2: full profile</button></div>
@@ -114,7 +116,7 @@ const busy=v=>{$("go").disabled=v;$("goquick").disabled=v};
 async function start(kind){$("res").textContent="";$("bar").style.display="none";$("barlabel").textContent="";
  if(mode=="pick"&&!sel.length){$("res").innerHTML="<span class='er'>Tick at least one folder first.</span>";return}
  busy(true);
- const o={fresh:$("fresh").checked,kind:kind,anon_names:$("anonn").checked,anon_map:$("anonmap").checked};
+ const o={fresh:$("fresh").checked,kind:kind,anon_names:$("anonn").checked,anon_map:$("anonmap").checked,list_paths:$("listpaths").checked};
  const body=mode=="pick"?{t:T,paths:sel,...o}:{t:T,path:$("p").value,...o};
  const r=await fetch("/api/start",{method:"POST",body:JSON.stringify(body)});const j=await r.json();
  if(j.error){$("res").innerHTML="<span class='er'>"+esc(j.error)+"</span>";busy(false);return}poll()}
@@ -174,7 +176,8 @@ $("fgo").onclick=async()=>{const names=[...$("fproj").querySelectorAll("input")]
 async function fpoll(){const j=await (await fetch("/api/status?t="+T)).json();$("flog").textContent=j.log.join("\n");
  if(j.state=="running"){$("fres").innerHTML="<span class='mut'>Reading the hub...</span>";setTimeout(fpoll,1000);return}$("fgo").disabled=false;
  if(j.state=="done"){const r=j.result;$("fres").innerHTML="<span class='ok'>Done: "+r.projects+" projects, "+r.files.toLocaleString()+" items"+(r.errors?", "+r.errors+" folder(s) could not be read":"")+".</span><br>"+
-  (r.notes||[]).map(n=>"<div class='mut'>"+esc(n)+"</div>").join("")+"<br><a class='btn' href='/api/download?t="+T+"'>Download profile zip</a> <span class='mut'>"+esc(r.name)+"</span>"}
+  (r.notes||[]).map(n=>"<div class='mut'>"+esc(n)+"</div>").join("")+"<br><a class='btn' href='/api/download?t="+T+"'>Download profile zip</a> <span class='mut'>"+esc(r.name)+"</span>"+
+  (r.stats_name?"<br><br><a class='btn' style='background:var(--ac)' href='/api/download_log?t="+T+"'>Download run statistics</a> <span class='mut'>the run diary (retries, folders that could not be read) - no file contents, no access token</span>":"")}
  else if(j.state=="error")$("fres").innerHTML="<span class='er'>"+esc(j.error)+"</span>"+(j.fail?"<br><br><a class='btn' style='background:var(--er)' href='/api/download_fail?t="+T+"'>Download fail log</a> <span class='mut'>"+esc(j.fail.name)+" - send this ONE file to us. Your computer's paths and user name are removed; look inside before sending if the folder names are sensitive.</span>":"")}
 renderSel();ls("");
 </script></body></html>"""
@@ -262,11 +265,12 @@ def _write_error_log(text, scanned=""):
     for d in (OUT_DIR, tempfile.gettempdir()):
         try:
             os.makedirs(d, exist_ok=True)
-            with open(os.path.join(d, "error_log.txt"), "w") as f:
-                f.write(fp.scrub_paths(text, scanned))
+            with open(os.path.join(d, "error_log.txt"), "a") as f:     # appended: an earlier failure is not lost when a later one happens
+                f.write("=== " + fp.now_utc() + " ===\n" + fp.scrub_paths(text, scanned).rstrip() + "\n\n")
             return
         except OSError:
             continue
+    print(fp.scrub_paths(text, scanned), file=sys.stderr)              # nowhere to write it: at least the console has it
 
 
 def _guarded(fn, *args):
@@ -292,15 +296,20 @@ def _fail(message, scanned, problem, context, redact):
         zp = fp.make_fail_log(OUT_DIR, problem, scanned=scanned or "", context=context, ui_log=screen, redact_paths=redact)
         fail = {"path": zp, "name": os.path.basename(zp)}
     except Exception:
-        pass
+        _write_error_log("The fail log itself could not be written:\n" + traceback.format_exc(), scanned or "")
+        message += " (The fail log zip could not be made; error_log.txt in the output folder has the details.)"
     with LOCK:
         STATE.update(state="error", error=message, fail=fail)
 
 
-def _run(path, folders=None, anon=False, tier=2, depth=1, fresh=False, quick=False, anon_names=False, anon_map=True):
+def _stamp():
+    return time.strftime("%H:%M:%SZ", time.gmtime())
+
+
+def _run(path, folders=None, anon=False, tier=2, depth=1, fresh=False, quick=False, anon_names=False, anon_map=True, list_paths=True):
     def log(msg):
         with LOCK:
-            STATE["log"].append(msg.rstrip())
+            STATE["log"].append(_stamp() + "  " + msg.rstrip())
     def progress(phase, files, total_files, done_bytes, total_bytes):
         with LOCK:
             STATE["progress"] = {"phase": phase, "files": files, "total_files": total_files,
@@ -309,7 +318,7 @@ def _run(path, folders=None, anon=False, tier=2, depth=1, fresh=False, quick=Fal
         label = os.environ.get("PROFILER_FOLDER_NAME") if IN_DOCKER and path == DATA_ROOT else None
         if quick:
             zip_path, nproj, nfiles, errors = fp.quick_scan(path, OUT_DIR, log=log, label=label, folders=folders, progress=progress, project_depth=depth,
-                                                            anonymize_names=anon_names or None, name_map=anon_map)
+                                                            anonymize_names=anon_names or None, name_map=anon_map, list_paths=list_paths)
             with LOCK:
                 STATE.update(state="done", result={"path": zip_path, "name": os.path.basename(zip_path), "stats_path": "", "stats_name": "",
                                                    "map_path": fp.LAST_RUN.get("map_zip", ""), "map_name": os.path.basename(fp.LAST_RUN.get("map_zip", "")),
@@ -338,7 +347,7 @@ def _run(path, folders=None, anon=False, tier=2, depth=1, fresh=False, quick=Fal
 def _run_fusion(hub_id, hub_name, names):
     def log(msg):
         with LOCK:
-            STATE["log"].append(msg.rstrip())
+            STATE["log"].append(_stamp() + "  " + msg.rstrip())
     try:
         api = FUSION["api"]
         path, n, nproj, stats = fcp.run(api, hub_id, hub_name, OUT_DIR, only=names or None, log=log)
@@ -348,7 +357,8 @@ def _run_fusion(hub_id, hub_name, names):
         if stats["size_unknown"]:
             notes.append(f"{stats['size_unknown']} item(s) have no size in the cloud (counted as 0 bytes).")
         with LOCK:
-            STATE.update(state="done", result={"path": path, "name": os.path.basename(path), "stats_path": "", "stats_name": "",
+            STATE.update(state="done", result={"path": path, "name": os.path.basename(path),
+                                               "stats_path": stats.get("stats_zip", ""), "stats_name": os.path.basename(stats.get("stats_zip", "")),
                                                "projects": nproj, "files": n, "errors": len(stats["unreadable"]), "notes": notes})
     except (fcp.ApiError, SystemExit) as e:
         _fail(str(e), "", str(e), {"mode": "fusion cloud", "projects_selected": len(names)}, False)
@@ -383,6 +393,9 @@ def _net_hint(path, e):
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
+
+    def log_error(self, fmt, *args):                  # protocol errors (bad request, timeouts) used to vanish; keep them in error_log.txt
+        _write_error_log("web page server: " + (fmt % args if args else str(fmt)))
 
     def _send(self, code, body, ctype="application/json", extra=None):
         data = body if isinstance(body, bytes) else body.encode()
@@ -485,7 +498,8 @@ class Handler(BaseHTTPRequestHandler):
                 msg = "Sign-in failed: " + str(e)
         elif q.get("error"):
             with LOCK:
-                FUSION.update(error="Autodesk sign-in was cancelled or refused (" + q["error"][0] + ").", pending=None)
+                why = q.get("error_description", [""])[0]
+                FUSION.update(error="Autodesk sign-in was cancelled or refused (" + q["error"][0] + (": " + why[:200] if why else "") + ").", pending=None)
         self._send(200, "<!doctype html><meta charset=utf-8><title>Autodesk sign-in</title><body style='font:16px system-ui;margin:40px'><p>"
                    + msg.replace("&", "&amp;").replace("<", "&lt;") + "</p>", "text/html; charset=utf-8")
 
@@ -533,7 +547,7 @@ class Handler(BaseHTTPRequestHandler):
             STATE.update(state="running", log=[], result=None, error=None, fail=None,
                          progress={"phase": "scan", "files": 0, "total_files": 0, "bytes": 0, "total_bytes": 0})
         threading.Thread(target=_guarded, args=(_run, path, folders or None, bool(body.get("anon")), 2, 1,
-                                                          bool(body.get("fresh")), body.get("kind") == "quick", bool(body.get("anon_names")), body.get("anon_map", True) is not False), daemon=True).start()
+                                                          bool(body.get("fresh")), body.get("kind") == "quick", bool(body.get("anon_names")), body.get("anon_map", True) is not False, body.get("list_paths", True) is not False), daemon=True).start()
         self._json({"ok": True})
 
 
@@ -551,10 +565,12 @@ def main(argv=None, open_browser=True):
         os.environ["PROFILER_WORKERS"] = str(a.workers)
     try:
         srv = ThreadingHTTPServer((a.host, a.port or 8765), Handler)   # 8765 first: the Autodesk callback URL is registered once for this port
-    except OSError:
+    except OSError as exc:
         if a.port:
             raise
         srv = ThreadingHTTPServer((a.host, 0), Handler)
+        print(f"Port 8765 is not available ({exc.strerror or type(exc).__name__}); using port {srv.server_address[1]} instead. "
+              f"For Autodesk sign-in, register http://localhost:{srv.server_address[1]}/callback (shown on the Fusion tab).")
     url = f"http://127.0.0.1:{srv.server_address[1]}/"
     print(f"Folder Profiler UI: {url}\n(this computer only; press Ctrl+C or close this window to stop)")
     if open_browser and not IN_DOCKER:

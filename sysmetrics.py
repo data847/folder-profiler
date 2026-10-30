@@ -104,6 +104,12 @@ class _Win:
             return None
         return p.WorkingSetSize
 
+    def peak_rss(self):
+        p = self.PMC(); p.cb = self.ct.sizeof(self.PMC)
+        if not self.psapi.GetProcessMemoryInfo(self.k32.GetCurrentProcess(), self.ct.byref(p), p.cb):
+            return 0
+        return p.PeakWorkingSetSize
+
     def io_read(self):
         c = self.IOC()
         if not self.k32.GetProcessIoCounters(self.k32.GetCurrentProcess(), self.ct.byref(c)):
@@ -177,14 +183,74 @@ def _mac_mem():
 
 
 # ------------------------------------------------------------------------------------ system information
+def _read_first(path):
+    try:
+        with open(path, "r") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def cgroup_mem_limit():
+    """Memory limit of the container / cgroup this process runs in, in bytes, or 0 when there is none (Docker --memory, Kubernetes limits,
+    systemd MemoryMax). Without this the profiler would size its memory guard from the HOST's RAM and be killed by the container's limit."""
+    if not IS_LINUX:
+        return 0
+    for path in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):      # cgroup v2, v1
+        v = _read_first(path)
+        if v.isdigit() and 0 < int(v) < (1 << 60):          # "max" or a huge number = unlimited
+            return int(v)
+    return 0
+
+
+def cgroup_cpus():
+    """CPU limit of the container as a (fractional) number of CPUs, or 0 when there is none (Docker --cpus, Kubernetes limits)."""
+    if not IS_LINUX:
+        return 0
+    v = _read_first("/sys/fs/cgroup/cpu.max").split()                  # v2: "<quota> <period>" or "max <period>"
+    if len(v) == 2 and v[0].isdigit() and v[1].isdigit() and int(v[1]) > 0:
+        return int(v[0]) / int(v[1])
+    q, per = _read_first("/sys/fs/cgroup/cpu/cpu.cfs_quota_us"), _read_first("/sys/fs/cgroup/cpu/cpu.cfs_period_us")      # v1
+    if q.lstrip("-").isdigit() and per.isdigit() and int(q) > 0 and int(per) > 0:
+        return int(q) / int(per)
+    return 0
+
+
+def effective_cpus():
+    """CPUs this process may really use: the logical CPUs, less any container limit and any affinity mask. Never below 1."""
+    n = os.cpu_count() or 1
+    try:
+        n = min(n, len(os.sched_getaffinity(0)))
+    except (AttributeError, OSError):
+        pass
+    lim = cgroup_cpus()
+    if lim:
+        n = min(n, max(1, int(lim + 0.999)))
+    return max(1, n)
+
+
+def peak_memory_mb():
+    """Highest resident memory of this process so far, in MB, or "" if the system will not say (Windows: the peak working set)."""
+    try:
+        if IS_WIN and _win():
+            return round(_win().peak_rss() / 1048576)
+        import resource
+        v = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return round(v / 1048576) if IS_MAC else round(v / 1024)         # macOS counts bytes, Linux kilobytes
+    except Exception:
+        return ""
+
+
 def total_ram_bytes():
-    """Installed RAM in bytes, or 0 if the system will not say."""
+    """RAM this process can use, in bytes, or 0 if the system will not say: the installed RAM, or the container's limit if that is lower."""
     try:
         if IS_WIN and _win():
             m = _win().memory()
             return int(m[0]) if m else 0
         if IS_LINUX:
-            return int(_linux_mem()[0])
+            host = int(_linux_mem()[0])
+            lim = cgroup_mem_limit()
+            return min(host, lim) if lim and host else (host or lim)
         if IS_MAC:
             m = _mac_mem()
             return int(m[0]) if m else 0
@@ -196,8 +262,10 @@ def total_ram_bytes():
 def system_info(data_paths=(), out_dir=".", extra=None, deep=True):
     """Static facts about the machine for the run report. `deep` also asks PowerShell about disks and antivirus on Windows."""
     rows = [("os", platform.platform()), ("machine", platform.machine()), ("python", platform.python_version()),
-            ("python_build", platform.python_implementation()), ("logical_cpus", os.cpu_count() or ""),
+            ("python_build", platform.python_implementation()), ("logical_cpus", os.cpu_count() or ""), ("usable_cpus", effective_cpus()),
+            ("container_memory_limit_mb", cgroup_mem_limit() // 1048576 or "none"), ("container_cpu_limit", cgroup_cpus() or "none"),
             ("in_docker", "yes" if os.environ.get("PROFILER_IN_DOCKER") else "no")]
+    errs = []                                            # probes that failed: the report says so instead of showing a silent blank
     cpu = ""
     try:
         if IS_WIN:
@@ -209,8 +277,8 @@ def system_info(data_paths=(), out_dir=".", extra=None, deep=True):
         elif IS_LINUX:
             with open("/proc/cpuinfo") as f:
                 cpu = next((l.split(":", 1)[1].strip() for l in f if l.lower().startswith("model name")), "")
-    except Exception:
-        pass
+    except Exception as exc:
+        errs.append(f"cpu_model: {type(exc).__name__}")
     rows.append(("cpu_model", cpu or platform.processor() or ""))
     try:
         if IS_WIN and _win():
@@ -222,8 +290,11 @@ def system_info(data_paths=(), out_dir=".", extra=None, deep=True):
         else:
             total = None
         rows.append(("ram_gb", f"{total / 1024 ** 3:.1f}" if total else ""))
-    except Exception:
+        if not total:
+            errs.append("ram_gb: the system gave no answer")
+    except Exception as exc:
         rows.append(("ram_gb", ""))
+        errs.append(f"ram_gb: {type(exc).__name__}")
     # storage: the drive(s) being read and the drive receiving the output
     seen = set()
     for label, p in [("data", d) for d in data_paths] + [("output", out_dir)]:
@@ -244,9 +315,10 @@ def system_info(data_paths=(), out_dir=".", extra=None, deep=True):
                 else:
                     import shutil
                     rows.append((f"{tag}_free_gb", f"{shutil.disk_usage(p).free / 1024 ** 3:.1f}"))
-            except Exception:
-                pass
-        except Exception:
+            except Exception as exc:
+                errs.append(f"{tag}_free_gb: {type(exc).__name__}")
+        except Exception as exc:
+            errs.append(f"{label}_drive: {type(exc).__name__}")
             continue
     if IS_LINUX:
         try:
@@ -257,17 +329,27 @@ def system_info(data_paths=(), out_dir=".", extra=None, deep=True):
                     rot.append(f"{dev}={'HDD' if open(f).read().strip() == '1' else 'SSD/flash'}")
             if rot:
                 rows.append(("block_devices", "; ".join(rot[:8])))
-        except Exception:
-            pass
+        except Exception as exc:
+            errs.append(f"block_devices: {type(exc).__name__}")
     if IS_WIN and deep:
         ps = lambda c: _run(["powershell", "-NoProfile", "-NonInteractive", "-Command", c], 12)
         disks = ps("Get-PhysicalDisk | ForEach-Object { '{0} {1} {2} GB' -f $_.MediaType,$_.BusType,[math]::Round($_.Size/1GB) }")
         if disks:
             rows.append(("physical_disks", "; ".join(x.strip() for x in disks.splitlines() if x.strip())))
-        rows.append(("defender_realtime_protection", ps("(Get-MpComputerStatus).RealTimeProtectionEnabled") or "unknown"))
-        rows.append(("power_plan", (ps("(powercfg /getactivescheme)") or "unknown").split("(")[-1].rstrip(")")))
+        else:
+            errs.append("physical_disks: PowerShell gave no answer (blocked, too slow, or not allowed)")
+        defender = ps("(Get-MpComputerStatus).RealTimeProtectionEnabled")
+        if not defender:
+            errs.append("defender_realtime_protection: PowerShell gave no answer")
+        rows.append(("defender_realtime_protection", defender or "unknown"))
+        plan = ps("(powercfg /getactivescheme)")
+        if not plan:
+            errs.append("power_plan: no answer")
+        rows.append(("power_plan", (plan or "unknown").split("(")[-1].rstrip(")")))
     for k, v in (extra or {}).items():
         rows.append((k, v))
+    if errs:
+        rows.append(("probe_errors", "; ".join(errs)))
     return rows
 
 

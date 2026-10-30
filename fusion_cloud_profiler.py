@@ -16,7 +16,7 @@ Setup (once, by whoever owns the integration):
 Usage:
   python fusion_cloud_profiler.py --client-id ID                 list the hubs this user can read
   python fusion_cloud_profiler.py --client-id ID --hub "Name"    profile one hub  -> fusion_<hub>_<date>.zip
-  options: --out DIR, --project NAME (repeatable: only these projects), --workers N (default 6), --token-env VAR (use an
+  options: --out DIR, --project NAME (repeatable: only these projects), --workers N (default 3: gentler on Autodesk's request limits), --token-env VAR (use an
            access token from this environment variable instead of signing in)
 
 What is VERIFIED and what is not: endpoints, paging (page[limit] <= 200, links.next), the topFolders / folder-contents / included-tip-version
@@ -32,7 +32,7 @@ import argparse, base64, csv, datetime, hashlib, http.server, io, json, os, queu
 import urllib.parse, urllib.request, webbrowser, zipfile
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "1.0"
+VERSION = "1.1"
 API = os.environ.get("FUSION_API_BASE") or "https://developer.api.autodesk.com"   # the override exists for the tests only
 SCOPE = "data:read"
 REDIRECT_PORT = 8765
@@ -47,48 +47,131 @@ class ApiError(Exception):
     pass
 
 
+MAX_EVENTS = 20000
+
+
+def _endpoint(url):
+    """The kind of call, without hub / project / folder ids, for the run log."""
+    path = urllib.parse.urlparse(url).path
+    for key, kind in (("/contents", "folder contents"), ("/topFolders", "top folders"), ("/projects", "projects"), ("/hubs", "hubs"),
+                      ("/authentication/", "sign-in")):
+        if key in path:
+            return kind
+    return "call"
+
+
+THROTTLE_RX = re.compile(r"capacity|rate.?limit|quota|too many|throttl", re.I)
+
+
+def _is_throttle(code, why):
+    """Autodesk answers 'slow down' with 429 - and sometimes with 403 + 'request capacity exceeded'. That is waiting-room, not a permission problem."""
+    return code == 429 or (code == 403 and bool(THROTTLE_RX.search(why or "")))
+
+
+def _body_of(e, limit=300):
+    """Autodesk's own explanation of an HTTP error (a short JSON text such as invalid_client). Never raises."""
+    try:
+        text = e.read().decode("utf-8", "replace")
+    except Exception:
+        return ""
+    try:
+        d = json.loads(text)
+        if isinstance(d, dict):
+            bits = [str(d.get(k)) for k in ("error", "error_description", "developerMessage", "message", "reason") if d.get(k)]
+            if bits:
+                text = " - ".join(bits)
+    except ValueError:
+        pass
+    return re.sub(r"\s+", " ", text).strip()[:limit]
+
+
 class Api:
-    def __init__(self, token, base=API, retries=6, refresher=None):
+    def __init__(self, token, base=API, retries=6, refresher=None, throttle_retries=10):
         self.token, self.base, self.retries, self.refresher = token, base.rstrip("/"), retries, refresher
+        self.throttle_retries = throttle_retries
         self.calls = 0
         self.retried = 0
         self.lock = threading.Lock()
+        self.events, self.events_dropped, self.t0 = [], 0, time.time()   # (utc time, seconds since start, level, phase, message): becomes Run_log.csv
+
+    def event(self, phase, message, level="INFO"):
+        """One line of the run log. Never call it while holding self.lock."""
+        with self.lock:
+            if len(self.events) >= MAX_EVENTS:
+                self.events_dropped += 1
+                return
+            self.events.append((datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), f"{time.time() - self.t0:.1f}", level, phase, message))
 
     def get(self, path_or_url):
         url = path_or_url if path_or_url.startswith("http") else self.base + path_or_url
+        kind = _endpoint(url)
         delay = 2.0
         refreshed = False
-        for attempt in range(self.retries):
+        last = ""                                     # why the most recent try failed: kept for the final error and the run log
+        fails = throttles = 0                         # ordinary failures and "slow down" answers have separate budgets
+        while True:
             sent = self.token
             req = urllib.request.Request(url, headers={"Authorization": "Bearer " + sent, "Accept": "application/json"})
+            throttled = False
             try:
                 with urllib.request.urlopen(req, timeout=60) as r:
                     with self.lock:
                         self.calls += 1
                     return json.loads(r.read().decode("utf-8"))
             except urllib.error.HTTPError as e:
+                why = _body_of(e)
                 if e.code == 401 and self.refresher and not refreshed:
                     refreshed = True                  # access tokens last about an hour: get a new one once per call and retry
+                    self.event("api", f"{kind}: 401 (token expired?) - asking Autodesk for a new access token" + (f" [{why}]" if why else ""), "WARN")
                     with self.lock:
                         if self.token == sent:
                             self.token = self.refresher()
                     continue
-                if e.code in (401, 403):
+                if _is_throttle(e.code, why):         # 429, or 403 + "request capacity exceeded": wait, do not give up as 'no permission'
+                    throttled = True
+                    try:
+                        wait = max(float(e.headers.get("Retry-After") or 0), delay)
+                    except ValueError:
+                        wait = delay
+                    wait = min(wait, 120.0)
+                    delay = min(delay * 2, 60)
+                    last = f"HTTP {e.code} throttled" + (f" [{why}]" if why else "")
+                elif e.code in (401, 403):
+                    self.event("api", f"{kind}: refused ({e.code})" + (f" [{why}]" if why else ""), "ERROR")
                     raise ApiError(f"Autodesk refused access ({e.code}) to {url.split('?')[0]}: the signed-in user, or the app on this hub, "
-                                   "has no read permission (the hub admin must add the app under Custom Integrations)")
-                if e.code == 404:
-                    raise ApiError(f"not found (404): {url.split('?')[0]}")
-                if e.code == 429 or e.code >= 500:
+                                   "has no read permission (the hub admin must add the app under Custom Integrations)"
+                                   + (f" [Autodesk says: {why}]" if why else ""))
+                elif e.code == 404:
+                    self.event("api", f"{kind}: not found (404)" + (f" [{why}]" if why else ""), "WARN")
+                    raise ApiError(f"not found (404): {url.split('?')[0]}" + (f" [{why}]" if why else ""))
+                elif e.code >= 500:
                     wait = float(e.headers.get("Retry-After") or delay)
                     delay = min(delay * 2, 60)
+                    last = f"HTTP {e.code}" + (f" [{why}]" if why else "")
                 else:
-                    raise ApiError(f"HTTP {e.code} for {url.split('?')[0]}")
-            except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
+                    self.event("api", f"{kind}: HTTP {e.code}" + (f" [{why}]" if why else ""), "ERROR")
+                    raise ApiError(f"HTTP {e.code} for {url.split('?')[0]}" + (f" [Autodesk says: {why}]" if why else ""))
+            except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
                 wait, delay = delay, min(delay * 2, 60)
+                reason = getattr(e, "reason", None) or e                   # URLError wraps the real cause (DNS, refused, timed out, TLS ...)
+                last = f"{type(reason).__name__}" + (f" ({str(reason)[:120]})" if str(reason) else "")
+            if throttled:
+                throttles += 1
+                budget, used, what = self.throttle_retries, throttles, "throttled"
+            else:
+                fails += 1
+                budget, used, what = self.retries, fails, "failed"
+            if used >= budget:
+                self.event("api", f"{kind}: try {used} of {budget} {what} ({last})", "WARN")
+                self.event("api", f"{kind}: gave up after {used} {what} tries ({last})", "ERROR")
+                if throttled:
+                    raise ApiError(f"Autodesk is throttling requests and kept refusing after {used} waits ({last}). This is a rate / capacity limit, "
+                                   "not a permission problem: wait 10-30 minutes and run again (fewer workers, e.g. --workers 2, makes it gentler).")
+                raise ApiError(f"gave up after {used} tries: {url.split('?')[0]}" + (f" (last problem: {last})" if last else ""))
+            self.event("api", f"{kind}: try {used} of {budget} {what} ({last}); waiting {wait:.0f}s", "WARN")
             with self.lock:
                 self.retried += 1
             time.sleep(wait)
-        raise ApiError(f"gave up after {self.retries} tries: {url.split('?')[0]}")
 
     def pages(self, path):
         """Every page of a list call (follows links.next)."""
@@ -120,7 +203,11 @@ def auth_finish(client_id, redirect, code, verifier, base=API):
         with urllib.request.urlopen(req, timeout=60) as r:
             tok = json.loads(r.read().decode())
     except urllib.error.HTTPError as e:
-        raise ApiError(f"Autodesk did not accept the sign-in ({e.code}): check the client id and that the callback URL registered for the app is exactly {redirect}")
+        why = _body_of(e)
+        raise ApiError(f"Autodesk did not accept the sign-in ({e.code})" + (f" [Autodesk says: {why}]" if why else "")
+                       + f": check the client id, that the app type is Desktop, Mobile, Single-Page App (no secret), and that the callback URL registered for the app is exactly {redirect}")
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        raise ApiError(f"could not reach Autodesk to finish the sign-in ({type(getattr(e, 'reason', None) or e).__name__}): check the internet connection and any proxy / firewall")
     state_ = {"refresh": tok.get("refresh_token")}
 
     def refresher():
@@ -132,7 +219,10 @@ def auth_finish(client_id, redirect, code, verifier, base=API):
             with urllib.request.urlopen(rq, timeout=60) as r2:
                 t2 = json.loads(r2.read().decode())
         except urllib.error.HTTPError as e:
-            raise ApiError(f"could not refresh the sign-in ({e.code}): sign in again")
+            why = _body_of(e)
+            raise ApiError(f"could not refresh the sign-in ({e.code})" + (f" [Autodesk says: {why}]" if why else "") + ": sign in again")
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            raise ApiError(f"could not reach Autodesk to refresh the sign-in ({type(getattr(e, 'reason', None) or e).__name__}): sign in again")
         state_["refresh"] = t2.get("refresh_token") or state_["refresh"]
         return t2["access_token"]
     return tok["access_token"], refresher
@@ -148,6 +238,7 @@ def sign_in(client_id, base=API):
         def do_GET(self):
             q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             got["code"], got["state"], got["error"] = q.get("code", [""])[0], q.get("state", [""])[0], q.get("error", [""])[0]
+            got["why"] = q.get("error_description", [""])[0]
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.end_headers()
@@ -163,7 +254,9 @@ def sign_in(client_id, base=API):
     srv.handle_request()
     srv.server_close()
     if got.get("error") or not got.get("code") or got.get("state") != state:
-        raise SystemExit("Sign-in did not complete" + (f" ({got['error']})" if got.get("error") else "") + ".")
+        raise SystemExit("Sign-in did not complete" + (f" ({got['error']}" + (f": {got['why'][:200]}" if got.get("why") else "") + ")" if got.get("error")
+                                                        else " (no answer from Autodesk within 5 minutes, or the sign-in page was closed)" if not got.get("code")
+                                                        else " (the answer did not match this sign-in; close old Autodesk tabs and try once)") + ".")
     return auth_finish(client_id, redirect, got["code"], verifier, base)
 
 
@@ -241,6 +334,7 @@ def crawl_project(api, project_id, project_name, folders, sink, stats):
             pages = list(api.pages(f"/data/v1/projects/{urllib.parse.quote(project_id, safe='')}/folders/{urllib.parse.quote(fid, safe='')}/contents?page%5Blimit%5D=200"))
         except ApiError as e:
             stats["unreadable"].append((project_name, "folder", "/".join(here), _short(e)))
+            api.event("crawl", f"{project_name}: folder '{'/'.join(here)}' could not be read: {_short(e)}", "ERROR")
             continue
         for doc in pages:
             versions = {v["id"]: v for v in doc.get("included", []) if v.get("type") == "versions"}
@@ -291,6 +385,7 @@ def write_zip(path, hub_name, files, dirs, stats, started):
             ("total_bytes", sum(r[3] for r in ordered)), ("hashing", "none"), ("assembly_names", "none"), ("detail_level", 1), ("project_depth", 1),
             ("archives_mode", "off"), ("api_calls", stats["calls"]), ("api_retries", stats["retried"]), ("items_size_unknown", stats["size_unknown"]),
             ("unreadable_folders", len(stats["unreadable"])), ("unknown_item_types", sum(stats["unknown_types"].values())),
+            ("log_events", len(stats.get("events", []))), ("log_events_dropped", stats.get("events_dropped", 0)),
             ("seconds", round(time.time() - started, 1))]
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr("Files.csv", table(FILES_HEADER, ordered))
@@ -299,6 +394,8 @@ def write_zip(path, hub_name, files, dirs, stats, started):
         z.writestr("Run_info.csv", table(["key", "value"], info))
         if stats["unreadable"]:
             z.writestr("Unreadable.csv", table(["project", "kind", "path", "reason"], stats["unreadable"]))
+        if stats.get("events") is not None:
+            z.writestr("Run_log.csv", table(["timestamp_utc", "elapsed_s", "level", "phase", "message"], stats["events"]))
         if stats["unknown_types"]:
             z.writestr("Unknown_Item_Types.csv", table(["autodesk_item_type", "items"], sorted(stats["unknown_types"].items())))
         z.writestr("WHAT_IS_IN_THIS_ZIP.txt",
@@ -309,14 +406,46 @@ def write_zip(path, hub_name, files, dirs, stats, started):
     return len(ordered)
 
 
-def run(api, hub_id, hub_name, out_dir, only=None, workers=6, quiet=False, log=None):
+def write_stats_zip(path, stats, started, n_projects, n_items):
+    """The run's diary as a SEPARATE small zip (like the folder profiler's run statistics): Run_log.csv and Run_stats.csv. It repeats what is
+    already inside the profile zip so it can be sent or read on its own. No file contents; project and folder names appear in the log lines."""
+    def table(header, rows):
+        b = io.StringIO(newline="")
+        w = csv.writer(b, lineterminator="\r\n")
+        w.writerow(header)
+        w.writerows(rows)
+        return ("\ufeff" + b.getvalue()).encode("utf-8")
+    levels = {}
+    for ev in stats.get("events", []):
+        levels[ev[2]] = levels.get(ev[2], 0) + 1
+    rows = [("tool_version", VERSION), ("run_utc", datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")),
+            ("projects", n_projects), ("items", n_items), ("api_calls", stats.get("calls", 0)), ("api_retries", stats.get("retried", 0)),
+            ("unreadable_folders", len(stats["unreadable"])), ("items_size_unknown", stats["size_unknown"]),
+            ("log_events", len(stats.get("events", []))), ("log_events_dropped", stats.get("events_dropped", 0)),
+            ("log_warnings", levels.get("WARN", 0)), ("log_errors", levels.get("ERROR", 0)), ("seconds", round(time.time() - started, 1))]
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("Run_log.csv", table(["timestamp_utc", "elapsed_s", "level", "phase", "message"], stats.get("events", [])))
+        z.writestr("Run_stats.csv", table(["key", "value"], rows))
+        z.writestr("README.txt", ("Run statistics from the Fusion cloud profiler: a timestamped diary of the run (retries and their causes, folders that could not be read) "
+                                  "and a few counters. No file contents and no access token. Project and folder names can appear in the log lines.\r\n").encode("utf-8"))
+    return path
+
+
+def run(api, hub_id, hub_name, out_dir, only=None, workers=3, quiet=False, log=None):
     started = time.time()
-    projs = projects(api, hub_id)
+    api.event("start", f"v{VERSION}: profiling hub '{hub_name}'" + (f", only {len(only)} project(s) asked for" if only else ""))
+    try:
+        projs = projects(api, hub_id)
+    except ApiError as e:
+        api.event("start", f"the project list could not be read: {_short(e)}", "ERROR")
+        raise
+    api.event("start", f"{len(projs)} project(s) in the hub")
     if only:
         want = {o.lower() for o in only}
         projs = [p for p in projs if p[1].lower() in want]
         missing = want - {p[1].lower() for p in projs}
         if missing:
+            api.event("start", "no such project in the hub: " + ", ".join(sorted(missing)), "ERROR")
             raise SystemExit("No such project in the hub: " + ", ".join(sorted(missing)))
     files, dirs, lock = [], [], threading.Lock()
     stats = {"unreadable": [], "unknown_types": {}, "size_unknown": 0}
@@ -327,26 +456,47 @@ def run(api, hub_id, hub_name, out_dir, only=None, workers=6, quiet=False, log=N
 
     def one(p):
         pid, pname = p
+        t_p = time.time()
+        api.event("project", f"{pname}: started")
         try:
             tf = top_folders(api, hub_id, pid)
         except ApiError as e:
             with lock:
                 stats["unreadable"].append((pname, "folder", "(project)", _short(e)))
+            api.event("project", f"{pname}: top folders could not be read, project skipped: {_short(e)}", "ERROR")
             return
-        d = crawl_project(api, pid, pname, tf, sink, stats)
+        n_items = [0]
+
+        def counting_sink(row):
+            n_items[0] += 1
+            sink(row)
+        d = crawl_project(api, pid, pname, tf, counting_sink, stats)
         with lock:
             dirs.extend(d)
+        api.event("project", f"{pname}: done ({n_items[0]:,} items, {len(d)} folders, {time.time() - t_p:.1f}s)")
         if log:
             log(f"{pname}: done")
         elif not quiet:
-            print(f"  {pname}: done", flush=True)
+            print(f"  {time.strftime('%H:%M:%SZ', time.gmtime())}  {pname}: done", flush=True)
     with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
-        list(ex.map(one, projs))
+        results = [f for f in [ex.submit(one, p) for p in projs]]
+        for p, f in zip(projs, results):
+            try:
+                f.result()
+            except Exception as e:                          # one project failing for an unexpected reason must not lose the others
+                if isinstance(e, SystemExit):
+                    raise
+                stats["unreadable"].append((p[1], "folder", "(project)", f"unexpected {type(e).__name__}"))
+                api.event("project", f"{p[1]}: stopped by an unexpected {type(e).__name__}: {str(e)[:200]}", "ERROR")
     stats["calls"], stats["retried"] = api.calls, api.retried
+    api.event("finish", f"{len(files):,} items in {len(projs)} project(s); {api.calls} API calls, {api.retried} retried, "
+                        f"{len(stats['unreadable'])} folder(s) not readable, {stats['size_unknown']} item(s) without a size")
+    stats["events"], stats["events_dropped"] = list(api.events), api.events_dropped
     os.makedirs(out_dir, exist_ok=True)
     safe = re.sub(r"[^A-Za-z0-9._-]+", "_", hub_name).strip("_") or "hub"
     path = os.path.join(out_dir, f"fusion_{safe}_{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}.zip")
     n = write_zip(path, hub_name, files, dirs, stats, started)
+    stats["stats_zip"] = write_stats_zip(os.path.join(out_dir, os.path.basename(path).replace("fusion_", "fusion_run_stats_", 1)), stats, started, len(projs), n)
     return path, n, len(projs), stats
 
 
@@ -357,7 +507,7 @@ def main():
     ap.add_argument("--hub", help="hub name or id to profile (omit to list the hubs)")
     ap.add_argument("--project", action="append", help="only this project (repeatable)")
     ap.add_argument("--out", default=".")
-    ap.add_argument("--workers", type=int, default=6)
+    ap.add_argument("--workers", type=int, default=3)
     ap.add_argument("--api-base", default=API, help=argparse.SUPPRESS)
     a = ap.parse_args()
     token, refresher = (os.environ.get(a.token_env, "") if a.token_env else ""), None

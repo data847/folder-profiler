@@ -4,7 +4,7 @@
 services:
   profiler-ui:
     build: .
-    image: folder-profiler:1.7-ui
+    image: folder-profiler:1.8-ui
     entrypoint: ["python", "/app/ui.py"]
     ports:
       - "127.0.0.1:8765:8765"   # loopback only: reachable from this computer, not the network

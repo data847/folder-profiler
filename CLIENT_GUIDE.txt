@@ -44,6 +44,12 @@ Step 2 - FULL PROFILE (the complete run, much longer): everything described in "
 In the browser page there is one button for each step. Run step 1 first if you want a fast overview, or send both zips.
 (Command line: add --quick for step 1; without it you get step 2.)
 
+IF SOMETHING GOES WRONG
+Problems are written down instead of ignored. Inside the zip: Unreadable.csv (folders / files the tool was not allowed to read, with the reason),
+Read_Problems.csv (files that could be listed but not fully read, with the reason; only present when there were some), Setup_Warnings.csv
+(folders that could not even be listed; only present when there were some) and Run_log.csv (a timestamped diary of the run, warnings included).
+If the whole run fails, send the fail log or error_log.txt from the output folder (it keeps every failure, newest last; your name and paths are removed).
+
 NETWORK DRIVES AND WINDOWS FILE SERVERS
 You can measure a mapped drive (Z:\...) or a server path (\\server\share\...). Tips:
   - Use an account that can read the folders. Folders the tool cannot read are listed in Unreadable.csv (inside the zip) so the owner can fix the
@@ -124,8 +130,11 @@ IF SOMETHING GOES WRONG
     2. Right-click the black window text, copy it, or take a screenshot, and send it to us.
 - "Run" button does nothing / stuck:  wait a minute for large folders. If nothing changes after
   10 minutes, close everything and start again from Step 2.
-- If an error file was made, it is output\error_log.txt in the tool folder. Send us that file.
-  Your name and folder paths are removed from it automatically.
+- If a run fails, the page shows a red "Download fail log" button. Click it and send us that ONE file
+  (fail_log_....zip, also saved in the "output" folder). It holds the error and how the run went, with your
+  computer's paths and user name removed. Names of files or folders can still appear inside error
+  messages: open problem.txt in it with Notepad and look first if the names are sensitive.
+  If the page itself will not open, send output\error_log.txt instead.
 - Antivirus warning: the tool does not change any files. If your antivirus blocks it, ask your
   IT team to allow the extracted folder, or contact us.
 
@@ -147,3 +156,26 @@ OPTIONAL - DOCKER (only if your IT team already uses Docker)
 Open a terminal in the tool folder. Copy ".env.example" to ".env" and set PROFILE_DIR to the
 folder to measure. Run:  docker compose up --build   then open http://localhost:8765 and
 continue from STEP 3. The zip is also saved in the "output" folder.
+
+
+OPTIONAL - HIDE NAMES IN THE RESULT
+-----------------------------------
+Tick "Anonymise file and folder names in the result" before Step 1 or Step 2 if the names of your
+projects, folders and files must not leave your computer.
+- Only the RESULT is changed. Your files and folders are never renamed or touched.
+- Project, folder and file names in the result become codes (for example P-a1b2-0003).
+  File types (.dwg, .pdf ...) are kept. The same name always gets the same code.
+- Leave "Also give me the name map" ticked: a second file, "name_map_....zip", is made, with its own
+  download button. It lists each real name and its code, so the codes can be turned back into the
+  real names. KEEP IT PRIVATE. Send us only the profile zip, never the name map.
+  (If you untick it, no map is made and the codes can never be decoded.)
+- It does not make the run noticeably slower.
+
+
+COMPUTER REQUIREMENTS
+---------------------
+Windows 10 / 11 or Server 2019+, 4 GB of free memory is enough (8 GB or more recommended), any number of
+CPU cores (4 is fine). The tool is limited by the speed of the disk or file server, not by the computer:
+it opens only the files it must read and keeps its memory use under a limit it works out from your RAM.
+Close other heavy programs while it runs. If the computer feels slow, close this tool and start it again;
+a stopped run continues where it stopped.
