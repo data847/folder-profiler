@@ -39,7 +39,9 @@ The tool does NOT open compressed files. Each one is counted as a single file, l
 
 TWO STEPS
 Step 1 - QUICK COUNT (very fast, a few seconds to minutes): counts how many files of each type there are and how big they are,
-per project folder and overall. No file is opened and no file names are recorded (only project folder names and file types).
+per project folder and overall. No file is opened. By default it also lists every file - its path inside the project, size and modified date -
+in a Paths folder of the zip (one list per file type), read from the folder listing only. To leave the file names out, untick "Step 1: also list every file's path, size and date by file type"
+in the page (command line: --no-paths); to hide the names but keep the lists, tick "Anonymise file and folder names". Nothing is ever sent anywhere.
 Step 2 - FULL PROFILE (the complete run, much longer): everything described in "WHAT IT RECORDS" above.
 In the browser page there is one button for each step. Run step 1 first if you want a fast overview, or send both zips.
 (Command line: add --quick for step 1; without it you get step 2.)
