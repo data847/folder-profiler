@@ -11,7 +11,10 @@ What it writes (one zip of CSVs, nothing else):
   Extensions.csv  one row per project + extension: counts, bytes
   Dirs.csv        the folder tree (anonymous ids; names at level >= 1)
   Links.csv       (level 2) names of files referenced inside assemblies, drawings and STEP files
-  Run_info.csv    tool version, date, OS, folder name, totals, read errors, time per step
+  Reconciliation.csv   this profile against the counting pass (the listing Step 1 also makes): files and bytes per project, and per file
+                  type where a project differs. The check says OK or names exactly what differs
+  Run_info.csv    tool version (and every version that worked on a resumed run), date, OS, folder name, totals, read errors, time per step,
+                  what limited the speed, the reconciliation verdict
   Run_log.csv, Run_phases.csv, Run_metrics.csv, System_info.csv   how the run went and what machine it ran on (also written
                   separately as run_stats_*.zip, safe to share: no file or folder names)
 
@@ -75,6 +78,8 @@ import diag
 from sysmetrics import now_utc
 
 VERSION = "1.8"
+STATE_FORMAT = 1             # layout of the saved progress (.resume): raise it ONLY when saved rows / fingerprints change meaning. A new VERSION of the
+                             # tool carries on from the saved progress of an older one as long as this number and the run's settings are the same.
 try:
     import name_anon
 except ImportError:          # optional feature: the profiler works without it, the option is then refused
@@ -286,6 +291,7 @@ class MemGate:
     def __init__(self, budget):
         self.budget, self.used, self.cv = int(budget), 0, threading.Condition()
         self.waits = 0
+        self.wait_s = 0.0                        # seconds workers spent blocked waiting for memory (summed)
 
     def hold(self, cost):
         gate = self
@@ -296,8 +302,10 @@ class MemGate:
                 with gate.cv:
                     if gate.used + self_.cost > gate.budget:
                         gate.waits += 1
-                    while gate.used + self_.cost > gate.budget:
-                        gate.cv.wait()
+                        t_w = time.perf_counter()
+                        while gate.used + self_.cost > gate.budget:
+                            gate.cv.wait()
+                        gate.wait_s += time.perf_counter() - t_w
                     gate.used += self_.cost
 
             def __exit__(self_, *a):
@@ -438,7 +446,12 @@ def walk_dirs(base, recurse, on_error, counts):
                 stack.append((e.path, e.name if rel == "." else rel + os.sep + e.name, depth + 1))
 
 
-def chunk_fingerprints(base, recurse, chunk_files):
+def file_fp(relpath, size, mtime_iso):
+    """crc of one file's identity (path inside its project, size, modified time): the building block of both the chunk and the project fingerprints."""
+    return zlib.crc32(f"{relpath}\0{size}\0{mtime_iso}\n".encode("utf-8", "surrogatepass"))
+
+
+def chunk_fingerprints(base, recurse, chunk_files, acc=None):
     """Stat-only pass (no file is opened): one crc per chunk of files over their relative path, size and modified time. The same
     formula is used when a chunk is saved, so a resumed run can tell whether a saved project still matches the disk."""
     fps, cur, n = [], 0, 0
@@ -450,7 +463,14 @@ def chunk_fingerprints(base, recurse, chunk_files):
             try:
                 st = e.stat()
                 relpath = e.name if rel == "." else (rel + os.sep + e.name).replace(os.sep, "/")
-                cur = zlib.crc32(f"{relpath}\0{st.st_size}\0{iso(st.st_mtime)}\n".encode("utf-8", "surrogatepass"), cur)
+                mt = iso(st.st_mtime)
+                cur = zlib.crc32(f"{relpath}\0{st.st_size}\0{mt}\n".encode("utf-8", "surrogatepass"), cur)
+                if acc is not None:                      # the project fingerprint (order independent: a sum), see scan_tree(fingerprint=...)
+                    if e.is_symlink():
+                        acc[2] += 1
+                    else:
+                        acc[0] = (acc[0] + file_fp(relpath, st.st_size, mt)) & 0xFFFFFFFF
+                        acc[1] += 1
             except OSError:
                 pass
             if n % chunk_files == 0:
@@ -459,6 +479,127 @@ def chunk_fingerprints(base, recurse, chunk_files):
     if n % chunk_files:
         fps.append(cur)
     return fps
+
+
+class ListingCache:
+    """The folder listing made by the counting pass, kept for the process phase so that every folder is read from the disk once, not twice (on a
+    slow disk or a network share listing is the slow part). Per folder: its sub-folder names and its files (name, kind, size, date, attributes), in
+    a temp SQLite file, so memory stays flat. It lives only as long as THIS process: a restarted run lists again, never trusting an old snapshot.
+    A folder in which the counting pass met any error is not stored (it is listed live, as before); a full cache simply stops storing."""
+
+    def __init__(self, nthreads, max_bytes):
+        import sqlite3, tempfile, atexit
+        self.dir = tempfile.mkdtemp(prefix="profiler_listing_")
+        atexit.register(self.close)
+        self.db = sqlite3.connect(os.path.join(self.dir, "listing.db"), check_same_thread=False, isolation_level=None)
+        self.db.execute("PRAGMA journal_mode=OFF")
+        self.db.execute("PRAGMA synchronous=OFF")
+        self.db.execute("CREATE TABLE f(k TEXT PRIMARY KEY, v BLOB) WITHOUT ROWID")
+        self.buf, self.lock = [[] for _ in range(nthreads)], threading.Lock()
+        self.bytes, self.max, self.full, self.stored = 0, int(max_bytes), False, 0
+
+    def put(self, k, ui, rel, subnames, ents):
+        if self.full:
+            return
+        import pickle
+        blob = pickle.dumps((subnames, ents), 4)
+        self.buf[k].append((f"{ui}\0{rel}", blob))
+        if len(self.buf[k]) >= 200:
+            self._flush(k)
+
+    def _flush(self, k):
+        rows, self.buf[k] = self.buf[k], []
+        with self.lock:
+            self.db.execute("BEGIN")
+            self.db.executemany("INSERT OR REPLACE INTO f VALUES (?,?)", rows)
+            self.db.execute("COMMIT")
+            self.stored += len(rows)
+            self.bytes += sum(len(b) + len(key) for key, b in rows)
+            if self.bytes > self.max:
+                self.full = True
+
+    def flush_all(self):
+        for k in range(len(self.buf)):
+            if self.buf[k]:
+                self._flush(k)
+
+    def get(self, ui, rel):
+        import pickle
+        row = self.db.execute("SELECT v FROM f WHERE k=?", (f"{ui}\0{rel}",)).fetchone()
+        return pickle.loads(row[0]) if row else None
+
+    def close(self):
+        if self.dir:
+            import shutil
+            try:
+                self.db.close()
+            except Exception:
+                pass
+            shutil.rmtree(self.dir, ignore_errors=True)
+            self.dir = None
+
+
+class CachedEntry:
+    """Stands in for an os.DirEntry made from the counting pass's listing: the process phase uses only name, path, stat() and is_symlink()."""
+    __slots__ = ("name", "path", "_link", "_st")
+
+    class _Stat:
+        __slots__ = ("st_size", "st_mtime", "st_file_attributes")
+
+        def __init__(self, size, mtime, attrs):
+            self.st_size, self.st_mtime, self.st_file_attributes = size, mtime, attrs
+
+    def __init__(self, dirpath, name, kind, size, mtime, attrs):
+        self.name, self.path, self._link = name, os.path.join(dirpath, name), kind == 1
+        self._st = None if kind == 1 else CachedEntry._Stat(size, mtime, attrs)
+
+    def is_symlink(self):
+        return self._link
+
+    def stat(self):
+        return os.stat(self.path) if self._link else self._st          # a link to a file: its size and date are the target's, read now
+
+
+def walk_cached(cache, ui, base, recurse, on_error, counts):
+    """walk_dirs, but a folder the counting pass already listed is read from `cache` (same entries, same order: files and sub-folders sorted by
+    name, depth first); any other folder is listed live exactly as walk_dirs does. counts['listing_reused'] / ['listing_live'] say which."""
+    stack = [(base, ".", 0)]
+    while stack:
+        dirpath, rel, depth = stack.pop()
+        got = cache.get(ui, "" if rel == "." else rel.replace(os.sep, "/"))
+        if got is not None:
+            counts["listing_reused"] += 1
+            subnames, ents = got
+            files = [CachedEntry(dirpath, nm_, kind, size, mt, at) for nm_, kind, size, mt, at in ents]
+            subdirs = [(os.path.join(dirpath, nm_), nm_) for nm_ in subnames]
+        else:
+            counts["listing_live"] += 1
+            def _list():
+                with os.scandir(dirpath) as it:
+                    return sorted(it, key=lambda e: e.name)
+            try:
+                entries = retry(_list, counts)
+            except OSError as e:
+                on_error(e)
+                continue
+            files, subdirs = [], []
+            for e in entries:
+                try:
+                    if e.is_symlink() or (hasattr(e, "is_junction") and e.is_junction()):
+                        if e.is_dir():
+                            counts["links_skipped"] += 1
+                            continue
+                        files.append(e)
+                    elif e.is_dir(follow_symlinks=False):
+                        subdirs.append((e.path, e.name))
+                    elif e.is_file(follow_symlinks=False):
+                        files.append(e)
+                except OSError as err:
+                    on_error(err)
+        yield dirpath, rel, depth, files
+        if recurse:
+            for path_, nm_ in reversed(subdirs):
+                stack.append((path_, nm_ if rel == "." else rel + os.sep + nm_, depth + 1))
 
 
 PIPELINE_CHUNKS = max(0, int(os.environ.get("PROFILER_PIPELINE_CHUNKS", "4")))      # chunks left in flight while the next one is listed (0 = wait for each chunk, as before)
@@ -658,16 +799,52 @@ def quick_threads(paths):
     return 32 if remote else 4
 
 
-def scan_tree(units, nthreads, progress=None, only=None, paths=False):
+class RunStopped(Exception):
+    """The run was stopped on request (Stop button). What was finished is saved; the same command carries on from there."""
+
+
+class Control:
+    """Pause / stop requests from another thread (the page's buttons). The run looks at it at safe points only: between chunks of files, and while
+    counting. Stop settles the chunks already in flight first, so no finished work is lost; pause does the same and then waits."""
+
+    def __init__(self):
+        self.stop = False
+        self.pause = False
+
+    def reset(self):
+        self.stop = self.pause = False
+
+    def check(self, can_pause=True):
+        """Raise RunStopped if stop was requested; wait here while paused (only where `can_pause`). -> seconds spent paused."""
+        if self.stop:
+            raise RunStopped("stopped on request")
+        waited = 0.0
+        while can_pause and self.pause and not self.stop:
+            time.sleep(0.25)
+            waited += 0.25
+        if self.stop:
+            raise RunStopped("stopped on request")
+        return waited
+
+
+CONTROL = Control()
+LIVE = {}                    # what the page shows while a run goes: {"limit": sentence, "paused": bool}
+
+
+def scan_tree(units, nthreads, progress=None, only=None, paths=False, fingerprint=None, listing=None):
     """The threaded folder listing used by BOTH steps: how many files of each type and how big, per unit, from folder listings only (no file is
     opened). units = [(name, folder, recurse)]; only = indexes of the units to scan (None = all). No depth limit; folder links / junctions
     are not followed. A folder is listed atomically (retried as a whole after a network hiccup), so nothing is ever counted twice.
     paths=True also keeps, per file type, every file's name, size and date (taken from the stat the scan makes anyway): res["paths"] =
     a PathStore (in memory up to paths_mem_rows(), then temp files; .chunks(ext) -> (unit, folder, [(name, size, mtime), ...])), capped at PATHS_MAX_FILES (counts["paths_dropped"] says how many were not kept).
+    listing = a ListingCache: every folder's entries are stored in it for the process phase (see ListingCache).
+    fingerprint = a set of unit indexes: for those units res["fps"][unit] = [sum, files, linked files] is also worked out - the same per-file crc the
+    process phase saves when a project is finished (order independent, so a threaded listing gives the same number as the sequential walk). Files
+    reached through a link are counted apart (their size and date are those of the target: not comparable) and left out of the sum.
     -> {"tally": {(unit, ext): [files, bytes]}, "unit": {unit: Counter(junk, tiered, dedup)}, "counts": Counter, "unreadable": [(unit, rel, kind, reason)]}"""
     import queue
     progress = progress or (lambda *a: None)
-    q, lock, finished = queue.Queue(), threading.Lock(), threading.Event()
+    q, lock, finished, abort = queue.Queue(), threading.Lock(), threading.Event(), threading.Event()
     todo = list(range(len(units))) if only is None else sorted(only)
     if not todo:
         return {"tally": {}, "unit": {}, "counts": collections.Counter(), "unreadable": []}
@@ -677,6 +854,7 @@ def scan_tree(units, nthreads, progress=None, only=None, paths=False):
     ctr = [collections.Counter() for _ in range(nthreads)]
     bad = [[] for _ in range(nthreads)]
     pstore = PathStore(nthreads, paths_mem_rows()) if paths else None
+    fpt = [dict() for _ in range(nthreads)] if fingerprint else None
     kept = [0]                                               # files whose path was kept (shared; guarded by `lock`)
     bases = {ui: lp(units[ui][1]) for ui in todo}
     for ui in todo:
@@ -687,12 +865,18 @@ def scan_tree(units, nthreads, progress=None, only=None, paths=False):
     def relpath(ui, path):
         return path[len(bases[ui]):].lstrip("\\/").replace("\\", "/")
 
-    def list_dir(path, recurse):
+    def list_dir(path, recurse, ui=None):
         """One folder: ONE stat per entry (on Windows it arrives with the directory listing, no extra disk access) gives file / folder / link
         and the size. Everything is gathered locally and returned, so a retry after a dropped connection starts clean."""
         subdirs, loc, ferr = [], {}, []
         locp = {} if paths else None
         nfiles = nbytes = njunk = nerr = nlinks = ntier = ndedup = 0
+        fpon = bool(fingerprint) and ui in fingerprint
+        fpsum = fpn = nlf = 0
+        ents, subnames, clean = ([] if listing is not None else None), [], True
+        if fpon:
+            pre = relpath(ui, path)
+            pre = pre + "/" if pre else ""
         with os.scandir(path) as it:
             for e in it:
                 try:
@@ -705,6 +889,8 @@ def scan_tree(units, nthreads, progress=None, only=None, paths=False):
                             nlinks += 1                          # a junction is never followed
                         elif recurse:
                             subdirs.append(e.path)
+                            if ents is not None:
+                                subnames.append(e.name)
                         continue
                     elif kind == S_IFLNK:
                         if e.is_dir():                           # a link to a folder: not followed (it could loop)
@@ -721,6 +907,14 @@ def scan_tree(units, nthreads, progress=None, only=None, paths=False):
                         ntier += 1
                     elif getattr(st, "st_reparse_tag", 0) == DEDUP_TAG:
                         ndedup += 1
+                    if fpon:
+                        if kind == S_IFLNK:
+                            nlf += 1
+                        else:
+                            fpsum = (fpsum + file_fp(pre + name, size, iso(st.st_mtime))) & 0xFFFFFFFF
+                            fpn += 1
+                    if ents is not None:
+                        ents.append((name, 1 if kind == S_IFLNK else 0, size, st.st_mtime, _file_attrs(st)))
                     ext = quick_ext(name)
                     t = loc.get(ext)
                     if t is None:
@@ -737,18 +931,27 @@ def scan_tree(units, nthreads, progress=None, only=None, paths=False):
                 except OSError as ex:
                     nerr += 1
                     ferr.append((e.name, reason_of(ex)))
-        return subdirs, loc, (nfiles, nbytes, njunk, nerr, nlinks, ntier, ndedup), ferr, locp
+                    clean = False                                # not stored: this folder is listed live when it is profiled, as before
+        if ents is not None:
+            ents.sort(key=lambda x: x[0])
+            subnames.sort()
+        return subdirs, loc, (nfiles, nbytes, njunk, nerr, nlinks, ntier, ndedup), ferr, locp, (fpsum, fpn, nlf), ((ents, subnames) if clean else None)
 
     def work(k):
         tally, c, ex_ = tallies[k], ctr[k], extras[k]
         while True:
             item = q.get()
-            if item is None:
+            if item is None or abort.is_set():             # a stop request (the caller's progress callback raised): leave the folders still queued
                 return
             ui, path, depth, recurse = item
             subdirs = []
             try:
-                subdirs, loc, nums, ferr, locp = retry(lambda: list_dir(path, recurse), c)
+                subdirs, loc, nums, ferr, locp, fpv, lst7 = retry(lambda: list_dir(path, recurse, ui), c)
+                if lst7 is not None and listing is not None:
+                    listing.put(k, ui, relpath(ui, path), lst7[1], lst7[0])
+                if fpt is not None and (fpv[1] or fpv[2]):
+                    a_ = fpt[k].setdefault(ui, [0, 0, 0])
+                    a_[0] = (a_[0] + fpv[0]) & 0xFFFFFFFF; a_[1] += fpv[1]; a_[2] += fpv[2]
                 nfiles, nbytes, njunk, nerr, nlinks, ntier, ndedup = nums
                 if locp:
                     with lock:
@@ -806,6 +1009,7 @@ def scan_tree(units, nthreads, progress=None, only=None, paths=False):
         while not finished.wait(0.3):
             progress("scan", sum(c["files"] for c in ctr), sum(c["files"] for c in ctr), 0, sum(c["bytes"] for c in ctr))
     finally:
+        abort.set()
         for _ in threads:
             q.put(None)
     counts = collections.Counter()
@@ -823,7 +1027,14 @@ def scan_tree(units, nthreads, progress=None, only=None, paths=False):
             unit[ui].update(cn)
     flat = [x for lst in bad for x in lst]
     counts["unreadable_not_listed"] += max(0, len(flat) - MAX_UNREADABLE)
-    return {"tally": dict(tally), "unit": dict(unit), "counts": counts, "unreadable": flat[:MAX_UNREADABLE], "paths": pstore}
+    fps = {}
+    for d_ in (fpt or ()):
+        for ui_, a_ in d_.items():
+            t_ = fps.setdefault(ui_, [0, 0, 0])
+            t_[0] = (t_[0] + a_[0]) & 0xFFFFFFFF; t_[1] += a_[1]; t_[2] += a_[2]
+    for ui_ in (fingerprint or ()):
+        fps.setdefault(ui_, [0, 0, 0])                    # a project with no files at all
+    return {"tally": dict(tally), "unit": dict(unit), "counts": counts, "unreadable": flat[:MAX_UNREADABLE], "paths": pstore, "fps": fps}
 
 
 def unreadable_csv(units, rows, with_paths=True, files_with_paths=True):
@@ -899,7 +1110,18 @@ def quick_scan(root, out_dir, log=print, label=None, folders=None, workers=None,
         log(f"WARNING ({where}): {path_}: {why}")
     nthreads = int(workers) if workers else quick_threads(data_paths)
     want_paths = (os.environ.get("PROFILER_PATHS", "1").lower() not in ("0", "false", "no")) if list_paths is None else bool(list_paths)
-    res = scan_tree(units, nthreads, progress, paths=want_paths)
+    CONTROL.reset()
+    keep_awake = sysmetrics.KeepAwake()
+    if keep_awake.start():
+        log(f"keeping this computer awake while the count runs ({keep_awake.how})")
+    def counting(*a):
+        if progress:
+            progress(*a)
+        CONTROL.check(can_pause=False)
+    try:
+        res = scan_tree(units, nthreads, counting, paths=want_paths)
+    finally:
+        keep_awake.stop()
     total = res["counts"]
     ext_stats = res["tally"]
     secs = time.time() - t0
@@ -977,6 +1199,44 @@ def quick_scan(root, out_dir, log=print, label=None, folders=None, workers=None,
     return zip_path, len(units), nfiles, total["dir_errors"] + total["errors"]
 
 
+def _cfg_core(cfg_json):
+    """A run's settings without the tool version: what decides whether saved progress belongs to this run. None if it cannot be read, or if
+    it was saved in another STATE_FORMAT (old progress had no "fmt": that is format 1)."""
+    try:
+        d = json.loads(cfg_json)
+        if d.pop("fmt", 1) != STATE_FORMAT:
+            return None
+        d.pop("v", None)
+        return json.dumps(d, sort_keys=True)
+    except Exception:
+        return None
+
+
+def find_saved_state(out_dir, cfg):
+    """The saved progress (a .resume/<id> folder) of the same run - same folders, options and state format - made by another version of the
+    tool, newest first; None if there is none."""
+    want = _cfg_core(cfg)
+    base = os.path.join(out_dir, ".resume")
+    best = None
+    try:
+        names = os.listdir(base)
+    except OSError:
+        return None
+    for n in names:
+        mp = os.path.join(base, n, "manifest.json")
+        try:
+            mt = os.path.getmtime(mp)
+            if best is not None and mt <= best[0]:
+                continue
+            with open(mp, encoding="utf-8") as fh:
+                got = _cfg_core(json.load(fh).get("cfg"))
+        except Exception:
+            continue
+        if got is not None and got == want:
+            best = (mt, os.path.join(base, n))
+    return best[1] if best else None
+
+
 def profile(root, out_dir, log=print, label=None, folders=None, workers=None, progress=None,
             anonymize_assembly_names=None, tier=None, project_depth=None,
             resume=True, metrics_interval=None, system_info=True, chunk_files=None, anonymize_names=None, name_map=True):
@@ -986,7 +1246,10 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
     NAMES (salted, to make anonymous folder ids); file contents are never hashed.
     progress(phase, files_done, files_total, bytes_done, bytes_total): phase "scan" (counting), "process" or "links"."""
     progress = progress or (lambda *a: None)
+    CONTROL.reset()
+    LIVE.clear()
     t_run0 = time.time()
+    paused_total = [0.0]                                 # seconds spent paused: not part of the run's time (elapsed, speed, time left)
     chunk_files = int(chunk_files or CHUNK_FILES)
     env_int = lambda k, d: int(os.environ[k]) if os.environ.get(k, "").isdigit() else d
     tier = env_int("PROFILER_TIER", 2) if tier is None else int(tier)
@@ -1018,11 +1281,15 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
     policy = (lambda ext: "read") if read_all else head_policy
     hit_types = set()                                               # (project, ext) of sampled types whose sample showed CAD content
     # ---- run identity, checkpoint state
-    cfg = json.dumps({"v": VERSION, "nohead": bool(no_head), "units": [[u[0], u[1], u[2]] for u in units], "tier": tier, "depth": project_depth,
+    cfg = json.dumps({"fmt": STATE_FORMAT, "nohead": bool(no_head), "units": [[u[0], u[1], u[2]] for u in units], "tier": tier, "depth": project_depth,
                       "anon": bool(anonymize_assembly_names), "anon_names": bool(nm),
                       "chunk": chunk_files}, sort_keys=True)
     run_id = f"{zlib.crc32(cfg.encode()):08x}{zlib.adler32(cfg.encode()):08x}"
     state_dir = os.path.join(out_dir, ".resume", run_id)
+    if resume and not os.path.exists(os.path.join(state_dir, "manifest.json")):
+        found = find_saved_state(out_dir, cfg)          # progress saved by an OLDER VERSION of the tool (its settings, and so its folder name, differ in "v")
+        if found:
+            state_dir = found
     LAST_RUN["state_dir"] = state_dir           # so a failed run's logs can be bundled (make_fail_log)
     if not resume:
         shutil.rmtree(state_dir, ignore_errors=True)
@@ -1034,16 +1301,30 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
         try:
             man = json.load(open(mpath, encoding="utf-8"))
             if man.get("cfg") != cfg:
-                man = None
+                if _cfg_core(man.get("cfg")) is not None and _cfg_core(man.get("cfg")) == _cfg_core(cfg):
+                    man["_from_version"] = (json.loads(man["cfg"]).get("v") or "")      # same run, saved by another version: carry on
+                    man["cfg"] = cfg
+                else:
+                    man = None
         except Exception as exc:
             man, man_problem = None, type(exc).__name__
     resumed = man is not None
     if man is None:
-        man = {"cfg": cfg, "salt": os.urandom(8).hex(), "created": now_utc(), "restarts": 0, "elapsed": 0.0, "units": {},
+        man = {"cfg": cfg, "salt": os.urandom(8).hex(), "created": now_utc(), "restarts": 0, "elapsed": 0.0, "units": {}, "versions": [{"v": VERSION, "utc": now_utc()}],
                "prescan_s": 0.0, "process_s": 0.0, "c": collections.Counter()}
     else:
         man["restarts"] += 1
         man["c"] = collections.Counter(man["c"])
+    vers = man.setdefault("versions", [])                # every version of the tool that worked on this run, in order
+    if not vers:                                         # progress saved before versions were recorded: the old cfg named it
+        old_v = man.pop("_from_version", "") or "earlier version"
+        vers.append({"v": old_v, "utc": man.get("created", "")})
+        for uu in man["units"].values():
+            uu.setdefault("vs", [old_v])
+    man.pop("_from_version", None)
+    prev_v = vers[-1]["v"]
+    if prev_v != VERSION:
+        vers.append({"v": VERSION, "utc": now_utc()})
     C = man["c"]
     elapsed_before = man["elapsed"]
     salt = man["salt"]
@@ -1066,10 +1347,15 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
     t0 = time.time()
     rlog = sysmetrics.RunLog(os.path.join(state_dir, "Run_log.csv"), t0=t0, echo=log)
     act = sysmetrics.Activity()
+    keep_awake = sysmetrics.KeepAwake()
+    if keep_awake.start():
+        rlog.event("start", f"keeping this computer awake while the run works ({keep_awake.how})")
     state = {"phase": "start", "files": 0, "bytes": 0}
     mon = sysmetrics.Monitor(os.path.join(state_dir, "Run_metrics.csv"), state,
                              interval=metrics_interval or env_int("PROFILER_METRICS_INTERVAL", 5), t0=t0)
     mon.start()
+    bn = sysmetrics.Bottleneck(act, gate, state, rlog, workers, window=float(os.environ.get("PROFILER_BOTTLENECK_SECS", "30") or 30), budget_mb=gate.budget >> 20, live=LIVE)
+    bn.start()
     si_box = [None]                                      # machine facts (PowerShell on Windows takes seconds): gathered while the run works
     si_thread = None
     if system_info:
@@ -1082,6 +1368,9 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
     rlog.event("start", ("RESUMED run (restart #%d) " % man["restarts"] if resumed else "started ") +
                f"v{VERSION}: level {tier}, project depth {project_depth}, {workers} workers, "
                f"{len(units)} projects, hashing: none")
+    if resumed and prev_v != VERSION:
+        rlog.event("start", f"the saved progress was made by v{prev_v}; carrying on from it with v{VERSION} - nothing that was finished is redone "
+                            f"(Run_info.csv lists the versions and which projects each profiled)")
     if man_problem:
         rlog.event("start", f"the saved progress of an earlier run could not be read ({man_problem}) - starting from the beginning", "WARN")
     for where, path_, why in setup_warnings:
@@ -1096,7 +1385,7 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
         now = time.time()
         if not force and now - manifest_clock[0] < 20 * manifest_clock[1]:
             return
-        man["elapsed"] = elapsed_before + (now - t_run0)
+        man["elapsed"] = elapsed_before + (now - t_run0 - paused_total[0])
         _save_json(mpath, man)
         manifest_clock[0] = time.time()
         manifest_clock[1] = manifest_clock[0] - now
@@ -1106,29 +1395,59 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
         C["errors"] += 1
         rlog.event(state["phase"], f"unreadable folder skipped ({reason_of(e)})", "WARN")
 
+    def pause_here():
+        state["phase"] = "paused"
+        LIVE["paused"] = True
+        rlog.event("control", "paused - what is finished is saved. Press Resume to carry on, or Stop.")
+        t_p = time.time()
+        try:
+            CONTROL.check()                               # waits while paused; raises RunStopped on Stop
+        finally:
+            dt_p = time.time() - t_p
+            paused_total[0] += dt_p
+            state["phase"] = "process"
+            LIVE["paused"] = False
+        rlog.event("control", f"resumed after {dt_p:.0f}s")
+
     walk_counts = collections.Counter()
+    listing = None                                        # ListingCache of the counting pass (None = off, or nothing was counted in this run)
     pool = ThreadPoolExecutor(max_workers=workers)
     try:
         # ================================================================= scan (count) - cached per project in the manifest
         state["phase"] = "scan"
         total_files = total_bytes = 0
         need = [ui for ui, (proj, _b, _r) in enumerate(units) if "files" not in man["units"].setdefault(proj, {})]
+        listed_units = set()                              # units whose folder listing the counting pass kept for the process phase
         if need:                                          # the same threaded folder listing as step 1 (cached per project for a resumed run)
             def scan_progress(phase, files, _tf, _db, nbytes):
                 state["files"] = files
                 progress("scan", files, files, 0, nbytes)
-            res = scan_tree(units, quick_threads(data_paths) if not os.environ.get("PROFILER_WORKERS", "").isdigit() else workers, scan_progress, only=set(need))
+                CONTROL.check(can_pause=False)                # Stop works while counting too (the partial count is thrown away)
+            scan_threads = quick_threads(data_paths) if not os.environ.get("PROFILER_WORKERS", "").isdigit() else workers
+            t_scan = time.time()
+            if os.environ.get("PROFILER_REUSE_LISTING", "1").lower() not in ("0", "false", "no"):
+                listing = ListingCache(scan_threads, env_int("PROFILER_LISTING_CACHE_MB", 4096) * 1024 * 1024)
+            res = scan_tree(units, scan_threads, scan_progress, only=set(need), listing=listing)
+            if listing is not None:
+                listing.flush_all()
+                listed_units = set(need)
+                if listing.full:
+                    rlog.event("scan", "the folder listing kept for the profiling pass reached its size limit; the folders after that are listed again "
+                                       "(PROFILER_LISTING_CACHE_MB raises the limit)")
+            scan_listed = sum(n_ for (_ui, _e), (n_, _b) in res["tally"].items())
             by_unit = collections.defaultdict(lambda: [0, 0])
-            for (ui, _ext), (n_, b_) in res["tally"].items():
+            ext_by_unit = collections.defaultdict(dict)
+            for (ui, ext_), (n_, b_) in res["tally"].items():
                 by_unit[ui][0] += n_
                 by_unit[ui][1] += b_
+                ext_by_unit[ui][ext_] = [n_, b_]                  # kept for the reconciliation at the end
             for ui in need:
                 u = man["units"][units[ui][0]]
                 ex_ = res["unit"].get(ui, collections.Counter())
                 lst = [[rel, kind, why] for (i, rel, kind, why) in res["unreadable"] if i == ui]
                 C["unreadable_not_listed"] += max(0, len(lst) - 5000)
                 u.update(files=by_unit[ui][0], bytes=by_unit[ui][1], junk=ex_["junk"], tiered=ex_["tiered"], dedup=ex_["dedup"],
-                         unreadable=lst[:5000])
+                         unreadable=lst[:5000], ext=ext_by_unit.get(ui, {}))
             cnt = res["counts"]
             C["unreadable_not_listed"] += cnt["unreadable_not_listed"]
             C["dir_errors"] += cnt["dir_errors"]
@@ -1151,10 +1470,26 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
             total_bytes += u["bytes"]
         scan_s = time.time() - t0
         man["prescan_s"] += scan_s
+        if need and scan_listed >= 1000:                  # how fast the folders could be listed: the speed limit of the counting pass, said plainly
+            rate = scan_listed / max(0.01, time.time() - t_scan)
+            rlog.event("speed", f"counting pass: {scan_listed:,} files listed at {rate:,.0f} files/s with {scan_threads} threads"
+                                + (" - SLOW: reading the folder listing is the limit (a slow disk, a USB 2 link, a network share, or very many small files); "
+                                   "it is not something the tool can speed up much" if rate < 2000 else ""))
         rlog.event("scan", f"counted {total_files:,} files, {total_bytes / 1e9:.1f} GB in {len(units)} projects "
                            f"({scan_s:.1f}s; unreadable folders {C['dir_errors']}, linked folders skipped {walk_counts['links_skipped']})")
         done_files = sum(man["units"][p[0]].get("files", 0) for p in units if man["units"][p[0]].get("complete"))
         done_bytes = sum(man["units"][p[0]].get("bytes", 0) for p in units if man["units"][p[0]].get("complete"))
+        quick_fp = {}
+        if resumed:
+            cand = [ui_ for ui_, (pj_, _b, _r) in enumerate(units)
+                    if man["units"][pj_].get("complete") and man["units"][pj_].get("fps") is not None and man["units"][pj_].get("ufp") is not None
+                    and man["units"][pj_]["ufp"][2] == 0]
+            if cand:                                              # finished projects: compared with the disk by the threaded listing, not one walk each
+                t_q = time.time()
+                th_q = quick_threads(data_paths) if not os.environ.get("PROFILER_WORKERS", "").isdigit() else workers
+                quick_fp = scan_tree(units, th_q, None, only=set(cand), fingerprint=set(cand)).get("fps", {})
+                rlog.event("speed", f"resume check: {len(cand)} finished project(s) compared with the disk in {time.time() - t_q:.1f}s with {th_q} threads "
+                                    f"(each used to be walked one after the other)")
         state.update(phase="process", files=done_files, bytes=done_bytes)
         progress("process", done_files, total_files, done_bytes, total_bytes)
         t_proc0 = time.time()
@@ -1188,25 +1523,42 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
             u = man["units"][proj]
             if u.get("complete") and resumed and u.get("fps") is not None:
                 t_v = time.time()
-                with act.timer("resume_verify"):
-                    same = chunk_fingerprints(base, recurse, chunk_files) == u["fps"]
+                how = "check"
+                qf, sv = quick_fp.get(ui), u.get("ufp")
+                if qf is not None and sv is not None and qf[2] == 0 and sv[2] == 0:
+                    same = qf[:2] == sv[:2]                        # fingerprints of the whole project, compared up front in parallel: equal = unchanged, different = changed
+                    how = "parallel check"
+                else:                                              # no fingerprint saved (older version), or the project holds links: walk it, as before
+                    acc = [0, 0, 0]
+                    with act.timer("resume_verify"):
+                        same = chunk_fingerprints(base, recurse, chunk_files, acc) == u["fps"]
+                    if same and sv is None:
+                        u["ufp"] = acc                             # saved from now on: the next resume uses the fast check
                 if not same:
                     u["complete"] = False                         # changed since it was saved: the chunk check below redoes what differs
                     C["stale_projects"] += 1
                     rlog.event("process", f"[{ui + 1}/{len(units)}] {shown(proj)}: changed since it was saved in an earlier run - checking it again", "WARN")
                 else:
-                    rlog.event("process", f"[{ui + 1}/{len(units)}] {shown(proj)}: unchanged since an earlier run ({time.time() - t_v:.1f}s check) - skipped")
+                    rlog.event("process", f"[{ui + 1}/{len(units)}] {shown(proj)}: unchanged since an earlier run ({how}) - skipped")
                     continue
             elif u.get("complete"):
                 rlog.event("process", f"[{ui + 1}/{len(units)}] {shown(proj)}: already done in an earlier run - skipped")
                 continue
+            if CONTROL.stop:
+                raise RunStopped("stopped on request")
+            if CONTROL.pause:
+                save_manifest(force=True)
+                pause_here()
             t_unit = time.time()
+            if VERSION not in u.setdefault("vs", []):
+                u["vs"].append(VERSION)
             chunks_done = u.get("chunks_done", 0)
             if chunks_done:
                 rlog.event("process", f"[{ui + 1}/{len(units)}] {shown(proj)}: resuming after chunk {chunks_done}")
                 state["files"] += min(u.get("files", 0), chunks_done * chunk_files)
             n = 0
             pending, chunk_idx = [], 0
+            ufp_acc = [0, 0, 0]                                     # this project's fingerprint: [sum of file crcs, files, linked files]
             wbase = lp(base)
 
             retries_seen = [C["retries"]]
@@ -1296,11 +1648,25 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
                 while len(inflight) > PIPELINE_CHUNKS:
                     finish_chunk(inflight.popleft())
 
+            def control_point():
+                """A safe place for Stop / Pause: the chunks already read are written first (their reads are paid for), then progress is saved."""
+                if not (CONTROL.stop or CONTROL.pause):
+                    return
+                while inflight:
+                    finish_chunk(inflight.popleft())
+                save_manifest(force=True)
+                if CONTROL.stop:
+                    raise RunStopped("stopped on request")
+                pause_here()
+
             def finish_chunk(job):
                 chunk_no, pend, futs, fp, t_c = job
                 fps = u.setdefault("fps", [])
                 rows, lrows, prows = [], [], []
                 for e, fut in zip(pend, futs):
+                    if not fut.done():                         # the main thread is held up by the readers: that wait is what "limited by read speed" means
+                        with act.timer("wait_for_reads"):
+                            fut.result()
                     sig, res, was_link, sh, why = fut.result()
                     path, name, ext, size, mtime, dir_id, depth, asm, relpath, nn, tiered = e
                     if sig == "NOTAG":
@@ -1353,7 +1719,9 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
                     _TEST_HOOK(ui, chunk_no)
 
             proc_counts = collections.Counter()
-            for dirpath, rel, depth, files in walk_dirs(wbase, recurse, lambda e: None, proc_counts):   # folders already counted by the scan
+            walker = (walk_cached(listing, ui, wbase, recurse, lambda e: None, proc_counts) if listing is not None and ui in listed_units
+                      else walk_dirs(wbase, recurse, lambda e: None, proc_counts))
+            for dirpath, rel, depth, files in walker:                  # folders already counted by the scan
                 dir_id = reg(proj, rel, depth, proj if rel == "." else os.path.basename(rel))
                 for e in files:
                     name = e.name
@@ -1375,11 +1743,20 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
                         asm = ""
                         if ext in ASSEMBLY_EXTS:
                             asm = (f"ASM-{ident(proj, rel, name, n=8).upper()}.{ext.upper()}" if anonymize_assembly_names else name)
-                        pending.append((e.path, name, ext, st.st_size, iso(st.st_mtime), dir_id, depth, asm, relpath, n,
+                        mt_ = iso(st.st_mtime)
+                        if e.is_symlink():                              # project fingerprint (see scan_tree): links are counted apart, not summed
+                            ufp_acc[2] += 1
+                        else:
+                            ufp_acc[0] = (ufp_acc[0] + file_fp(relpath, st.st_size, mt_)) & 0xFFFFFFFF
+                            ufp_acc[1] += 1
+                        pending.append((e.path, name, ext, st.st_size, mt_, dir_id, depth, asm, relpath, n,
                                         bool(_file_attrs(st) & TIER_MASK)))
                     if n % chunk_files == 0:
                         flush_chunk()
+                        control_point()
             C["retries"] += proc_counts["retries"]
+            C["listing_reused"] += proc_counts["listing_reused"]
+            C["listing_live"] += proc_counts["listing_live"]
             if pending or (n and n % chunk_files):
                 flush_chunk()
             while inflight:                                     # the project is only done when every chunk submitted for it has been written
@@ -1405,15 +1782,21 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
                 for i in dirs_of.pop(proj, ()):                  # saved to disk: free the memory (Dirs.csv is built from the saved files at the end)
                     dirs.pop(i, None)
                 u["complete"] = True
+                u["ufp"] = ufp_acc[:]
                 u["loose_files"] = n_loose
                 save_manifest()
             rlog.event("process", f"[{ui + 1}/{len(units)}] {shown(proj)}: done ({n_loose:,} files, {time.time() - t_unit:.1f}s)")
-        man["process_s"] += time.time() - t_proc0
+        man["process_s"] += time.time() - t_proc0 - paused_total[0]
         save_manifest(force=True)
     except BaseException as exc:
-        rlog.event(state["phase"], f"run stopped: {type(exc).__name__}. Progress is saved - start again with the same settings to resume.", "ERROR")
+        if isinstance(exc, RunStopped):
+            rlog.event(state["phase"], "stopped on request. What was finished is saved - start again with the same settings to carry on from here.", "WARN")
+        else:
+            rlog.event(state["phase"], f"run stopped: {type(exc).__name__}. Progress is saved - start again with the same settings to resume.", "ERROR")
         save_manifest(force=True)
-        mon.stop()
+        mon.stop(); bn.stop(); keep_awake.stop()
+        if listing is not None:
+            listing.close()
         pool.shutdown(wait=False, cancel_futures=True)
         raise
     finally:
@@ -1422,7 +1805,17 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
         except Exception:
             pass
 
+
     # ===================================================================== finalize: stream the saved chunks into the zip
+    try:
+        bn.step(min_files=1)                              # the last stretch of the process phase, however short
+    except Exception:
+        pass
+    bn.stop()
+    keep_awake.stop()                                     # profiling is over; building the zip is quick
+    if listing is not None:
+        listing.close()
+    bn_main, bn_text = bn.summary()
     state["phase"] = "finalize"
     t_fin = time.time()
     progress("process", total_files, total_files, total_bytes, total_bytes)
@@ -1579,8 +1972,32 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
             [[p, s[0], s[1], len(s[4]), s[2], s[3]] for p, s in sorted(proj_stats.items())])
         put("Extensions.csv", ["project", "ext", "file_count", "total_bytes", "avg_bytes"],
             [[p, e, s[0], s[1], s[1] // s[0]] for (p, e), s in sorted(ext_stats.items())])
+        # ---- reconciliation: what this profile holds, against what the counting pass (the same listing Step 1 makes) counted
+        recon, recon_bad, recon_nocmp = [], 0, 0
+        for proj_real, uu in man["units"].items():
+            pk = nm.project(proj_real) if nm else proj_real
+            ps = proj_stats.get(pk, [0, 0])
+            if "files" not in uu:
+                recon_nocmp += 1
+                recon.append(["project", pk, "", "", ps[0], "", "", ps[1], "", "NOT COUNTED (no counting-pass figure for this project)"])
+                continue
+            df, db = ps[0] - uu["files"], ps[1] - uu["bytes"]
+            ok = df == 0 and db == 0
+            recon_bad += 0 if ok else 1
+            recon.append(["project", pk, "", uu["files"], ps[0], df, uu["bytes"], ps[1], db, "OK" if ok else "DIFFERENT"])
+            if not ok and uu.get("ext") is not None:                # which file types differ, for the projects that do
+                seen = {e_ for (p_, e_) in ext_stats if p_ == pk} | set(uu["ext"])
+                for e_ in sorted(seen):
+                    c1, c2 = uu["ext"].get(e_, [0, 0]), ext_stats.get((pk, e_), [0, 0])
+                    if c1 != c2:
+                        recon.append(["extension", pk, e_, c1[0], c2[0], c2[0] - c1[0], c1[1], c2[1], c2[1] - c1[1], "DIFFERENT"])
+        recon_text = (f"OK: all {len(man['units']) - recon_nocmp} projects match the counting pass exactly (files and bytes)" if not recon_bad and not recon_nocmp else
+                      f"{recon_bad} of {len(man['units'])} projects differ from the counting pass" + (f", {recon_nocmp} have no counting-pass figure" if recon_nocmp else "")
+                      + " - see Reconciliation.csv (a folder that changed while the run worked is the usual reason)")
+        put("Reconciliation.csv", ["level", "project", "ext", "counted_files", "profiled_files", "diff_files", "counted_bytes", "profiled_bytes", "diff_bytes", "status"], recon)
+        rlog.event("finalize", f"reconciliation: {recon_text}", "INFO" if not recon_bad and not recon_nocmp else "WARN")
         fin_s = time.time() - t_fin
-        active = elapsed_before + (time.time() - t_run0)
+        active = elapsed_before + (time.time() - t_run0 - paused_total[0])
         busy, calls = act.snapshot()
         proc_s = man["process_s"]
         info = [["tool_version", VERSION], ["run_utc", now_utc()], ["os", platform.platform()], ["python", platform.python_version()],
@@ -1599,7 +2016,10 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
                 ["ignored_system_files", C["junk"] + sum(u.get("junk", 0) for u in man["units"].values())],
                 ["projects_changed_during_run", C["changed_projects"]], ["projects_changed_between_restarts", C["stale_projects"]], ["chunks_redone_after_change", C["stale_chunks"]],
                 ["drawing_sheets_counted", C["sheets_counted"]], ["drawing_sheets_not_counted", C["sheets_not_counted"]],
-                ["drawing_sheets_status", "; ".join(f"{k.split(':', 1)[1]} x{v}" for k, v in sorted(C.items(), key=lambda kv: -kv[1]) if k.startswith("sheet_status:"))], ["restarts_resumed", man["restarts"]],
+                ["drawing_sheets_status", "; ".join(f"{k.split(':', 1)[1]} x{v}" for k, v in sorted(C.items(), key=lambda kv: -kv[1]) if k.startswith("sheet_status:"))], ["restarts_resumed", man["restarts"]], ["reconciliation", recon_text], ["reconciliation_projects_different", recon_bad],
+                ["folders_read_from_counting_pass", C["listing_reused"]], ["folders_listed_again", C["listing_live"]], ["main_limit", bn_main or "not measured (run too short)"], ["limit_breakdown", bn_text],
+                ["versions_used", " -> ".join(v["v"] for v in vers)],
+                ["projects_by_version", "; ".join(f"{k}: {n_}" for k, n_ in sorted(collections.Counter("+".join(uu.get("vs", [])) or "none" for uu in man["units"].values()).items()))],
                 ["peak_memory_mb", _peak_mb()], ["usable_cpus", _usable_cpus()], ["seconds", round(active, 1)], ["seconds_scan", round(man["prescan_s"], 1)], ["seconds_process", round(proc_s, 1)],
                 ["seconds_finalize", round(fin_s, 1)],
                 ["avg_MB_per_s", round(bytes_out / 1e6 / max(1.0, proc_s + man["prescan_s"]), 1)],
@@ -1672,6 +2092,8 @@ def what_is(tier, anonymized, names_anon=False):
                  "The table of codes and real names is NOT in this zip; the data owner keeps it.\r\n")
     return head + body + ("Read_Problems.csv (only when needed) lists files that could not be fully read - file number, type, step and the reason (an error type,\r\n"
                           "never file text). Setup_Warnings.csv (only when needed) lists folders that could not be listed when the projects were chosen.\r\n"
+                          "Reconciliation.csv checks this profile against the count made before profiling started: per project the files and bytes counted and "
+                          "profiled, and the file types that differ if they do. Run_info.csv gives the verdict.\r\n"
                           "Run_log.csv, Run_phases.csv, Run_metrics.csv and System_info.csv describe how the run went and what machine it ran\r\n"
                           "on (no file names; project folder names appear in Run_log.csv unless the names are anonymised). "
                           "Compressed files (zip, rar, 7z, tar ...) are counted as one file each; nothing is looked into them.\r\n")
@@ -1834,6 +2256,9 @@ def main(argv=None):
         except SystemExit as e:
             print(e)
             return 1
+        except RunStopped:
+            print("\nStopped.")
+            return 130
         print(f"\nDone: {nproj} folders, {nfiles:,} files" + (f", {errors} unreadable" if errors else ""))
         print("Top file types: " + ", ".join(f".{e} {n:,}" for e, n, _b in LAST_RUN.get("top", [])[:8]))
         shown = os.path.basename(qz) if os.environ.get("PROFILER_IN_DOCKER") else qz
@@ -1852,6 +2277,9 @@ def main(argv=None):
     except SystemExit as e:
         print(e)
         return 1
+    except RunStopped:
+        print("\nStopped. What was finished is saved: run the same command again and it carries on from here.")
+        return 130
     except Exception:
         log = os.path.join(out_dir, "error_log.txt")
         os.makedirs(out_dir, exist_ok=True)

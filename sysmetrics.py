@@ -406,6 +406,143 @@ class Activity:
             return dict(self.sec), dict(self.n)
 
 
+class KeepAwake:
+    """Stops the computer going to sleep while a long run works (a laptop that sleeps halts the run and, on some drives, drops the connection).
+    macOS: caffeinate; Windows: SetThreadExecutionState; Linux: systemd-inhibit. Never an error: if it cannot, the run goes on and says so.
+    In Docker nothing is done (the container cannot). PROFILER_KEEP_AWAKE=0 turns it off."""
+
+    def __init__(self):
+        self.proc, self.thread, self.stop_ev, self.how = None, None, threading.Event(), ""
+
+    def start(self):
+        if os.environ.get("PROFILER_KEEP_AWAKE", "1").lower() in ("0", "false", "no") or os.environ.get("PROFILER_IN_DOCKER"):
+            return ""
+        try:
+            if IS_MAC:
+                self.proc = subprocess.Popen(["caffeinate", "-i", "-w", str(os.getpid())], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                self.how = "caffeinate"
+            elif IS_WIN:
+                import ctypes
+
+                def hold():
+                    k = ctypes.windll.kernel32
+                    k.SetThreadExecutionState(0x80000000 | 0x00000001)         # ES_CONTINUOUS | ES_SYSTEM_REQUIRED (per thread: this one stays alive)
+                    self.stop_ev.wait()
+                    k.SetThreadExecutionState(0x80000000)
+                self.thread = threading.Thread(target=hold, daemon=True)
+                self.thread.start()
+                self.how = "SetThreadExecutionState"
+            else:
+                self.proc = subprocess.Popen(["systemd-inhibit", "--what=idle:sleep", "--who=Folder Profiler", "--why=profiling a folder",
+                                              "tail", "--pid=%d" % os.getpid(), "-f", "/dev/null"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                self.how = "systemd-inhibit"
+        except Exception:
+            self.proc, self.how = None, ""
+        return self.how
+
+    def stop(self):
+        self.stop_ev.set()
+        if self.proc is not None:
+            try:
+                self.proc.terminate()
+            except Exception:
+                pass
+            self.proc = None
+
+
+READ_ACTIVITIES = ("format_tag_read", "sheet_count", "reference_read")      # worker time spent opening and reading files
+
+
+def classify_window(m):
+    """What limited the run during one window of time, from measured numbers only.
+    m: seconds (window length), workers, cpus, read_busy_s (worker seconds reading), wait_s (main thread blocked waiting for reads),
+    ckpt_s (main thread saving progress), cpu_s (process CPU seconds), memwait_s (worker seconds blocked on the memory budget),
+    files, bytes, budget_mb. -> (label, sentence). Labels: memory, cpu, saving, reads, listing, balanced."""
+    W = max(1e-6, m["seconds"]); N = max(1, m["workers"]); C = max(1, m["cpus"])
+    readers = min(1.0, m["read_busy_s"] / (W * N))                 # share of the readers' capacity in use
+    cpu = m["cpu_s"] / (W * C)
+    wait = min(1.0, m["wait_s"] / W)
+    ckpt = min(1.0, m["ckpt_s"] / W)
+    memwait = m["memwait_s"] / (W * N)
+    rate = f"{m['files'] / W:,.0f} files/s, {m['bytes'] / W / 1e6:,.1f} MB/s"
+    if memwait > 0.10:
+        return "memory", (f"LIMIT: memory. Reads of large files spent {100 * memwait:.0f}% of their time waiting for the memory budget "
+                          f"({m['budget_mb']} MB). More RAM, or a higher PROFILER_MEM_BUDGET_MB, would be faster ({rate}).")
+    if cpu > 0.85:
+        return "cpu", (f"LIMIT: processor. {100 * cpu:.0f}% of the {C} usable CPU(s) are busy; the disk is not the limit here, more CPU cores would be ({rate}).")
+    if ckpt > 0.25:
+        return "saving", (f"LIMIT: saving progress. {100 * ckpt:.0f}% of the time goes into writing the saved-progress files in the output folder; "
+                          f"a faster output disk (not the data disk) would help ({rate}).")
+    if wait > 0.5 and readers > 0.5:
+        return "reads", (f"LIMIT: file read speed. The run waits for the disk / network to deliver file data ({rate}); readers busy {100 * readers:.0f}%, "
+                         f"CPU {100 * cpu:.0f}%. A faster disk or connection would help; more workers help only on a network share.")
+    if wait < 0.35 and readers < 0.5:
+        return "listing", (f"LIMIT: folder listing. The readers are idle ({100 * (1 - readers):.0f}% free) while the folders are listed one by one "
+                           f"({rate}). Typical for a slow disk or share with many small files; reading headers is not the problem.")
+    return "balanced", (f"No single limit: readers {100 * readers:.0f}% busy, CPU {100 * cpu:.0f}%, waiting for reads {100 * wait:.0f}% of the time ({rate}).")
+
+
+class Bottleneck(threading.Thread):
+    """Every `window` seconds of the process phase, works out what is slowing the run (classify_window) and writes it to the run log, so the
+    log - and the page - say WHY the run is as fast or slow as it is. Keeps the time spent under each limit for Run_info.csv."""
+
+    def __init__(self, act, gate, state, rlog, workers, window=30.0, budget_mb=0, live=None):
+        super().__init__(daemon=True)
+        self.act, self.gate, self.state, self.rlog = act, gate, state, rlog
+        self.live = live if live is not None else {}
+        self.workers, self.window, self.budget_mb = workers, max(0.5, float(window)), budget_mb
+        self.cpus = effective_cpus()
+        self.stop_ev = threading.Event()
+        self.seconds = {}                       # label -> seconds of windows under that limit
+        self.last, self.quiet = None, 0
+        self.latest = ""
+        self._prev = self._snap()
+
+    def _snap(self):
+        sec, _n = self.act.snapshot()
+        return dict(t=time.time(), cpu=time.process_time(), sec=sec, memwait=getattr(self.gate, "wait_s", 0.0),
+                    files=self.state.get("files", 0), bytes=self.state.get("bytes", 0), phase=self.state.get("phase", ""))
+
+    def step(self, min_files=20):
+        cur, prev = self._snap(), self._prev
+        self._prev = cur
+        if cur["phase"] != "process" or prev["phase"] != "process":
+            return None
+        d = lambda k: cur["sec"].get(k, 0.0) - prev["sec"].get(k, 0.0)
+        m = dict(seconds=cur["t"] - prev["t"], workers=self.workers, cpus=self.cpus, read_busy_s=sum(d(k) for k in READ_ACTIVITIES),
+                 wait_s=d("wait_for_reads"), ckpt_s=d("write_checkpoint"), cpu_s=cur["cpu"] - prev["cpu"], memwait_s=cur["memwait"] - prev["memwait"],
+                 files=cur["files"] - prev["files"], bytes=cur["bytes"] - prev["bytes"], budget_mb=self.budget_mb)
+        if m["files"] < min_files:
+            return None
+        label, text = classify_window(m)
+        self.seconds[label] = self.seconds.get(label, 0.0) + m["seconds"]
+        self.latest = text
+        self.live["limit"] = text
+        self.quiet += 1
+        if label != self.last or self.quiet >= 10:          # tell it when it changes, and now and then while it stays the same
+            self.rlog.event("speed", text)
+            self.last, self.quiet = label, 0
+        return label, text
+
+    def run(self):
+        while not self.stop_ev.wait(self.window):
+            try:
+                self.step()
+            except Exception:
+                pass
+
+    def stop(self):
+        self.stop_ev.set()
+
+    def summary(self):
+        """-> (main limit label or "", 'reads 61%; listing 22%; ...')"""
+        tot = sum(self.seconds.values())
+        if not tot:
+            return "", ""
+        parts = sorted(self.seconds.items(), key=lambda kv: -kv[1])
+        return parts[0][0], "; ".join(f"{k} {100 * v / tot:.0f}%" for k, v in parts)
+
+
 class Monitor(threading.Thread):
     """Samples the machine every `interval` seconds into Run_metrics.csv (appended; survives restarts)."""
     HEADER = ["timestamp_utc", "elapsed_s", "phase", "files_done", "bytes_done_GB", "files_per_s", "MB_per_s_processed",

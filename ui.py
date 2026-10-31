@@ -4,6 +4,7 @@ Starts a tiny web server on 127.0.0.1 (this computer only, never the network), o
 lets you pick a folder, shows live progress, and offers the metrics zip for download.
 All profiling is done by file_profiler.profile(); this file only adds the page around it.
 """
+import collections
 import json
 import os
 import re
@@ -23,6 +24,7 @@ TOKEN = os.urandom(16).hex()
 STATE = {"state": "idle", "log": [], "result": None, "error": None, "fail": None,
          "progress": {"phase": "", "files": 0, "total_files": 0, "bytes": 0, "total_bytes": 0}}
 LOCK = threading.Lock()
+HIST = collections.deque(maxlen=600)      # (time, files done) while profiling: the speed of the last minute or two gives the time left
 # Fusion 360 (Autodesk cloud) sign-in: lives in memory only, never written to disk
 FUSION = {"api": None, "hubs": [], "pending": None, "error": "", "client_id": ""}
 # frozen exe: HERE is a temp unpack dir, so put output next to the exe the client double-clicked
@@ -71,6 +73,9 @@ table.qt{border-collapse:collapse}table.qt td,table.qt th{border:1px solid #8884
 <button id="go" title="The complete profile (file details, references inside assemblies, drawing sheets). Takes much longer.">Step 2: full profile</button></div>
 <div class="mut" style="margin-top:6px">Step 1 only counts files per type and size (very fast; no file is opened). Step 2 is the complete profile.</div>
 <div class="bar" id="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100"><i id="barfill"></i></div><div class="mut" id="barlabel" style="margin-top:6px"></div>
+<div class="row" id="ctl" style="margin-top:8px;display:none"><button id="pause" title="Pauses at the end of the current batch of files; what is finished is saved. Nothing is lost.">Pause</button>
+<button id="stop" style="background:var(--er)" title="Stops after the current batch; what is finished is saved and the same button carries on from there.">Stop</button></div>
+<div class="mut" id="limit" style="margin-top:6px"></div>
 <pre id="log" class="mut" style="margin-top:10px"></pre><div id="res" style="margin-top:10px"></div></div>
 </div>
 <div id="tab_fusion" style="display:none">
@@ -86,7 +91,10 @@ Create an app once at <b>aps.autodesk.com/myapps</b> (type <i>Desktop, Mobile, S
 <div class="row" style="margin-top:8px"><select id="fhub"></select><button class="g" id="fout">Sign out</button></div>
 <div class="mut" style="margin-top:8px" id="fpl"></div><ul id="fproj"></ul></div>
 <div class="card" id="frun" style="display:none"><b>3. Run</b>
-<div class="row" style="margin-top:8px"><button id="fgo">Profile this hub</button></div>
+<div class="row" style="margin-top:8px"><button id="fquick" title="Counts the items of each file type and their size per project. No item or folder names are recorded.">Step 1: quick count</button>
+<button id="fgo" title="The complete profile: every item with its name, type, size, date and folder. Reuses Step 1's listing if it is less than a day old.">Step 2: full profile</button></div>
+<label style="display:block;margin-top:8px"><input type="checkbox" id="ffresh"> Start from scratch <span class="mut">(normally a stopped run carries on, and Step 2 reuses a Step 1 listing less than a day old; tick this to list the hub again)</span></label>
+<div class="mut" style="margin-top:6px">Both steps list the hub once; asking Autodesk is the slow part. Step 1 keeps the listing and writes counts only (no names); Step 2 then needs no new calls. If Autodesk limits the speed, the tool waits, slows down and carries on by itself; if it gives up, nothing is lost - run it again later.</div>
 <div class="mut" style="margin-top:6px">Every Fusion design is counted as a part (the cloud does not say part or assembly) and designs have no size in the cloud, so size totals are understated. The result is the same kind of zip as the Folders tab and goes into the same compile step.</div>
 <pre id="flog" class="mut" style="margin-top:10px"></pre><div id="fres" style="margin-top:10px"></div></div>
 </div>
@@ -112,7 +120,10 @@ $("addcur").onclick=()=>{if(cur&&!sel.includes(cur)){sel.push(cur);renderSel()}}
 $("up").onclick=()=>ls($("up").dataset.parent);$("p").onchange=()=>ls($("p").value);
 $("anonn").onchange=()=>{$("anonmap").disabled=!$("anonn").checked};
 $("go").onclick=()=>start("full");$("goquick").onclick=()=>start("quick");
-const busy=v=>{$("go").disabled=v;$("goquick").disabled=v};
+const busy=v=>{$("go").disabled=v;$("goquick").disabled=v;$("ctl").style.display=v?"":"none";if(!v){$("limit").textContent="";$("pause").textContent="Pause";$("pause").disabled=false;$("stop").disabled=false}};
+const ctl=a=>fetch("/api/control",{method:"POST",body:JSON.stringify({t:T,action:a})});
+$("pause").onclick=()=>ctl($("pause").textContent=="Pause"?"pause":"resume");$("stop").onclick=()=>{$("stop").disabled=true;ctl("stop")};
+const left=s=>s==null?"":s<90?" - about "+Math.round(s)+" s left":s<5400?" - about "+Math.round(s/60)+" min left":" - about "+(s/3600).toFixed(1)+" h left";
 async function start(kind){$("res").textContent="";$("bar").style.display="none";$("barlabel").textContent="";
  if(mode=="pick"&&!sel.length){$("res").innerHTML="<span class='er'>Tick at least one folder first.</span>";return}
  busy(true);
@@ -133,7 +144,11 @@ function bar(j){const p=j.progress,b=$("bar");
  $("barfill").style.width=pct+"%";b.setAttribute("aria-valuenow",Math.round(pct));
  $("barlabel").textContent=Math.round(pct)+"%  -  "+p.files.toLocaleString()+" of "+p.total_files.toLocaleString()+" files  ("+mb(p.bytes)+" of "+mb(p.total_bytes)+")"}
 async function poll(){const j=await (await fetch("/api/status?t="+T)).json();bar(j);$("log").textContent=j.log.join("\n");$("log").scrollTop=1e9;
- if(j.state=="running"){setTimeout(poll,700);return}busy(false);
+ if(j.state=="running"){$("pause").textContent=j.paused?"Resume":"Pause";$("pause").disabled=j.progress.phase!="process"&&!j.paused;
+  if(j.paused)$("barlabel").textContent="Paused - "+$("barlabel").textContent.replace(/ - about.*$/,"");else $("barlabel").textContent+=left(j.eta_s);
+  if(j.stopping)$("barlabel").textContent="Stopping after the current batch...";
+  $("limit").textContent=j.live&&j.live.limit&&!j.paused?j.live.limit:"";setTimeout(poll,700);return}busy(false);
+ if(j.state=="stopped"){$("bar").style.display="none";$("barlabel").textContent="";$("res").innerHTML="<span class='mut'>"+esc(j.message||"Stopped.")+"</span>";return}
  if(j.state=="done"&&j.result.quick){let t="<table class='qt'><tr><th>File type</th><th>Files</th><th>Size</th></tr>";
   j.result.top.forEach(x=>{t+="<tr><td>."+esc(x[0])+"</td><td>"+x[1].toLocaleString()+"</td><td>"+mb(x[2])+"</td></tr>"});t+="</table>";
   $("res").innerHTML="<span class='ok'>Step 1 done: "+j.result.files.toLocaleString()+" files, "+mb(j.result.total_bytes)+", "+j.result.types+" file types in "+j.result.projects+" folders ("+j.result.seconds+" s).</span><br><br>"+t+
@@ -167,14 +182,22 @@ async function fprojects(){const h=$("fhub").value;$("fproj").innerHTML="";if(!h
  j.projects.forEach(n=>{const li=document.createElement("li"),cb=document.createElement("input");cb.type="checkbox";cb.checked=true;cb.dataset.n=n;
   const sp=document.createElement("span");sp.className="n";sp.textContent=n;sp.onclick=()=>cb.click();li.appendChild(cb);li.appendChild(sp);$("fproj").appendChild(li)})}
 $("fout").onclick=async()=>{await fetch("/api/fusion/logout",{method:"POST",body:JSON.stringify({t:T})});$("fstat").textContent="Signed out.";fshow({signed_in:false,hubs:[]})};
-$("fgo").onclick=async()=>{const names=[...$("fproj").querySelectorAll("input")].filter(c=>c.checked).map(c=>c.dataset.n);
+const fbusy=v=>{$("fgo").disabled=v;$("fquick").disabled=v};
+async function fstart(step){const names=[...$("fproj").querySelectorAll("input")].filter(c=>c.checked).map(c=>c.dataset.n);
  if(!names.length){$("fres").innerHTML="<span class='er'>Tick at least one project.</span>";return}
- $("fres").textContent="";$("fgo").disabled=true;
+ $("fres").textContent="";fbusy(true);
  const hn=$("fhub").options[$("fhub").selectedIndex].textContent;
- const r=await fetch("/api/start",{method:"POST",body:JSON.stringify({t:T,kind:"fusion",hub:$("fhub").value,hub_name:hn,projects:names})});const j=await r.json();
- if(j.error){$("fres").innerHTML="<span class='er'>"+esc(j.error)+"</span>";$("fgo").disabled=false;return}fpoll()};
-async function fpoll(){const j=await (await fetch("/api/status?t="+T)).json();$("flog").textContent=j.log.join("\n");
- if(j.state=="running"){$("fres").innerHTML="<span class='mut'>Reading the hub...</span>";setTimeout(fpoll,1000);return}$("fgo").disabled=false;
+ const r=await fetch("/api/start",{method:"POST",body:JSON.stringify({t:T,kind:"fusion",hub:$("fhub").value,hub_name:hn,projects:names,step:step,fresh:$("ffresh").checked})});const j=await r.json();
+ if(j.error){$("fres").innerHTML="<span class='er'>"+esc(j.error)+"</span>";fbusy(false);return}fpoll()}
+$("fquick").onclick=()=>fstart(1);$("fgo").onclick=()=>fstart(2);
+async function fpoll(){const j=await (await fetch("/api/status?t="+T)).json();$("flog").textContent=j.log.join("\n");$("flog").scrollTop=1e9;
+ if(j.state=="running"){$("fres").innerHTML="<span class='mut'>Reading the hub...</span>";setTimeout(fpoll,1000);return}fbusy(false);
+ if(j.state=="stopped"){$("fres").innerHTML="<span class='mut'>"+esc(j.message||"Stopped.")+"</span>";return}
+ if(j.state=="done"&&j.result.quick){const r=j.result;let t="<table class='qt'><tr><th>File type</th><th>Items</th><th>Size</th></tr>";
+  r.top.forEach(x=>{t+="<tr><td>."+esc(x[0]||"(none)")+"</td><td>"+x[1].toLocaleString()+"</td><td>"+mb(x[2])+"</td></tr>"});t+="</table>";
+  $("fres").innerHTML="<span class='ok'>Step 1 done: "+r.files.toLocaleString()+" items, "+r.types+" file types in "+r.projects+" projects"+(r.errors?", "+r.errors+" folder(s) could not be read":"")+".</span><br><br>"+t+
+   (r.notes||[]).map(n=>"<div class='mut'>"+esc(n)+"</div>").join("")+"<br><a class='btn' href='/api/download?t="+T+"'>Download quick count zip</a> <span class='mut'>"+esc(r.name)+" (no item or folder names)</span><br><br><span class='mut'>Click <b>Step 2: full profile</b> when ready: it reuses this listing, so it needs no new calls to Autodesk.</span>"+
+   (r.stats_name?"<br><br><a class='btn' style='background:var(--ac)' href='/api/download_log?t="+T+"'>Download run statistics</a>":"");return}
  if(j.state=="done"){const r=j.result;$("fres").innerHTML="<span class='ok'>Done: "+r.projects+" projects, "+r.files.toLocaleString()+" items"+(r.errors?", "+r.errors+" folder(s) could not be read":"")+".</span><br>"+
   (r.notes||[]).map(n=>"<div class='mut'>"+esc(n)+"</div>").join("")+"<br><a class='btn' href='/api/download?t="+T+"'>Download profile zip</a> <span class='mut'>"+esc(r.name)+"</span>"+
   (r.stats_name?"<br><br><a class='btn' style='background:var(--ac)' href='/api/download_log?t="+T+"'>Download run statistics</a> <span class='mut'>the run diary (retries, folders that could not be read) - no file contents, no access token</span>":"")}
@@ -224,8 +247,8 @@ table{border-collapse:collapse;width:100%}td,th{border:1px solid var(--bd);paddi
 <li>Go back to the Folder Profiler page, tab <b>Fusion 360 (cloud)</b>.</li>
 <li>Paste the <b>Client ID</b> and click <b>Sign in with Autodesk</b>. A new browser tab opens at Autodesk.</li>
 <li>Sign in <b>as the hub member</b> (the account that can see the designs) and approve the request. It asks only for <code>data:read</code> - read access to data. When it says "Signed in", close that tab.</li>
-<li>Choose the <b>hub</b>, untick any <b>projects</b> you do not want, and click <b>Profile this hub</b>.</li>
-<li>When it finishes, click <b>Download profile zip</b>. Give that zip to the <i>profile-compile</i> skill like any other profile.</li>
+<li>Choose the <b>hub</b> and untick any <b>projects</b> you do not want. Click <b>Step 1: quick count</b> first: it counts the items of each file type per project and writes <b>no item or folder names</b>; use it to see how big each project is and to untick the huge ones.</li>
+<li>Click <b>Step 2: full profile</b>. It needs <b>no new calls to Autodesk</b> if Step 1 was run less than a day ago (the listing is kept and reused); otherwise it lists the hub itself. When it finishes, click <b>Download profile zip</b> and give that zip to the <i>profile-compile</i> skill like any other profile (the Step 1 zip works there too and gives the quick-count workbook).</li>
 </ol></div>
 
 <h2>What is read, and what is not</h2>
@@ -251,6 +274,7 @@ table{border-collapse:collapse;width:100%}td,th{border:1px solid var(--bd);paddi
 <tr><td>"did not accept the sign-in" or Autodesk shows an error about the callback / redirect</td><td>The callback URL registered for the app is not exactly the one in Part 1, step 6, or the Client ID is wrong. Edit the app at aps.autodesk.com/myapps and compare character by character. If the Folder Profiler was started while port 8765 was busy it uses another port: then the callback URL shown on the tab is the one to register, and it is shown there every time.</td></tr>
 <tr><td>Signed in, but "no hub can be read"</td><td>The signed-in account is not a member of the hub (sign in again with the right account), or the hub is an Autodesk Docs / BIM 360 / Forma hub, where the account administrator must first allow the app in the admin portal. Fusion Team hubs need only the member's approval.</td></tr>
 <tr><td>Some folders listed as unreadable / "no read permission"</td><td>That member cannot see those folders. Sign in as someone who can, or accept that they are missing; the count is shown in the result.</td></tr>
+<tr><td>"the listing is not finished" / the run stopped by itself</td><td>Autodesk limits how fast it answers. The tool already waits (all its requests pause together, then go on slower), but if Autodesk keeps refusing for about half an hour it stops <b>without losing anything</b>: every folder listed so far is saved. Wait 10-30 minutes and click the same button again: it lists only what is left. A newer version of the tool carries on from an older one's saved progress too. Tick <b>Start from scratch</b> only to ignore it. The result's Run_info.csv says how many answers were throttled and how much time that cost.</td></tr>
 <tr><td>"sign in again"</td><td>The sign-in expired (for example the computer slept for a long time). Click <b>Sign in with Autodesk</b> again; a finished run is not affected.</td></tr>
 <tr><td>Nothing happens after clicking Sign in</td><td>The browser blocked the new tab. Allow pop-ups for this page and click again.</td></tr></table>
 
@@ -314,6 +338,8 @@ def _run(path, folders=None, anon=False, tier=2, depth=1, fresh=False, quick=Fal
         with LOCK:
             STATE["progress"] = {"phase": phase, "files": files, "total_files": total_files,
                                  "bytes": done_bytes, "total_bytes": total_bytes}
+            if phase == "process":
+                HIST.append((time.time(), files))
     try:
         label = os.environ.get("PROFILER_FOLDER_NAME") if IN_DOCKER and path == DATA_ROOT else None
         if quick:
@@ -334,6 +360,11 @@ def _run(path, folders=None, anon=False, tier=2, depth=1, fresh=False, quick=Fal
             STATE.update(state="done", result={"path": zip_path, "name": os.path.basename(zip_path), "stats_path": sz,
                                                "stats_name": os.path.basename(sz), "projects": nproj, "files": nfiles, "errors": errors,
                                                "map_path": fp.LAST_RUN.get("map_zip", ""), "map_name": os.path.basename(fp.LAST_RUN.get("map_zip", ""))})
+    except fp.RunStopped:
+        with LOCK:
+            STATE.update(state="stopped", error=None, result=None,
+                         message=("Stopped. Nothing from the count was kept; start again whenever you like." if quick else
+                                  "Stopped. Everything finished so far is saved: click Step 2 again (same settings) and it continues where it stopped."))
     except SystemExit as e:
         _fail(str(e), path, str(e), dict(mode="quick count" if quick else "full profile", depth=depth, tier=tier, fresh=fresh, anonymize_names=anon_names), anon_names)
     except Exception:
@@ -344,22 +375,29 @@ def _run(path, folders=None, anon=False, tier=2, depth=1, fresh=False, quick=Fal
               dict(mode="quick count" if quick else "full profile", depth=depth, tier=tier, fresh=fresh, anonymize_names=anon_names), anon_names)
 
 
-def _run_fusion(hub_id, hub_name, names):
+def _run_fusion(hub_id, hub_name, names, step=2, fresh=False):
     def log(msg):
         with LOCK:
             STATE["log"].append(_stamp() + "  " + msg.rstrip())
     try:
         api = FUSION["api"]
-        path, n, nproj, stats = fcp.run(api, hub_id, hub_name, OUT_DIR, only=names or None, log=log)
+        path, n, nproj, stats = fcp.run(api, hub_id, hub_name, OUT_DIR, only=names or None, log=log, step=step, fresh=fresh)
         notes = []
         if stats["unknown_types"]:
             notes.append(f"{sum(stats['unknown_types'].values())} item(s) of unknown type are listed in Unknown_Item_Types.csv inside the zip.")
         if stats["size_unknown"]:
             notes.append(f"{stats['size_unknown']} item(s) have no size in the cloud (counted as 0 bytes).")
+        if stats.get("reused"):
+            notes.append("The listing from the earlier step was reused: no new calls to Autodesk were needed.")
+        res = {"path": path, "name": os.path.basename(path), "stats_path": stats.get("stats_zip", ""), "stats_name": os.path.basename(stats.get("stats_zip", "")),
+               "projects": nproj, "files": n, "errors": len(stats["unreadable"]), "notes": notes}
+        if step == 1:
+            res.update(quick=True, top=stats.get("top", []), total_bytes=stats.get("total_bytes", 0), types=stats.get("distinct_extensions", 0))
         with LOCK:
-            STATE.update(state="done", result={"path": path, "name": os.path.basename(path),
-                                               "stats_path": stats.get("stats_zip", ""), "stats_name": os.path.basename(stats.get("stats_zip", "")),
-                                               "projects": nproj, "files": n, "errors": len(stats["unreadable"]), "notes": notes})
+            STATE.update(state="done", result=res)
+    except fcp.Incomplete as e:                          # the listing is not finished; everything listed is saved. Not a failure of the tool.
+        with LOCK:
+            STATE.update(state="stopped", error=None, result=None, message=str(e))
     except (fcp.ApiError, SystemExit) as e:
         _fail(str(e), "", str(e), {"mode": "fusion cloud", "projects_selected": len(names)}, False)
     except Exception:
@@ -460,7 +498,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"path": p, "parent": p if IN_DOCKER and os.path.realpath(p) == DATA_ROOT else os.path.dirname(p), "dirs": dirs, "sep": os.sep})
         if u.path == "/api/status":
             with LOCK:
-                return self._json(STATE)
+                out = dict(STATE)
+                out["live"] = dict(fp.LIVE)
+                out["stopping"] = fp.CONTROL.stop
+                out["paused"] = fp.CONTROL.pause and STATE["state"] == "running"
+                out["eta_s"] = self._eta() if STATE["state"] == "running" and not out["paused"] else None
+                return self._json(out)
         if u.path in ("/api/download", "/api/download_log", "/api/download_map", "/api/download_fail"):
             with LOCK:
                 res = STATE.get("fail") if u.path.endswith("_fail") else STATE.get("result")
@@ -503,8 +546,23 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, "<!doctype html><meta charset=utf-8><title>Autodesk sign-in</title><body style='font:16px system-ui;margin:40px'><p>"
                    + msg.replace("&", "&amp;").replace("<", "&lt;") + "</p>", "text/html; charset=utf-8")
 
+    @staticmethod
+    def _eta():
+        """Seconds left, from the speed of the last 90 seconds of profiling (None until there is enough to go on)."""
+        p = STATE["progress"]
+        if p["phase"] != "process" or not p["total_files"]:
+            return None
+        now = time.time()
+        pts = [h for h in HIST if now - h[0] <= 90]
+        if len(pts) < 2:
+            return None
+        dt, df = pts[-1][0] - pts[0][0], pts[-1][1] - pts[0][1]
+        if dt < 5 or df <= 0:
+            return None
+        return max(0.0, (p["total_files"] - p["files"]) / (df / dt))
+
     def do_POST(self):
-        if not self._host_ok() or self.path not in ("/api/start", "/api/fusion/logout"):
+        if not self._host_ok() or self.path not in ("/api/start", "/api/fusion/logout", "/api/control"):
             return self._send(403, "forbidden", "text/plain")
         try:
             body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
@@ -512,6 +570,22 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"error": "bad request"}, 400)
         if body.get("t") != TOKEN:
             return self._send(403, "forbidden", "text/plain")
+        if self.path == "/api/control":
+            act = body.get("action")
+            with LOCK:
+                if STATE["state"] != "running":
+                    return self._json({"error": "No run is in progress"})
+                if act == "stop":
+                    fp.CONTROL.stop = True
+                elif act == "pause":
+                    fp.CONTROL.pause = True
+                    HIST.clear()
+                elif act == "resume":
+                    fp.CONTROL.pause = False
+                    HIST.clear()
+                else:
+                    return self._json({"error": "unknown action"}, 400)
+            return self._json({"ok": True})
         if self.path == "/api/fusion/logout":
             with LOCK:
                 FUSION.update(api=None, hubs=[], pending=None, error="")
@@ -524,9 +598,9 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK:
                 if STATE["state"] == "running":
                     return self._json({"error": "A run is already in progress"})
-                STATE.update(state="running", log=[], result=None, error=None, fail=None,
+                fp.CONTROL.reset(); HIST.clear(); fp.LIVE.clear(); STATE.update(state="running", log=[], result=None, error=None, fail=None,
                              progress={"phase": "scan", "files": 0, "total_files": 0, "bytes": 0, "total_bytes": 0})
-            threading.Thread(target=_guarded, args=(_run_fusion, hub, str(body.get("hub_name") or "hub"), names), daemon=True).start()
+            threading.Thread(target=_guarded, args=(_run_fusion, hub, str(body.get("hub_name") or "hub"), names, 1 if body.get("step") == 1 else 2, bool(body.get("fresh"))), daemon=True).start()
             return self._json({"ok": True})
         folders = [str(p).strip().strip('"') for p in body.get("paths") or []]
         path = (body.get("path") or "").strip().strip('"')
@@ -544,7 +618,7 @@ class Handler(BaseHTTPRequestHandler):
         with LOCK:
             if STATE["state"] == "running":
                 return self._json({"error": "A run is already in progress"})
-            STATE.update(state="running", log=[], result=None, error=None, fail=None,
+            fp.CONTROL.reset(); HIST.clear(); fp.LIVE.clear(); STATE.update(state="running", log=[], result=None, error=None, fail=None,
                          progress={"phase": "scan", "files": 0, "total_files": 0, "bytes": 0, "total_bytes": 0})
         threading.Thread(target=_guarded, args=(_run, path, folders or None, bool(body.get("anon")), 2, 1,
                                                           bool(body.get("fresh")), body.get("kind") == "quick", bool(body.get("anon_names")), body.get("anon_map", True) is not False, body.get("list_paths", True) is not False), daemon=True).start()

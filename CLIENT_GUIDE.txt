@@ -22,6 +22,17 @@ settings and the same folder: it continues from the last saved point, not from t
 thousand files in the "output" folder (a hidden ".resume" folder) and removed when the run finishes. To ignore it and start over,
 tick "Start from scratch" on the page (or use --fresh). If files were added, removed or replaced in between, the tool notices (it compares what it saved
 with what is on the disk), profiles the affected part again and says so in the log.
+A NEWER VERSION OF THE TOOL CARRIES ON TOO: if you download a new version while a run is unfinished, start it with the same folder and
+settings and it continues from where the older version stopped - nothing already read is read again. Run_info.csv in the result names every
+version that worked on the run and how many projects each profiled. (Only if a version changes how saved progress is stored does it say so and start over.)
+
+WHILE IT RUNS
+On the page, Pause and Stop buttons appear under the progress bar, with the time left. Pause waits at the end of the current batch of files and
+Resume continues; Stop ends the run and keeps everything finished (click Step 2 again with the same settings to carry on). Stop also works while
+files are being counted, but that count is then thrown away. The tool keeps the computer from going to sleep while it works. The page also says
+what is limiting the speed - the disk or network reading files, the listing of folders, the processor, memory or saving progress - and the
+same lines are in Run_log.csv. When it finishes, Reconciliation.csv and the line 'reconciliation' in Run_info.csv compare the profile with the
+count made before profiling started (files and bytes per project): OK, or exactly what differs.
 
 RUN STATISTICS (safe to share)
 Every run also produces run_stats_...zip (and a "Download run statistics" button on the page). It contains the time each step took,
@@ -45,6 +56,13 @@ in the page (command line: --no-paths); to hide the names but keep the lists, ti
 Step 2 - FULL PROFILE (the complete run, much longer): everything described in "WHAT IT RECORDS" above.
 In the browser page there is one button for each step. Run step 1 first if you want a fast overview, or send both zips.
 (Command line: add --quick for step 1; without it you get step 2.)
+
+FUSION 360 (AUTODESK CLOUD): STEPS, RESUME AND RATE LIMITS
+The Fusion 360 tab works in the same two steps as folders. Step 1 (quick count) lists the hub and counts items and bytes per project and file type, with no
+item or folder names; Step 2 (full profile) writes every item. Both use ONE listing: Step 1 keeps it, so Step 2 within a day needs no new calls to Autodesk.
+If the run stops, the computer restarts, or Autodesk limits the speed for too long, everything listed so far is saved: click the same button again and it
+lists only what is left (a newer version of the tool carries on from an older one's progress too). The tool is gentle by itself: when Autodesk says
+'slow down' all its requests pause together and then continue slower. Run_info.csv reports how often that happened and what it cost.
 
 IF SOMETHING GOES WRONG
 Problems are written down instead of ignored. Inside the zip: Unreadable.csv (folders / files the tool was not allowed to read, with the reason),

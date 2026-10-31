@@ -77,7 +77,7 @@ with tempfile.TemporaryDirectory() as out:
     check("zip has Files.csv with f3d rows", z.read("Files.csv").decode("utf-8-sig").count(",f3d,"), 2)
     post("/api/fusion/logout", {"t": T})
     check("sign-out clears the sign-in", api(f"/api/fusion/status?t={T}")["signed_in"], False)
-    check("the access token is nowhere on disk in the output folder", all(b"TOKEN" not in open(os.path.join(out, f), "rb").read() for f in os.listdir(out)), True)
+    check("the access token is nowhere on disk in the output folder (every file, including any saved progress)", all(b"TOKEN" not in open(os.path.join(d, f), "rb").read() for d, _s, fs in os.walk(out) for f in fs), True)
     srv.shutdown()
 fake.shutdown()
 sys.exit(1 if any(bad) else 0)
