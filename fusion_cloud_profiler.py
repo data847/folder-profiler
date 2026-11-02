@@ -41,7 +41,7 @@ import argparse, base64, csv, datetime, email.utils, hashlib, http.server, io, j
 import urllib.parse, urllib.request, webbrowser, zipfile
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "1.1"
+VERSION = "1.2"
 API = os.environ.get("FUSION_API_BASE") or "https://developer.api.autodesk.com"   # the override exists for the tests only
 SCOPE = "data:read"
 REDIRECT_PORT = 8765
@@ -414,17 +414,77 @@ def sign_in(client_id, base=API):
         def log_message(self, *a):
             pass
 
-    srv = http.server.HTTPServer(("127.0.0.1", REDIRECT_PORT), H)
+    if not loopback_free(REDIRECT_PORT):
+        raise SystemExit(f"Port {REDIRECT_PORT} is used by another program on this computer (for example a Docker container or another tool). Autodesk sends the "
+                         f"browser back to http://localhost:{REDIRECT_PORT}/callback after you approve; that program would answer instead of this one (a '404' page). "
+                         f"Stop it and run again (docker ps shows containers using port {REDIRECT_PORT}), or use the Folder Profiler page instead, which picks a free port.")
+    done = threading.Event()
+
+    class Once(H):
+        def do_GET(self):
+            super().do_GET()
+            done.set()
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", REDIRECT_PORT), Once)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    v6 = serve_ipv6_too(Once, REDIRECT_PORT)                  # `localhost` may mean ::1: answer there too
     print("Opening the browser to sign in to Autodesk (read-only access: data:read). If it does not open, copy this address:\n  " + url)
     webbrowser.open(url)
-    srv.timeout = 300
-    srv.handle_request()
-    srv.server_close()
+    done.wait(300)
+    for sv in (srv, v6):
+        if sv is not None:
+            sv.shutdown(); sv.server_close()
     if got.get("error") or not got.get("code") or got.get("state") != state:
         raise SystemExit("Sign-in did not complete" + (f" ({got['error']}" + (f": {got['why'][:200]}" if got.get("why") else "") + ")" if got.get("error")
                                                         else " (no answer from Autodesk within 5 minutes, or the sign-in page was closed)" if not got.get("code")
                                                         else " (the answer did not match this sign-in; close old Autodesk tabs and try once)") + ".")
     return auth_finish(client_id, redirect, got["code"], verifier, base)
+
+
+def loopback_free(port):
+    """True if `port` can be taken on BOTH loopback addresses: 127.0.0.1 and, where this computer has it, ::1. `localhost` resolves to ::1 first on many
+    computers, so a program (a Docker container, another tool) holding the port on IPv6 alone would receive Autodesk's redirect and answer 404 - while this
+    program, listening on IPv4 only, never saw it."""
+    import socket
+    for fam, addr in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
+        if fam == socket.AF_INET6 and not socket.has_ipv6:
+            continue
+        try:
+            sk = socket.socket(fam, socket.SOCK_STREAM)
+        except OSError:
+            continue                                   # no IPv6 at all on this computer
+        try:
+            if fam == socket.AF_INET6:
+                sk.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            sk.bind((addr, port))
+        except OSError as e:
+            if fam == socket.AF_INET6 and getattr(e, "errno", None) in (getattr(__import__("errno"), n, -1) for n in ("EADDRNOTAVAIL", "EAFNOSUPPORT", "EPROTONOSUPPORT")):
+                continue                               # IPv6 loopback not configured here: only IPv4 matters
+            return False
+        finally:
+            sk.close()
+    return True
+
+
+class _V6Server(http.server.ThreadingHTTPServer):
+    address_family = __import__("socket").AF_INET6
+
+    def server_bind(self):
+        import socket
+        self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)        # ::1 only: the IPv4 server keeps 127.0.0.1
+        super().server_bind()
+
+
+def serve_ipv6_too(handler, port):
+    """Answer on ::1:`port` as well as on 127.0.0.1, so a browser that resolves `localhost` to IPv6 first still reaches this program. -> the server or None."""
+    import socket
+    if not socket.has_ipv6:
+        return None
+    try:
+        v6 = _V6Server(("::1", port), handler)
+    except OSError:
+        return None
+    threading.Thread(target=v6.serve_forever, daemon=True).start()
+    return v6
 
 
 def hubs(api):

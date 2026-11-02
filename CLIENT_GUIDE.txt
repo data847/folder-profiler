@@ -63,6 +63,9 @@ item or folder names; Step 2 (full profile) writes every item. Both use ONE list
 If the run stops, the computer restarts, or Autodesk limits the speed for too long, everything listed so far is saved: click the same button again and it
 lists only what is left (a newer version of the tool carries on from an older one's progress too). The tool is gentle by itself: when Autodesk says
 'slow down' all its requests pause together and then continue slower. Run_info.csv reports how often that happened and what it cost.
+Sign-in: Autodesk sends the browser back to http://localhost:PORT/callback after you approve. The page uses port 8765 only if no other program holds it
+(on IPv4 or IPv6); otherwise it takes the next free port (8766, 8767 ...) and shows the callback URL to register in your Autodesk app on the Fusion tab. If
+you see a 404 page after approving, another program (often a Docker container) is answering on that port: see the Fusion help page, 'Troubleshooting'.
 
 IF SOMETHING GOES WRONG
 Problems are written down instead of ignored. Inside the zip: Unreadable.csv (folders / files the tool was not allowed to read, with the reason),
@@ -183,8 +186,14 @@ OPTIONAL - HIDE NAMES IN THE RESULT
 Tick "Anonymise file and folder names in the result" before Step 1 or Step 2 if the names of your
 projects, folders and files must not leave your computer.
 - Only the RESULT is changed. Your files and folders are never renamed or touched.
-- Project, folder and file names in the result become codes (for example P-a1b2-0003).
-  File types (.dwg, .pdf ...) are kept. The same name always gets the same code.
+- Project, folder and file names in the result become codes (for example P-a1b2-3f9c0e).
+  File types (.dwg, .pdf ...) are kept. The same name always gets the same code - in Step 1 and
+  in Step 2, and in every later run on this computer - so the two results line up by code.
+  The codes come from a secret key made the first time you tick the option and kept on this computer
+  (folder ".folder-profiler" in your user folder; in Docker the output folder, file ".name_key").
+  Never send that file. If you delete it, the next run starts new, unrelated codes. The name map
+  zip holds a copy (Name_Key.txt) in case you move to another computer. Run_info.csv has a line
+  "name_codes" that says whether this run's codes are kept ("same on every run") or only for this run.
 - Leave "Also give me the name map" ticked: a second file, "name_map_....zip", is made, with its own
   download button. It lists each real name and its code, so the codes can be turned back into the
   real names. KEEP IT PRIVATE. Send us only the profile zip, never the name map.

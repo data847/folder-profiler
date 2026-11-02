@@ -1,4 +1,5 @@
 """The UI's anonymise box: it reaches both steps, and the map is downloadable separately from the profile."""
+import os as _os, tempfile as _tf; _os.environ["PROFILER_NAME_KEY_FILE"] = _os.path.join(_tf.mkdtemp(), "name_key")   # tests never touch the real key in ~/.folder-profiler
 import io, json, os, sys, tempfile, threading, time, urllib.request, zipfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__))); sys.path.insert(0, ROOT)
 import ui

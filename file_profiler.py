@@ -77,7 +77,7 @@ import sysmetrics
 import diag
 from sysmetrics import now_utc
 
-VERSION = "1.8"
+VERSION = "1.9"
 STATE_FORMAT = 1             # layout of the saved progress (.resume): raise it ONLY when saved rows / fingerprints change meaning. A new VERSION of the
                              # tool carries on from the saved progress of an older one as long as this number and the run's settings are the same.
 try:
@@ -1047,15 +1047,24 @@ def unreadable_csv(units, rows, with_paths=True, files_with_paths=True):
     return out
 
 
-def _name_map(flag):
-    """A NameMap when name anonymisation is asked for (argument, else env PROFILER_ANON_NAMES), else None."""
+def name_codes(nm):
+    """Run_info value: are this run's codes the same as every other run's on this computer?"""
+    if not nm:
+        return "n/a"
+    return "same on every run (kept key)" if nm.stable else "new for this run only (no place to keep a key)"
+
+
+def _name_map(flag, out_dir=None):
+    """A NameMap when name anonymisation is asked for (argument, else env PROFILER_ANON_NAMES), else None. Its codes come from a secret key kept on this
+    computer, so every run (step 1, step 2, tomorrow's) gives the same name the same code; with no place to keep a key they are per-run (see name_anon)."""
     if flag is None:
         flag = os.environ.get("PROFILER_ANON_NAMES", "").lower() in ("1", "true", "yes")
     if not flag:
         return None
     if name_anon is None:
         raise SystemExit("name anonymisation needs name_anon.py next to file_profiler.py")
-    return name_anon.NameMap()
+    key, where = name_anon.load_key(out_dir)
+    return name_anon.NameMap(key=key, key_path=where)
 
 
 def _safe_member(ext, used):
@@ -1142,7 +1151,7 @@ def quick_scan(root, out_dir, log=print, label=None, folders=None, workers=None,
         w.writerow(header)
         w.writerows(rows)
         return ("\ufeff" + buf.getvalue()).encode("utf-8")
-    nm = _name_map(anonymize_names)
+    nm = _name_map(anonymize_names, out_dir)
     pname = (lambda n: nm.project(n)) if nm else (lambda n: n)
     ext_rows = [[units[ui][0], ext, n, b, b // max(1, n)] for (ui, ext), (n, b) in sorted(ext_stats.items(), key=lambda kv: (units[kv[0][0]][0].lower(), -kv[1][0]))]
     all_rows = [[ext, n, b, f"{100 * n / max(1, nfiles):.2f}", f"{100 * b / max(1, nbytes):.2f}"] for ext, (n, b) in sorted(overall.items(), key=lambda kv: -kv[1][0])]
@@ -1162,14 +1171,14 @@ def quick_scan(root, out_dir, log=print, label=None, folders=None, workers=None,
             ["cloud_tiered_files", total["tiered_files"]], ["deduplicated_files", total["dedup_files"]], ["network_retries", total["retries"]],
             ["unreadable_not_listed_cap", total["unreadable_not_listed"]], ["setup_warnings", len(setup_warnings)],
             ["threads", nthreads], ["usable_cpus", _usable_cpus()], ["seconds", round(secs, 1)], ["files_per_s", round(nfiles / max(secs, 0.01))],
-            ["files_opened", 0], ["hashing", "none"], ["names_anonymized", "yes" if nm else "no"],
+            ["files_opened", 0], ["hashing", "none"], ["names_anonymized", "yes" if nm else "no"], ["name_codes", name_codes(nm)],
             ["file_paths_listed", "yes" if want_paths else "no"], ["file_paths_not_kept_over_limit", total["paths_dropped"] if want_paths else 0]]
     what = ("This archive was made by the Folder Profiler QUICK COUNT (step 1).\r\n"
             "It lists, per project folder and overall, how many files of each type there are and how big they are. No file was opened,\r\n"
             "no archive was looked into, and no file names are recorded unless a Paths folder is present - only the project (folder) names, the file types, and the names of\r\n"
             "any folders that could not be read (Unreadable.csv).\r\n"
             "Extensions.csv (per project), Extensions_All.csv (whole folder), Projects.csv, Unreadable.csv, Run_info.csv. Open them with Excel or Notepad.\r\n"
-            + ("Names are ANONYMISED: project and folder names are codes (P-xxxx-nnnn, D-xxxx-nnnnnn). The owner keeps the name map separately.\r\n" if nm else ""))
+            + ("Names are ANONYMISED: project and folder names are codes (P-xxxx-hhhhhh, D-xxxx-hhhhhhhh). The owner keeps the name map separately. A name has the same code in Step 1 and Step 2 (see Run_info name_codes).\r\n" if nm else ""))
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr("Extensions.csv", csv_bytes(["project", "ext", "file_count", "total_bytes", "avg_bytes"], ext_rows))
         z.writestr("Extensions_All.csv", csv_bytes(["ext", "file_count", "total_bytes", "share_of_files_pct", "share_of_bytes_pct"], all_rows))
@@ -1258,7 +1267,7 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
     if tier == 2 and cad_links is None:
         raise SystemExit("detail level 2 needs cad_links.py next to file_profiler.py")
     project_depth = max(1, env_int("PROFILER_PROJECT_DEPTH", 1) if project_depth is None else int(project_depth))
-    nm = _name_map(anonymize_names)
+    nm = _name_map(anonymize_names, out_dir)
     if tier >= 1 or nm:                     # with name anonymisation the assembly names follow the same map as every other name
         anonymize_assembly_names = False
     if anonymize_assembly_names is None:
@@ -2004,7 +2013,7 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
                 ["folder_name", nm.root(label) if nm else label], ["mode", "docker" if os.environ.get("PROFILER_IN_DOCKER") else "native"],
                 ["projects", len(units)], ["workers", workers], ["files", nfiles_out], ["total_bytes", bytes_out],
                 ["hashing", "none"], ["assembly_names", "anonymized" if (anonymize_assembly_names or nm) else "real"],
-                ["names_anonymized", "yes" if nm else "no"],
+                ["names_anonymized", "yes" if nm else "no"], ["name_codes", name_codes(nm)],
                 ["detail_level", tier], ["project_depth", project_depth],
                 ["header_reads_skipped", C["head_skipped"]], ["header_reads_sampled", C["head_sampled"]],
                 ["types_with_cad_content_read_in_full", len(hit_types)], ["files_read_after_a_cad_hit", sum(hit_read.values())], ["memory_budget_MB", gate.budget >> 20], ["reads_that_waited_for_memory", gate.waits], ["dwg_sheets_reused_from_identical_copies", C["sheets_reused"]], ["link_files_read", C["link_read"]],
@@ -2088,7 +2097,7 @@ def what_is(tier, anonymized, names_anon=False):
                 "(tiered / online-only) are listed but never opened.\r\n")
     if names_anon:
         body += ("NAMES ARE ANONYMISED: project, folder and file names (and the file names referenced in Links.csv) are replaced by codes - "
-                 "P-xxxx-nnnn, D-xxxx-nnnnnn, F-xxxx-nnnnnn - with the file extension kept. The same name always has the same code, so the structure is intact. "
+                 "P-xxxx-hhhhhh, D-xxxx-hhhhhhhh, F-xxxx-hhhhhhhhhh - with the file extension kept. The same name always has the same code, so the structure is intact. "
                  "The table of codes and real names is NOT in this zip; the data owner keeps it.\r\n")
     return head + body + ("Read_Problems.csv (only when needed) lists files that could not be fully read - file number, type, step and the reason (an error type,\r\n"
                           "never file text). Setup_Warnings.csv (only when needed) lists folders that could not be listed when the projects were chosen.\r\n"

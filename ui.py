@@ -21,6 +21,7 @@ sys.path.insert(0, HERE)  # the bundled embeddable Python runs isolated and does
 import file_profiler as fp  # noqa: E402
 import fusion_cloud_profiler as fcp  # noqa: E402
 TOKEN = os.urandom(16).hex()
+SERVER_ID = os.urandom(8).hex()           # lets the page's sign-in check that `localhost` really reaches THIS program (see check_localhost)
 STATE = {"state": "idle", "log": [], "result": None, "error": None, "fail": None,
          "progress": {"phase": "", "files": 0, "total_files": 0, "bytes": 0, "total_bytes": 0}}
 LOCK = threading.Lock()
@@ -65,7 +66,7 @@ table.qt{border-collapse:collapse}table.qt td,table.qt th{border:1px solid #8884
 <ul id="ls"></ul>
 <div id="selbox" style="display:none;margin-top:12px"><span class="mut" id="selcount"></span><ul id="sel" style="max-height:150px"></ul></div></div>
 <div class="card"><b>3. Run</b>
-<label style="display:block;margin-top:8px"><input type="checkbox" id="anonn"> Anonymise file and folder names in the result <span class="mut">(optional; applies to Step 1 and Step 2. Only the result is renamed, never your files. You also get a separate name map to keep private; extra time is negligible)</span></label>
+<label style="display:block;margin-top:8px"><input type="checkbox" id="anonn"> Anonymise file and folder names in the result <span class="mut">(optional; applies to Step 1 and Step 2. Only the result is renamed, never your files. The same name gets the same code in Step 1, Step 2 and every later run on this computer. You also get a separate name map to keep private; extra time is negligible)</span></label>
 <label style="display:block;margin:6px 0 0 24px"><input type="checkbox" id="anonmap" checked disabled> Also give me the name map <span class="mut">(a separate file, real name &rarr; anonymised name, with its own download button. Keep it private.)</span></label>
 <label style="display:block;margin-top:8px"><input type="checkbox" id="listpaths" checked> Step 1: also list every file's path, size and date by file type <span class="mut">(adds a few seconds on a fast disk, nothing noticeable on a slow disk or file server; the zip grows by about 11 bytes per file. Uncheck to keep file names out of the Step 1 result.)</span></label>
 <label style="display:block;margin-top:8px"><input type="checkbox" id="fresh"> Start from scratch <span class="mut">(normally a stopped run continues where it stopped; tick this to ignore saved progress)</span></label>
@@ -274,6 +275,7 @@ table{border-collapse:collapse;width:100%}td,th{border:1px solid var(--bd);paddi
 <tr><td>"did not accept the sign-in" or Autodesk shows an error about the callback / redirect</td><td>The callback URL registered for the app is not exactly the one in Part 1, step 6, or the Client ID is wrong. Edit the app at aps.autodesk.com/myapps and compare character by character. If the Folder Profiler was started while port 8765 was busy it uses another port: then the callback URL shown on the tab is the one to register, and it is shown there every time.</td></tr>
 <tr><td>Signed in, but "no hub can be read"</td><td>The signed-in account is not a member of the hub (sign in again with the right account), or the hub is an Autodesk Docs / BIM 360 / Forma hub, where the account administrator must first allow the app in the admin portal. Fusion Team hubs need only the member's approval.</td></tr>
 <tr><td>Some folders listed as unreadable / "no read permission"</td><td>That member cannot see those folders. Sign in as someone who can, or accept that they are missing; the count is shown in the result.</td></tr>
+<tr><td>A <b>404</b> page after you approve on Autodesk's page (cancelling looked fine)</td><td>After you approve, Autodesk sends the browser to <code>http://localhost:PORT/callback</code>. On many computers <code>localhost</code> means the IPv6 address first, and <b>another program</b> (typically a Docker container) can be using the same port number there, so the browser reaches <i>it</i>, not the Folder Profiler. The Folder Profiler now notices: it only takes port 8765 when that port is free on IPv4 and IPv6, otherwise it takes the next free one (8766, 8767 ...) and the <b>callback URL shown on this tab</b> is the one to register in your Autodesk app (edit the app at aps.autodesk.com/myapps). It also checks, when you click Sign in, that <code>localhost</code> really leads back to itself, and says so if not (stop the other program: <code>docker ps</code> shows containers on the port).</td></tr>
 <tr><td>"the listing is not finished" / the run stopped by itself</td><td>Autodesk limits how fast it answers. The tool already waits (all its requests pause together, then go on slower), but if Autodesk keeps refusing for about half an hour it stops <b>without losing anything</b>: every folder listed so far is saved. Wait 10-30 minutes and click the same button again: it lists only what is left. A newer version of the tool carries on from an older one's saved progress too. Tick <b>Start from scratch</b> only to ignore it. The result's Run_info.csv says how many answers were throttled and how much time that cost.</td></tr>
 <tr><td>"sign in again"</td><td>The sign-in expired (for example the computer slept for a long time). Click <b>Sign in with Autodesk</b> again; a finished run is not affected.</td></tr>
 <tr><td>Nothing happens after clicking Sign in</td><td>The browser blocked the new tab. Allow pop-ups for this page and click again.</td></tr></table>
@@ -328,6 +330,61 @@ def _fail(message, scanned, problem, context, redact):
 
 def _stamp():
     return time.strftime("%H:%M:%SZ", time.gmtime())
+
+
+def check_localhost(port, fetch=None):
+    """Does http://localhost:<port>/ - the address Autodesk redirects the browser to after sign-in - reach THIS program? -> "" if so, else a plain message.
+    `localhost` can mean ::1 (IPv6) first; if another program (a Docker container, another tool) holds the port there, the approved sign-in lands on it and
+    the browser shows a 404 while this program never hears of it."""
+    import urllib.error
+    import urllib.request
+    fetch = fetch or (lambda u: urllib.request.urlopen(u, timeout=3).read().decode("utf-8", "replace"))
+    try:
+        got = json.loads(fetch(f"http://localhost:{port}/api/ping"))
+        if got.get("id") == SERVER_ID:
+            return ""
+        what = "a different Folder Profiler"
+    except urllib.error.HTTPError as e:
+        what = f"a program that does not know this page (it answered {e.code})"
+    except Exception as e:
+        what = "nothing" if isinstance(e, (urllib.error.URLError, OSError)) else "a program that does not answer like this one"
+    return (f"The browser would not reach this program at http://localhost:{port}/ - it reaches {what}. Autodesk sends you back to exactly that address after you "
+            f"approve, so the sign-in would end on a '404' page. Another program is probably using port {port} (for example a Docker container: run docker ps). "
+            f"Stop it and restart this page, or restart this page so it picks a free port, and register the callback URL shown on this tab.")
+
+
+def choose_server(host, want, handler, explicit=False):
+    """The HTTP server on the preferred port when that port is free on every loopback address, else on a free one. -> (server, why_not_preferred)."""
+    from http.server import ThreadingHTTPServer as TS
+    local = host in ("127.0.0.1", "localhost")
+    if want and (not local or fcp.loopback_free(want)):
+        try:
+            return TS((host, want), handler), ""
+        except OSError as exc:
+            if explicit:
+                raise
+            why = exc.strerror or type(exc).__name__
+    elif explicit:
+        raise OSError(f"port {want} is also in use on another loopback address (IPv6)")
+    else:
+        why = "another program uses it on the IPv6 loopback address (where 'localhost' can point)"
+    for port in range(want + 1, want + 21):               # the NEXT ports in order (8766, 8767 ...), not a random one: the callback URL registered at Autodesk
+        if local and not fcp.loopback_free(port):         # then stays the same from one start to the next
+            continue
+        try:
+            return TS((host, port), handler), why
+        except OSError:
+            continue
+    for _ in range(25):                                   # none of those: any port that is free on every loopback address
+        probe = TS((host, 0), handler)
+        port = probe.server_address[1]
+        probe.server_close()
+        if not local or fcp.loopback_free(port):
+            try:
+                return TS((host, port), handler), why
+            except OSError:
+                continue
+    return TS((host, 0), handler), why
 
 
 def _run(path, folders=None, anon=False, tier=2, depth=1, fresh=False, quick=False, anon_names=False, anon_map=True, list_paths=True):
@@ -447,7 +504,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _host_ok(self):  # blocks DNS-rebinding: only our own loopback name is accepted
-        return re.fullmatch(r"(127\.0\.0\.1|localhost)(:\d+)?", self.headers.get("Host", "")) is not None
+        return re.fullmatch(r"(127\.0\.0\.1|localhost|\[::1\])(:\d+)?", self.headers.get("Host", "")) is not None
 
     def _json(self, obj, code=200):
         self._send(code, json.dumps(obj))
@@ -461,6 +518,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, PAGE.replace("__TOKEN__", TOKEN), "text/html; charset=utf-8")
         if u.path == "/help/fusion":
             return self._send(200, HELP_FUSION, "text/html; charset=utf-8")
+        if u.path == "/api/ping":           # no secrets: only tells a caller which program this is (the sign-in's localhost check)
+            return self._json({"id": SERVER_ID})
         if u.path == "/callback":           # Autodesk redirects the browser here after sign-in (no page token; the state value is the check)
             return self._fusion_callback(q)
         if q.get("t", [""])[0] != TOKEN:
@@ -469,6 +528,10 @@ class Handler(BaseHTTPRequestHandler):
             cid = q.get("client_id", [""])[0].strip()
             if not re.fullmatch(r"[A-Za-z0-9_-]{8,80}", cid):
                 return self._json({"error": "That does not look like an Autodesk Client ID (letters and digits only)."})
+            if not IN_DOCKER:
+                bad = check_localhost(self.server.server_address[1])
+                if bad:
+                    return self._json({"error": bad})
             redirect = f"http://localhost:{self.server.server_address[1]}/callback"
             url, verifier, state = fcp.auth_begin(cid, redirect)
             with LOCK:
@@ -637,14 +700,14 @@ def main(argv=None, open_browser=True):
     OUT_DIR = a.out or OUT_DIR
     if a.workers:
         os.environ["PROFILER_WORKERS"] = str(a.workers)
-    try:
-        srv = ThreadingHTTPServer((a.host, a.port or 8765), Handler)   # 8765 first: the Autodesk callback URL is registered once for this port
-    except OSError as exc:
-        if a.port:
-            raise
-        srv = ThreadingHTTPServer((a.host, 0), Handler)
-        print(f"Port 8765 is not available ({exc.strerror or type(exc).__name__}); using port {srv.server_address[1]} instead. "
+    # 8765 first: the Autodesk callback URL is registered once for this port. It is taken only if it is free on IPv4 AND IPv6 loopback (a program holding it
+    # on IPv6 alone would get Autodesk's redirect, `localhost` pointing there first, and show a 404).
+    srv, why = choose_server(a.host, a.port or 8765, Handler, explicit=bool(a.port))
+    if why:
+        print(f"Port {a.port or 8765} is not available ({why}); using port {srv.server_address[1]} instead. "
               f"For Autodesk sign-in, register http://localhost:{srv.server_address[1]}/callback (shown on the Fusion tab).")
+    if a.host in ("127.0.0.1", "localhost"):
+        fcp.serve_ipv6_too(Handler, srv.server_address[1])          # `localhost` may mean ::1: answer there too
     url = f"http://127.0.0.1:{srv.server_address[1]}/"
     print(f"Folder Profiler UI: {url}\n(this computer only; press Ctrl+C or close this window to stop)")
     if open_browser and not IN_DOCKER:

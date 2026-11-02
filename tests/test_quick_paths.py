@@ -1,5 +1,6 @@
 """Step 1 file lists: Paths/<type>.csv holds every file (project, path, size, date) from the folder listing; counts agree with the tally; odd names and
 Windows device-name extensions survive; anonymisation hides names; the switch turns it off; a cap is reported; the compile skill still reads the zip."""
+import os as _os, tempfile as _tf; _os.environ["PROFILER_NAME_KEY_FILE"] = _os.path.join(_tf.mkdtemp(), "name_key")   # tests never touch the real key in ~/.folder-profiler
 import csv, io, os, subprocess, sys, tempfile, zipfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__))); sys.path.insert(0, ROOT)
 import file_profiler as fp, name_anon

@@ -1,5 +1,6 @@
 """Reconciliation.csv: an untouched tree reconciles exactly (files and bytes per project, with odd names, links, junk, versioned Creo names); a folder that
 changes while the run works is reported with the exact difference per project and per file type; anonymised runs keep the check; Run_info says it."""
+import os as _os, tempfile as _tf; _os.environ["PROFILER_NAME_KEY_FILE"] = _os.path.join(_tf.mkdtemp(), "name_key")   # tests never touch the real key in ~/.folder-profiler
 import csv, io, os, sys, tempfile, zipfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__))); sys.path.insert(0, ROOT)
 import file_profiler as fp

@@ -1,5 +1,6 @@
 """Logging gaps: failures that used to vanish now leave a reason (Read_Problems.csv, Setup_Warnings.csv, Run_log.csv, error_log.txt),
 for the folder profiler, the UI and the Fusion cloud profiler.   Run: python tests/test_logging.py"""
+import os as _os, tempfile as _tf; _os.environ["PROFILER_NAME_KEY_FILE"] = _os.path.join(_tf.mkdtemp(), "name_key")   # tests never touch the real key in ~/.folder-profiler
 import csv, http.server, io, json, os, shutil, sys, tempfile, threading, zipfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)

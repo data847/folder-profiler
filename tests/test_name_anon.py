@@ -1,5 +1,6 @@
 """Optional name anonymisation (step 1 and step 2): nothing identifying survives in the shared zips, the separate map decodes every path
 exactly, counts are identical to a plain run, references still resolve, and the source files are untouched."""
+import os as _os, tempfile as _tf; _os.environ["PROFILER_NAME_KEY_FILE"] = _os.path.join(_tf.mkdtemp(), "name_key")   # tests never touch the real key in ~/.folder-profiler
 import csv, hashlib, io, os, stat, sys, tempfile, time, zipfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT); sys.path.insert(0, os.path.join(ROOT, "claude-skill", "profile-compile", "scripts"))
@@ -75,8 +76,8 @@ with tempfile.TemporaryDirectory() as t:
     grp = lambda rows: sorted(sorted(i for i, r in enumerate(rows[1:]) if r[7] == d) for d in {r[7] for r in rows[1:]})
     check("dir_id (salted per run) groups the same files together in both runs", grp(fa) == grp(fb), True)
     sz = lambda z, n, col: sorted(r[col] for r in rd(z, n)[1:])
-    check("Projects.csv counts equal", [r[1:] for r in rd(za, "Projects.csv")[1:]] == [r[1:] for r in rd(zp, "Projects.csv")[1:]], True)
-    check("Extensions.csv counts equal", [r[1:] for r in rd(za, "Extensions.csv")[1:]] == [r[1:] for r in rd(zp, "Extensions.csv")[1:]], True)
+    check("Projects.csv counts equal (rows sort by code in an anonymised run, so compare without the order)", sorted(r[1:] for r in rd(za, "Projects.csv")[1:]) == sorted(r[1:] for r in rd(zp, "Projects.csv")[1:]), True)
+    check("Extensions.csv counts equal", sorted(r[1:] for r in rd(za, "Extensions.csv")[1:]) == sorted(r[1:] for r in rd(zp, "Extensions.csv")[1:]), True)
 
     # ---- the map decodes every path exactly
     mp = zipfile.ZipFile(map_zip); rows = rd(mp, "Name_Map.csv")[1:]
@@ -107,7 +108,7 @@ with tempfile.TemporaryDirectory() as t:
     em, sf = cp.load_mapping(os.path.join(ROOT, "claude-skill", "profile-compile", "scripts", "mapping"))
     ca = cp.compile_runs(cp.load_profiles([anon]), em, sf, False, "auto", True, "folder")[0]
     cb = cp.compile_runs(cp.load_profiles([plain]), em, sf, False, "auto", True, "folder")[0]
-    check("compiled workbook rows: same numbers, only the names differ", [r[4:9] for r in ca] == [r[4:9] for r in cb] and len(ca) == len(cb), True)
+    check("compiled workbook rows: same numbers, only the names (and so the row order) differ", sorted(r[4:9] for r in ca) == sorted(r[4:9] for r in cb) and len(ca) == len(cb), True)
 
     # ---- step 1
     q_plain = fp.quick_scan(src, out)[0]

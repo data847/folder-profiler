@@ -1,5 +1,6 @@
 """Fail log: when a run fails the UI offers ONE zip for remote debugging - with the error, the run's own log, settings and machine - and
 without the owner's paths, user name or access tokens (and, with name anonymisation on, without anything below the scanned folder)."""
+import os as _os, tempfile as _tf; _os.environ["PROFILER_NAME_KEY_FILE"] = _os.path.join(_tf.mkdtemp(), "name_key")   # tests never touch the real key in ~/.folder-profiler
 import io, json, os, sys, tempfile, threading, time, urllib.request, zipfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__))); sys.path.insert(0, ROOT)
 import file_profiler as fp, ui
