@@ -4,7 +4,18 @@ FOLDER PROFILER - STEP-BY-STEP GUIDE (no technical knowledge needed)
 WHAT THIS DOES
 It counts and measures the files in a folder (types, sizes, dates) and makes ONE small zip file
 with the numbers. It never copies, stores or sends your files or their contents - only information ABOUT them (see "WHAT IT RECORDS").
-It does not use the internet. Your files are never changed.
+Your files are never changed. Nothing about your files or the result is ever sent over the internet by the tool. The only internet use is the
+starter downloading the program itself from GitHub (see "WHERE THE PROGRAM COMES FROM" below) - and, only if you choose the optional
+Fusion 360 tab and sign in, the questions it asks Autodesk about your own hub.
+
+WHERE THE PROGRAM COMES FROM
+The package holds only a small starter (launcher.py) and, on Windows, the Python it needs. Each time you start the tool, the starter asks GitHub
+(github.com/data847/folder-profiler, public) which version is the latest, and downloads it (about 0.5 MB, into the folder "app" next to the
+starter) only if it is newer than the one already there. So the first start needs internet access to github.com and api.github.com; later starts
+use the copy in "app" if GitHub cannot be reached. It sends GitHub nothing but the request itself (as any web page does); no file names, no
+results, no information about your computer. To stay on one exact version, put its tag on the first line of a file named ref.txt next to the
+starter. Delete the folder "app" to start clean. Open launcher.py in Notepad to read exactly what it does. If your network blocks GitHub, the
+first start fails with a plain message: ask us for a full copy.
 
 WHAT IT RECORDS
 For every file at any folder depth: its type, size, modified date, a short format tag, and its file name and
@@ -101,7 +112,7 @@ STEP 2. Start the tool.
   - If Windows shows a blue box "Windows protected your PC":
         click "More info", then click "Run anyway".
     (This appears because the tool is not from the Microsoft Store. It is safe to run;
-     you can open run-ui.bat and file_profiler.py in Notepad to read exactly what they do.)
+     you can open run-ui.bat and launcher.py in Notepad to read exactly what they do; the program itself is in the folder "app".)
   - A black window opens with some text. LEAVE IT OPEN. It is the tool running.
   - After a few seconds your web browser opens a page called "Folder Profiler".
     If the browser does not open by itself, look in the black window for a line like
@@ -167,9 +178,10 @@ MAC (needs Python 3 installed once)
 1. Install Python from https://www.python.org/downloads/ (click the big yellow Download button
    and open the installer). Skip if already installed.
 2. Double-click folder-profiler-ui.zip to unzip it (do not run it from inside the zip).
-3. Open the app "Terminal". Type:   cd   (then a space), drag the unzipped "folder-profiler"
-   folder into the Terminal window, press Enter.
-4. Type:   python3 ui.py   and press Enter. Your browser opens the Folder Profiler page.
+3. Open the app "Terminal". Type:   cd   (then a space), drag the unzipped "folder-profiler-ui"
+   folder into the Terminal window, press Enter. (Or just double-click run-ui.command in that folder.)
+4. Type:   python3 launcher.py ui   and press Enter. The first time it downloads the program from
+   GitHub (needs internet); then your browser opens the Folder Profiler page.
 5. Continue from STEP 3 above (choose the folder, Start profiling, Download, send to us).
    To stop the tool, go back to Terminal and press Control + C.
 
@@ -177,7 +189,8 @@ MAC (needs Python 3 installed once)
 OPTIONAL - DOCKER (only if your IT team already uses Docker)
 ------------------------------------------------------------
 Open a terminal in the tool folder. Copy ".env.example" to ".env" and set PROFILE_DIR to the
-folder to measure. Run:  docker compose up --build   then open http://localhost:8765 and
+folder to measure. Run:  python3 launcher.py prepare   (fetches the program from GitHub; on Windows use
+python\python.exe launcher.py prepare), then:  docker compose up --build   then open http://localhost:8765 and
 continue from STEP 3. The zip is also saved in the "output" folder.
 
 

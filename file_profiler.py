@@ -1047,6 +1047,12 @@ def unreadable_csv(units, rows, with_paths=True, files_with_paths=True):
     return out
 
 
+def code_build():
+    """Run_info rows saying which commit of the program made the zip - present only when launcher.py started it (it sets FOLDER_PROFILER_BUILD)."""
+    b = os.environ.get("FOLDER_PROFILER_BUILD", "").strip()
+    return [["code_build", b]] if b else []
+
+
 def name_codes(nm):
     """Run_info value: are this run's codes the same as every other run's on this computer?"""
     if not nm:
@@ -1191,7 +1197,7 @@ def quick_scan(root, out_dir, log=print, label=None, folders=None, workers=None,
         if want_paths:
             z.writestr("Paths_Index.csv", csv_bytes(["file_type", "list", "files"], [[e, f"Paths/{m}.csv", res["paths"].count(e)] for e, m in p_index.items()]))
         paths_s = time.time() - t_paths
-        z.writestr("Run_info.csv", csv_bytes(["key", "value"], info + ([["seconds_writing_path_lists", round(paths_s, 1)], ["path_list_spills_to_disk", res["paths"].spills]] if want_paths else []) + [["peak_memory_mb", _peak_mb()]]))
+        z.writestr("Run_info.csv", csv_bytes(["key", "value"], info + code_build() + ([["seconds_writing_path_lists", round(paths_s, 1)], ["path_list_spills_to_disk", res["paths"].spills]] if want_paths else []) + [["peak_memory_mb", _peak_mb()]]))
         z.writestr("WHAT_IS_IN_THIS_ZIP.txt", (what + ("Paths/<type>.csv lists EVERY file of that type: project, path inside the project, size and modified date (read from the folder listing; "
                                                        "no file was opened). Paths_Index.csv says how many files each list has.\r\n" if want_paths else "")).encode("utf-8"))
     if res.get("paths"):
@@ -2033,7 +2039,7 @@ def profile(root, out_dir, log=print, label=None, folders=None, workers=None, pr
                 ["seconds_finalize", round(fin_s, 1)],
                 ["avg_MB_per_s", round(bytes_out / 1e6 / max(1.0, proc_s + man["prescan_s"]), 1)],
                 ["avg_files_per_s", round(nfiles_out / max(1.0, proc_s + man["prescan_s"]))]]
-        put("Run_info.csv", ["key", "value"], info)
+        put("Run_info.csv", ["key", "value"], info + code_build())
         z.writestr("WHAT_IS_IN_THIS_ZIP.txt", what_is(tier, anonymize_assembly_names, bool(nm)).encode("utf-8"))
         # ---- shareable run statistics
         phases = [["phase", "wall_seconds", "files", "GB", "MB_per_s", "files_per_s", "note"],
