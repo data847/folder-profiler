@@ -2249,6 +2249,10 @@ def main(argv=None):
                     help="projects are the folders this many levels below the chosen one (default 1; env PROFILER_PROJECT_DEPTH)")
     ap.add_argument("--quick", action="store_true",
                     help="STEP 1 only: a very fast count of files per type and size (no file is opened); the full profile is step 2 (default)")
+    ap.add_argument("--legacy-profile", action="store_true",
+                    help="STEP 2 only: run the old metrics-only profile (zip for profile-compile) instead of the CAD scan workbook")
+    ap.add_argument("--download-cloud-files", action="store_true",
+                    help="CAD scan: download (hydrate) online-only OneDrive / Google Drive / Dropbox files and check them; by default they are listed in Not Checked")
     ap.add_argument("--fresh", action="store_true", help="ignore saved progress of an earlier run and start from the beginning")
     ap.add_argument("--metrics-interval", type=float, default=None, help="seconds between system samples in Run_metrics.csv (default 5)")
     ap.add_argument("--no-system-info", action="store_true", help="do not ask the OS about disks / antivirus (System_info.csv is shorter)")
@@ -2280,6 +2284,30 @@ def main(argv=None):
         print(f"\nPlease send us this ONE file{' (in the output folder)' if os.environ.get('PROFILER_IN_DOCKER') else ''}:\n  {shown}")
         print("Step 2 (the full profile) is the same command without --quick.")
         reveal(qz)
+        return 0
+    if not a.legacy_profile:
+        print(f"CAD project scan (step 2): {label or folder}\n(read-only; every file is opened and hashed here; only names, paths, sizes, dates, hashes and counts are written)\n")
+        try:
+            import cad_scan
+            xlsx, nproj, nfiles, problems = cad_scan.scan(folder, out_dir, label=label, workers=a.workers, download_cloud=a.download_cloud_files,
+                                                         host=sys.modules[__name__])
+        except RunStopped:
+            print("\nStopped. A scan is not resumable: start it again from the beginning.")
+            return 130
+        except SystemExit as e:
+            print(e)
+            return 1
+        except Exception:
+            log = os.path.join(out_dir, "error_log.txt")
+            os.makedirs(out_dir, exist_ok=True)
+            open(log, "w").write(scrub_paths(traceback.format_exc(), folder))
+            print(f"\nSomething went wrong. Please send us this file: {log}")
+            return 1
+        LAST_RUN["scan"] = True
+        print(f"\nDone: {nproj} projects, {nfiles:,} files" + (f", {problems} not checked" if problems else ""))
+        shown = os.path.basename(xlsx) if os.environ.get("PROFILER_IN_DOCKER") else xlsx
+        print(f"\nPlease send us this ONE file{' (in the output folder)' if os.environ.get('PROFILER_IN_DOCKER') else ''}:\n  {shown}")
+        reveal(xlsx)
         return 0
     print(f"Profiling: {label or folder}\n(read-only; nothing is copied or sent anywhere)\n")
     try:

@@ -1,7 +1,7 @@
 # Folder Profiler
 
 Measures a folder of CAD/engineering projects and writes **metrics only** — file extensions, sizes, dates,
-and a short format tag per file, plus anonymous folder ids (no file is ever hashed). It never copies, uploads or stores
+and a short format tag per file, plus anonymous folder ids (the legacy profile never hashes a file; the CAD scan, step 2, does). It never copies, uploads or stores
 file contents, folder names, or paths below the project name. The one exception is **assembly files** (`.sldasm .asm
 .iam .catproduct`): their file names are recorded (or replaced by codes `ASM-3F9A1C2B.SLDASM` with
 `--anonymize-assembly-names` / the UI tick box) so the *Assembly Breakdown* tab can be estimated by folder. Standard library only; no network code; files are opened read-only.
@@ -61,7 +61,14 @@ without any evidence as Unclassified, and no longer called AutoCAD-heavy project
   (a local disk is limited by Python itself: measured 4 threads beating 32); one huge project is shared between threads; **there is no depth limit** (tested at 150 levels; `Run_info.csv` reports the deepest level reached) and folder links / junctions are not followed.
   Writes `quick_<name>_<date>.zip` (`Extensions.csv`, `Extensions_All.csv`, `Projects.csv`, `Run_info.csv`); its numbers equal the full profile's `Extensions.csv`
   (tested). Measured on a warm SSD (macOS): about 165,000 files per second (300,000 files in 1.8 s); 60,000 files in 0.5 s against 3.3 s for step 2; on a cold hard disk the gap is far larger because step 1 never opens a file.
-- **Step 2 - full profile** (the default run): everything below.
+- **Step 2 - CAD project scan** (the default run; `cad_scan.py`): reads **every file's content** (MD5 hash, Solid Edge 3D-body check, assembly component
+  names), opens zip / tar / gz (and rar / 7z when 7-Zip, unrar or bsdtar is installed) up to 5 levels deep, splits the folder tree into projects and writes
+  **one workbook** `scan_<folder>_<date>.xlsx` with the tabs Read Me, Field Logic, Projects, Real Files, Excluded Files, Project Map and Not Checked. The rules are
+  the *Field Logic* tab of the LH2 CAD Project Scan sheet (`scan_docs.json` holds that tab verbatim and is copied into the workbook; `LIMITS` in `cad_scan.py`
+  lists what is not covered). Only names, paths, sizes, dates, hashes and counts are written; no geometry or text leaves the machine. Online-only (cloud)
+  files are listed in Not Checked unless `--download-cloud-files` / the UI box is used. A scan is **not resumable** and **name anonymisation does not apply**.
+  The old metrics-only profile (zip for `profile-compile`, no hashing, resumable) is still available: `--legacy-profile`, or env `PROFILER_LEGACY_PROFILE=1` for the UI.
+- **Step 2 (legacy) - full profile** (`--legacy-profile`): everything below.
 - `compile_profiles.py quick_*.zip` turns a step-1 zip into `quick_count.xlsx` (Overview by file class, By Extension, By Project).
 
 ## Resume, run statistics, scale

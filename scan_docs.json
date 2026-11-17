@@ -1,0 +1,360 @@
+{
+"Read Me": [
+[
+"LH2 CAD Project Scan: output format"
+],
+[],
+[
+"What this file is",
+"One workbook per scan. The script fills every sheet; nothing is typed by hand. Counts come only from reading files on the supplier's computer. No geometry or document text leaves the machine: only names, paths, sizes, dates and counts."
+],
+[
+"Projects",
+"One row per detected project, with Total / Real distinct / Duplicates / Blank for each file group, and real-file totals. Real distinct = Total minus exclusions (formula)."
+],
+[
+"Real Files",
+"One row per real, distinct file kept in the counts, with its folder path (and archive path when it sits inside a zip/rar/7z)."
+],
+[
+"Excluded Files",
+"One row per file NOT counted as real, with the reason and, for duplicates, the path of the copy that was kept. Use this to audit the counts."
+],
+[
+"Project Map",
+"How each project was detected: folders included, rule applied, top-level assemblies found."
+],
+[
+"Not Checked",
+"Files the script could not read (cloud-only, locked, encrypted archive, corrupt). They are in Total Files but not in any group."
+],
+[
+"Field Logic",
+"The rule behind every column, and how each rule was cross-checked."
+],
+[
+"Yellow rows",
+"Example rows. On Projects the figures are the verified Machine-Assembly-01 counts; on the other sheets the rows are illustrative. Delete them: the script writes real rows from row 4 (Projects) or row 2 (other sheets)."
+],
+[
+"Check column",
+"Projects!AQ must be 0 on every row: Total Files minus all group totals minus Not Checked."
+]
+],
+"Field Logic": [
+[
+"Field logic for the scan script, with cross-checks"
+],
+[
+"Cross-check sources: (V) verified on file contents of 6 supplier projects (Machine-Assembly-01/02, Channel-Welding-Line-01, OEM-Machine-001/004/008); (P) cross-checked on the 2026-11-03 profile of a different supplier set (407,472 files, 45 top folders, names/paths/sizes/links only); (T) tested on sample files. Where a rule could not be confirmed it says so and the script must not claim more."
+],
+[],
+[
+"#",
+"Output column(s)",
+"Field",
+"Logic for the script",
+"Cross-check: does it hold beyond the 6 projects?",
+"Confidence"
+],
+[
+"0. Before counting"
+],
+[
+"0.1",
+"All",
+"Read every file (content, not just names)",
+"The current profiler reads names, paths and a few headers only, with hashing off. The new script must open every file to: (a) compute an MD5 of the file, (b) read the 3D body stream of Solid Edge parts, (c) read component names of assemblies, (d) open archives. Only names, paths, sizes, dates, hashes and counts are written out; no geometry or text leaves the machine.",
+"(P) Run_info shows hashing = none and header_reads_sampled only, so duplicates and blank files cannot be found from today's output. Reading ~245 GB at the observed ~370 MB/s is ~11 minutes plus hashing, so it is feasible.",
+"High"
+],
+[
+"0.2",
+"Not Checked",
+"Cloud-only files",
+"Detect online-only files (Windows attribute RECALL_ON_DATA_ACCESS / OFFLINE, macOS dataless). Default: list them in Not Checked and do not open them. Option --download-cloud-files: download (hydrate) them first, then check them like local files.",
+"(P) 295,726 of 407,472 files (73%) in the profile are cloud-only (TIERED). Without hydration most counts would be Not Checked. This is not specific to one supplier: any OneDrive / Google Drive / Dropbox folder behaves this way.",
+"High"
+],
+[
+"0.3",
+"All groups",
+"Archives (zip, rar, 7z, tar, gz)",
+"Open every archive and treat its members as files of the folder it sits in, recursively (archive inside archive) up to depth 5. Member path = \"<archive path> > <path inside>\". The archive container itself is not counted. Password-protected, corrupt or unsupported archives go to Not Checked (one row per archive). A member that is byte-identical to a file outside the archive is a Duplicate like any other copy.",
+"(P) 2,439 archives (24 GB) in the profile; the current tool counts each as one file and never looks inside. (V) In Machine-Assembly-01, 7 zips were fully duplicated by unzipped files and 1 zip held 2 files found nowhere else, so members must be compared file by file, not archive by archive. rar needs unrar/7-Zip on the machine; 7z needs py7zr.",
+"High"
+],
+[
+"0.4",
+"Project Name, Project Type, Project Folder; Project Map",
+"Splitting folders into projects",
+"Work on the folder tree (archives expanded). Walk down from the selected root. For each folder X:\n1. No CAD files (part, assembly, drawing, exchange) anywhere below X → not a project; its files belong to the parent's project as Other.\n2. Library: X's name contains std / standard / library / toolbox / vendor / bought out / downloads, OR X has no top-level assembly and is referenced by assemblies in 3+ other projects → Project Type = Library; stop here (do not split it).\n3. Role folders: if any child folder of X is named by role (3D, 2D, CAD, STEP, IGES, DRAFTS, DRAWINGS, DWG, DXF, PDF, PARTS, COMPONENTS, ASM, ASSEMBLY, SUB ASSEMBLY, STD PARTS, BOM, DOCS, IMAGES, RENDERS, OLD, BACKUP, ARCHIVE, REV n, Rn, Vn, FINAL, CONCEPT, FIXTURE, LAYOUT, NEW FOLDER*), X is one project; stop.\n4. Otherwise group X's child folders: join two children when assemblies in one reference files in the other strongly (10+ references and 20%+ of that child's resolved references). Ignore hub folders referenced by 3+ siblings (shared libraries). A group is a candidate if it has 1+ non-empty assembly or 20+ CAD files.\n5. If 2+ candidate groups: X is a collection. Recurse into each group (a group of one child → that child). X's own loose files plus small groups → project \"<X> (loose files)\", Type = Loose files. Otherwise X is one project.\nProject Name = folder name (joined names when siblings were merged). Project Map records the rule used for each project.",
+"(P) Ran on all 45 top folders: 1,013 projects. Machine-Assembly-01 and Machine-Assembly-02 each came out as one project, matching the verified folders. Job folders (e.g. numbered customer job folders) were separated correctly.\nTwo rules were dropped after testing: (a) merging folders that share many file names wrongly merged different customers' machines, because suppliers reuse the same part names across jobs; (b) merging on any single cross-reference merged everything through shared bolt / standard-part folders, hence the hub rule and the 10-reference threshold.\nLimits: revision copies of a machine in separate folders (e.g. R1 / R2) become separate projects; cloud-only folders have no reference data, so only rules 1-3 apply there unless files are downloaded. Review Project Map before relying on the split.",
+"Medium: always review Project Map"
+],
+[
+"1. Part files"
+],
+[
+"1.1",
+"Part files: Total",
+"Which files are parts",
+"Extensions: .par .psm (Solid Edge), .sldprt (SolidWorks), .ipt (Inventor), .prt (Creo or NX; tell them apart by file header), .catpart (CATIA). Creo version suffixes (name.prt.7) count as part files.",
+"(P) The profile has .par, .psm, .sldprt, .ipt, .prt; versioned Creo names exist (14 files). Extension list is standard CAD knowledge, not project-specific.",
+"High"
+],
+[
+"1.2",
+"Part files: Blank (Placeholders / Empty)",
+"Placeholder or empty part",
+"Solid Edge (.par/.psm): open as OLE / Compound File. Real if it holds a 3D body in stream STREAM0.X_B (older versions) OR STREAM0.P_B (newer versions). If neither: Blank (this includes sketch-only files). Self-check: if a Blank file still contains the Parasolid marker \"**ABCDEFGHIJKLMNOPQRSTUVWXYZ\" outside a sketch stream, report it in Not Checked instead of Blank.\nAll formats: 0-byte files and files that fail to open (bad header) are Blank.\nSolidWorks / Inventor / NX / Creo / CATIA: no body check (see Confidence); never call them Blank unless 0-byte or unreadable.",
+"(V) STREAM0.X_B-only rule mislabelled 691 of 699 OEM-Machine-004 parts and hundreds in OEM-001/008 as empty; adding STREAM0.P_B fixed it; after the fix 0 Blank files contained a body, and preview images of 150 random Blank files per folder were all blank.\n(P) The same 146,432-byte empty Solid Edge part appears in almost every top folder of the new supplier set (e.g. 30,292 copies under two of the top folders), so the placeholder pattern is a Solid Edge behaviour, not specific to the 6 projects.\n(T) 6 SolidWorks parts tested: the body is stored in compressed, obfuscated sections; it could not be read reliably, so no Blank claim is made for SolidWorks.",
+"High for Solid Edge; not available for other formats"
+],
+[
+"1.3",
+"Part files: Import Debris (STEP splits)",
+"STEP-import split bodies",
+"A real part is import debris if its name contains \"_oa\" or \"-oa\" (e.g. Fillet 22_oa_11, Fillet 1-oa0), \"Fillet <n>\", starts with \"PRODUCT_ID\" or \"Imported\", OR 50+ real parts in the same project share one base name (name with trailing _<n> groups removed). Count the files in these groups as Import Debris. The original STEP file stays in the Exchange group.",
+"(P) In the new supplier set: 19,648 part files with _oa, 19,203 with Fillet <n>, 4,660 PRODUCT_ID, 360 Imported, spread over 30+ top folders. Top 50+ groups were all import or assembly names (e.g. \"<assembly name> R7\" ×1,124, \"<project name>\" ×1,027, \"<assembly name>_IGES FILE\" ×988). The \"-oa\" variant was found here and added.\nLimit: a split saved with ordinary, non-numbered names is missed (counted as real).",
+"Medium-high"
+],
+[
+"1.4",
+"Part files: Duplicates",
+"Copies of the same part",
+"Group the remaining real parts by 3D body: same body bytes (MD5 of the body stream), or same body length with under 2% of bytes different. Each group = one distinct part; keep the newest file (latest modified) as the real file and list the others as Duplicates with \"Same As\". Parts whose body is not read (non-Solid-Edge): duplicates only when the whole file is byte-identical (MD5); Creo older versions (name.prt.N, not the highest N) are duplicates. File names are never used to decide that two parts are the same.",
+"(V) Bytes that differ between grouped files were internal entity IDs and attribute strings that Solid Edge rewrites on every save, not geometry. Preview images agreed for 92-100% of pairs in 5 of 6 folders; mismatches were zoom/colour differences of the same part. OEM-Machine-008 previews were unreliable (bodies differed by <0.1%).\nLimits: (a) a re-saved part in another CAD version can differ >2% → counted twice (count slightly high); (b) SolidWorks etc. copies that are not byte-identical are not caught.",
+"Medium-high for Solid Edge; Low-medium for other formats"
+],
+[
+"1.5",
+"Part files: Real Distinct",
+"Real distinct parts",
+"Formula: Total − Duplicates − Blank − Import Debris (formula in the sheet).",
+"Arithmetic.",
+"High"
+],
+[
+"2. Assembly files"
+],
+[
+"2.1",
+"Assembly files: Total",
+"Which files are assemblies",
+"Extensions: .asm (Solid Edge; Creo .asm told apart by header), .sldasm, .iam, .catproduct, Creo name.asm.N.",
+"(P) .asm and .sldasm present in the profile. Standard CAD extensions.",
+"High"
+],
+[
+"2.2",
+"Assembly files: Blank / Empty",
+"Empty or hollow assembly",
+"Read the component file names stored in the assembly (Solid Edge: names stored as UTF-16 text; SolidWorks/Inventor: from the file's reference list). Blank if (a) no component names, or (b) none of its components is a Real Distinct part or a non-empty assembly found in the scan (all components are placeholders, import debris or missing). Resolve a component name to the nearest file of that name by folder path. If the assembly cannot be parsed, put it in Not Checked, not Blank.",
+"(V) 502 empty + 27 hollow assemblies in Machine-Assembly-01; hollow ones referenced only placeholders / split bodies / missing files.\n(P) 93.1% of assembly references in the profile resolve to a file name in the scan, so name resolution works. Read_Problems shows .sldasm files the current reader could not parse (\"container not understood\") and Solid Edge assemblies with ValueError: these must go to Not Checked, not Blank.",
+"High for Solid Edge; Medium for others"
+],
+[
+"2.3",
+"Assembly files: Duplicates",
+"Re-saved copies of an assembly",
+"Duplicate if byte-identical to another assembly, OR its component list is exactly the same as another non-empty assembly's. Assemblies that only partly overlap (a variant or revision with some parts changed) are different designs and are kept. Keep the newest; list the rest with \"Same As\".",
+"Rule set by LH2 (partial overlap = different design). Exact-list match is format-independent. (V) Machine-Assembly-01: 5 copies under this rule.",
+"High"
+],
+[
+"2.4",
+"Assembly files: Real Distinct",
+"Real distinct assemblies",
+"Formula: Total − Duplicates − Blank.",
+"Arithmetic.",
+"High"
+],
+[
+"3. Drawing files (2D)"
+],
+[
+"3.1",
+"Drawing files: Total",
+"Which files are drawings",
+".dft (Solid Edge), .dwg, .dxf, .slddrw, .idw, .drw (Creo), .catdrawing. PDF prints are documents and go to Other.",
+"(P) .dft, .dwg, .dxf, .slddrw present. Standard extensions.",
+"High"
+],
+[
+"3.2",
+"Drawing files: Blank / Empty",
+"Empty drawing",
+"Blank if 0-byte or unreadable/corrupt; DXF/DWG with no entities in model space and no layouts with content. Do not mark a drawing Blank only because its linked model is missing: it still holds sheets.",
+"(P) 72 zero-byte files exist in the profile (mostly downloads and documents). No reliable empty-sheet test exists for .dft/.slddrw without a CAD kernel, so the rule stays conservative.",
+"Medium (conservative: may miss empty .dft)"
+],
+[
+"3.3",
+"Drawing files: Duplicates",
+"Copies of a drawing",
+"Byte-identical (MD5) only. Keep the newest; list the rest with \"Same As\".",
+"(V) 17 of 125 drawings in Machine-Assembly-01 were byte-identical copies; the 2D counts for the other 5 projects matched the LH2 catalogue. Limit: a drawing re-saved under another name with different bytes is not caught.",
+"High for what it catches"
+],
+[
+"3.4",
+"Drawing files: Real Distinct",
+"Real distinct drawings",
+"Formula: Total − Duplicates − Blank.",
+"Arithmetic.",
+"High"
+],
+[
+"4. 3D exchange files"
+],
+[
+"4.1",
+"3D exchange: all four columns",
+"STEP / IGES / Parasolid / STL",
+"Extensions: .stp .step .igs .iges .x_t .x_b .xmt_txt .sat .jt .stl .3mf .obj. Blank if 0-byte, or a STEP with no geometry entity (no MANIFOLD_SOLID_BREP, BREP_WITH_VOIDS, SHELL_BASED_SURFACE_MODEL, FACETED_BREP, GEOMETRIC_CURVE_SET), an STL with 0 triangles, or an IGES with no geometry entities. Duplicates = byte-identical. Real = Total − Duplicates − Blank.\nThey are reported separately because your definition of Real 3D is parts + assemblies; add them to Real 3D if you want STEP files to count.",
+"(P) .stp, .step, .igs, .x_t, .xmt_txt, .stl, .3mf all occur in the profile. STEP entity names are from the ISO 10303 standard, not supplier-specific.",
+"High"
+],
+[
+"5. Other files"
+],
+[
+"5.1",
+"Other files: Total",
+"Everything else",
+"All files not in groups 1-4, including archive members (archives themselves are containers and not counted).",
+"(P) Covers documents, images, video, software projects, CNC/robot programs, etc.",
+"High"
+],
+[
+"5.2",
+"Other files: Junk / Auto-generated",
+"Files with no design value",
+"Exclude: (a) 0-byte files; (b) system, lock and temp files: .ds_store, thumbs.db, desktop.ini, names starting ~$ or ._, .selock, .lck, .tmp, .crdownload, .download, .partial; (c) CAD side-files: .cfg, .log, .err, .bak with the same name as a CAD file in the same folder; (d) installers and binaries: .exe, .dll, .msi, .mst, .cab, .sys; (e) shortcuts .lnk.\nKeep .cfg/.log that do not sit next to a same-named CAD file (they can be machine or PLC configuration). Keep code, CNC and robot programs (.prg, .bas, .nc, .gcode, .cs, .cpp…): they can be real project content.",
+"(P) 10,995 of 11,285 .cfg files (97%) and 4,538 of 4,787 .log files (95%) sit next to a same-named CAD file in the new supplier set, which confirms they are CAD side-files and supports the \"same name, same folder\" condition instead of excluding every .cfg/.log. .selock files are all \"<cad name>.selock\" lock files. .prg/.bas (3,126 files) never sit next to CAD files: they are machine programs and stay as real.",
+"High"
+],
+[
+"5.3",
+"Other files: Duplicates",
+"Copies",
+"Byte-identical (MD5), including archive members that also exist unzipped. Keep the newest.",
+"Format-independent.",
+"High"
+],
+[
+"5.4",
+"Other files: Real Distinct",
+"Real other files",
+"Formula: Total − Duplicates − Junk.",
+"Arithmetic.",
+"High"
+],
+[
+"6. Totals and checks"
+],
+[
+"6.1",
+"Total Files",
+"Total files in the project",
+"Formula: sum of the five group totals + Not Checked. Archive members included; archive containers not.",
+"Arithmetic; Check column must be 0.",
+"High"
+],
+[
+"6.2",
+"Total Real 3D Files",
+"Real 3D",
+"Formula: Real parts + Real assemblies (LH2 definition).",
+"Arithmetic.",
+"High"
+],
+[
+"6.3",
+"Total Real 2D Files",
+"Real 2D",
+"Formula: Real drawings.",
+"Arithmetic.",
+"High"
+],
+[
+"6.4",
+"Total Real Exchange / Other / All",
+"Other totals",
+"Exchange = Real exchange files; Other = Real other files; Total Real Files = 3D + 2D + Exchange + Other.",
+"Arithmetic.",
+"High"
+],
+[
+"6.5",
+"Content Check Level",
+"How deep the check went per project",
+"Full = all part files are Solid Edge (body read). Partial = some parts in other formats (byte-identical duplicates only, no blank check). Name the formats in the cell.",
+"Needed because the body check is verified for Solid Edge only.",
+"High"
+],
+[
+"7. Part linkage (main assembly)"
+],
+[
+"7.1",
+"Main Assembly (detected)",
+"Which assembly is the \"final\" one",
+"Candidates = non-empty assemblies not used inside any other assembly of the project (top-level). Drop: hollow assemblies, STEP-import shells (name contains .stp / .step / .igs / iges / imported, or most components are import debris) and re-saved copies (same component list). Rank the rest by the number of real parts in their full tree (sub-assemblies expanded); prefer names containing final / complete / main / total / GA when within 10% of the largest. Write the winner here and ALL candidates, ranked, in Project Map so a person can confirm.",
+"(V) Machine-Assembly-01: 58 top-level assemblies; the largest is \"<main assembly>.asm\" (the known final), with a same-named copy in another subfolder.\n(P) On 80 readable projects in the profile, \"largest top-level assembly\" alone picked STEP-import shells in several (e.g. \"<name>.stp.asm\", \"e1@ (1).asm\", \"<name>_iges file.asm\"), hence the drop rules. A folder holding several machines has several valid \"final\" assemblies; this field shows only one.",
+"Medium: needs human confirmation"
+],
+[
+"7.2",
+"Parts Referenced",
+"Parts in the main assembly",
+"Walk the main assembly's component tree (expand sub-assemblies found in the scan; a sub-assembly that cannot be found counts as one missing reference). Count distinct part file names referenced.",
+"(V) Machine-Assembly-01 main assembly: 601 distinct parts referenced, 31 sub-assemblies.",
+"High"
+],
+[
+"7.3",
+"Found – Real (project / other folder), Found – Empty Placeholder Only, Missing",
+"Where each referenced part is",
+"Resolve each referenced name: first in the project's folders, then anywhere else in the scan (incl. archives). Classify: Found – Real if a file with a 3D body exists (real part or STEP-import body: both carry geometry), split by in-project / other folder; Found – Empty Placeholder Only if every file with that name has no 3D body; Missing if no file has that name. Prefer an exact match on the full path stored in the assembly before matching by name.",
+"(V) Machine-Assembly-01: 601 referenced = 95 real + 111 import bodies (206 found real) + 310 empty placeholders + 85 missing. Matching by name only would show 516 \"present\" (86%); the real figure is 34%. So the placeholder check is essential here.\nLimits: \"other folder\" only means elsewhere in what was scanned; a part on another drive is reported Missing. Two different parts with the same file name can be confused when only names are compared.",
+"Medium-high"
+],
+[
+"7.4",
+"Part Linkage %",
+"Of the real parts referenced, how many are in the project folder",
+"Formula: Found Real in Project Folder / (Parts Referenced − Found Empty Placeholder Only) (formula). Denominator = real parts the assembly references: those found with a 3D body anywhere, plus those missing (no file at all, so they cannot be ruled out as real). References to empty placeholders are left out of the % and shown in their own column. Parts found only in another folder count against the %, because they would not come with the project folder.",
+"(V) Machine-Assembly-01: 601 referenced − 310 empty placeholders = 291 real references; 206 found in the project folder → 70.8%. The other 85 are missing from the whole scan. If missing parts were also left out, every project would read 100% wherever all found parts sit in one folder, so they stay in the denominator.",
+"High"
+],
+[
+"8. Final assembly drawing"
+],
+[
+"8.1",
+"Final Assembly Drawing Present (Y/N)",
+"Is there a GA / final assembly drawing",
+"TO BE DECIDED. Options:\n(a) Reference-based: Y if any drawing stores a reference to the main assembly file, or to a re-saved copy of it (same component list).\n(b) Name-based: Y if a drawing file (.dft, .dwg, .dxf, .slddrw, .pdf) has the same name as the main assembly, or its name contains GA / general arrangement / final / complete / overall / layout together with the project or machine name.\nA name-based check also works for DWG / DXF / PDF drawings, which store no model reference. A combination (a OR b) is likely the most useful; final rule to be agreed with the tech team.",
+"(V) Machine-Assembly-01: no .dft references the main assembly (the drawings in that folder are for a variant of it), so reference-based gives N. Name-based rules are untested and can give false Y (e.g. \"FINAL ASSEMBLY\" drawings of a sub-assembly) or false N (GA drawings named by drawing number only).",
+"To be decided"
+],
+[
+"6.6",
+"Real Files sheet",
+"Paths of real files",
+"One row per Real Distinct file (all five groups): project, category, file name, folder path relative to the scanned root, archive path if inside an archive, extension, size, modified date, number of duplicates excluded for it, check type.",
+"Format-independent.",
+"High"
+],
+[
+"6.7",
+"Excluded Files sheet",
+"Audit trail",
+"One row per excluded file with the exclusion type, a reason and, for duplicates, the kept file's path. Lets anyone spot-check a sample by opening the files.",
+"Recommended: errors in this chat were found exactly this way.",
+"High"
+]
+]
+}

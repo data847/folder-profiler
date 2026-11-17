@@ -57,14 +57,20 @@ STEP files whose references are listed). Duplicate files are recognised by their
 All sub-folders are included, however deeply they are nested.
 
 COMPRESSED FILES (.zip, .rar, .7z, .tar ...)
-The tool does NOT open compressed files. Each one is counted as a single file, like any other.
+Step 1 does NOT open compressed files: each one is counted as a single file. Step 2 (the CAD scan) DOES open zip / tar / gz files (rar and 7z too when 7-Zip is installed) and counts what is inside.
 
 TWO STEPS
 Step 1 - QUICK COUNT (very fast, a few seconds to minutes): counts how many files of each type there are and how big they are,
 per project folder and overall. No file is opened. By default it also lists every file - its path inside the project, size and modified date -
 in a Paths folder of the zip (one list per file type), read from the folder listing only. To leave the file names out, untick "Step 1: also list every file's path, size and date by file type"
 in the page (command line: --no-paths); to hide the names but keep the lists, tick "Anonymise file and folder names". Nothing is ever sent anywhere.
-Step 2 - FULL PROFILE (the complete run, much longer): everything described in "WHAT IT RECORDS" above.
+Step 2 - CAD PROJECT SCAN (the complete run, much longer): opens and reads EVERY file on this computer (it computes a fingerprint (MD5) of each file,
+checks whether Solid Edge parts hold a 3D body, reads the component names stored in assemblies, and looks inside archives) so that empty files, copies and
+placeholders can be told apart from real design files. It writes ONE spreadsheet, scan_<folder>_<date>.xlsx, with: Projects (counts per project), Real Files,
+Excluded Files, Project Map and Not Checked (files it could not read). What leaves the computer is only that spreadsheet: file and folder names, paths,
+sizes, dates, fingerprints and counts. No drawing, model geometry or document text is copied or stored. Files that exist only in the cloud (OneDrive, Google Drive,
+Dropbox "online-only") are NOT downloaded unless you tick the box for it; they are listed in Not Checked. A stopped scan cannot be resumed - it starts again.
+(The older metrics-only profile is still available with the option --legacy-profile.)
 In the browser page there is one button for each step. Run step 1 first if you want a fast overview, or send both zips.
 (Command line: add --quick for step 1; without it you get step 2.)
 

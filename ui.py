@@ -66,6 +66,7 @@ table.qt{border-collapse:collapse}table.qt td,table.qt th{border:1px solid #8884
 <ul id="ls"></ul>
 <div id="selbox" style="display:none;margin-top:12px"><span class="mut" id="selcount"></span><ul id="sel" style="max-height:150px"></ul></div></div>
 <div class="card"><b>3. Run</b>
+<label style="display:block;margin-top:8px"><input type="checkbox" id="dlcloud"> Step 2: download online-only files (OneDrive / Google Drive / Dropbox) and check them <span class="mut">(by default they are not downloaded and are listed in the Not Checked sheet; ticking this can download a lot of data)</span></label>
 <label style="display:block;margin-top:8px"><input type="checkbox" id="anonn"> Anonymise file and folder names in the result <span class="mut">(optional; applies to Step 1 and Step 2. Only the result is renamed, never your files. The same name gets the same code in Step 1, Step 2 and every later run on this computer. You also get a separate name map to keep private; extra time is negligible)</span></label>
 <label style="display:block;margin:6px 0 0 24px"><input type="checkbox" id="anonmap" checked disabled> Also give me the name map <span class="mut">(a separate file, real name &rarr; anonymised name, with its own download button. Keep it private.)</span></label>
 <label style="display:block;margin-top:8px"><input type="checkbox" id="listpaths" checked> Step 1: also list every file's path, size and date by file type <span class="mut">(adds a few seconds on a fast disk, nothing noticeable on a slow disk or file server; the zip grows by about 11 bytes per file. Uncheck to keep file names out of the Step 1 result.)</span></label>
@@ -128,7 +129,7 @@ const left=s=>s==null?"":s<90?" - about "+Math.round(s)+" s left":s<5400?" - abo
 async function start(kind){$("res").textContent="";$("bar").style.display="none";$("barlabel").textContent="";
  if(mode=="pick"&&!sel.length){$("res").innerHTML="<span class='er'>Tick at least one folder first.</span>";return}
  busy(true);
- const o={fresh:$("fresh").checked,kind:kind,anon_names:$("anonn").checked,anon_map:$("anonmap").checked,list_paths:$("listpaths").checked};
+ const o={fresh:$("fresh").checked,kind:kind,anon_names:$("anonn").checked,anon_map:$("anonmap").checked,list_paths:$("listpaths").checked,dl_cloud:$("dlcloud").checked};
  const body=mode=="pick"?{t:T,paths:sel,...o}:{t:T,path:$("p").value,...o};
  const r=await fetch("/api/start",{method:"POST",body:JSON.stringify(body)});const j=await r.json();
  if(j.error){$("res").innerHTML="<span class='er'>"+esc(j.error)+"</span>";busy(false);return}poll()}
@@ -154,6 +155,8 @@ async function poll(){const j=await (await fetch("/api/status?t="+T)).json();bar
   j.result.top.forEach(x=>{t+="<tr><td>."+esc(x[0])+"</td><td>"+x[1].toLocaleString()+"</td><td>"+mb(x[2])+"</td></tr>"});t+="</table>";
   $("res").innerHTML="<span class='ok'>Step 1 done: "+j.result.files.toLocaleString()+" files, "+mb(j.result.total_bytes)+", "+j.result.types+" file types in "+j.result.projects+" folders ("+j.result.seconds+" s).</span><br><br>"+t+
    "<br><a class='btn' href='/api/download?t="+T+"'>Download quick count zip</a> <span class='mut'>"+esc(j.result.name)+"</span><br><br><span class='mut'>When you are ready, click <b>Step 2: full profile</b> for the complete profile.</span>"+(j.result.map_name?"<br><br><a class='btn' style='background:var(--er)' href='/api/download_map?t="+T+"'>Download name map</a> <span class='mut'>"+esc(j.result.map_name)+" - KEEP PRIVATE: it turns the codes back into the real names. Do not send it with the profile.</span>":"")}
+ else if(j.state=="done"&&j.result.scan)$("res").innerHTML="<span class='ok'>Scan done: "+j.result.projects+" projects, "+j.result.files.toLocaleString()+" files"+(j.result.errors?", "+j.result.errors+" not checked (see the Not Checked sheet)":"")+
+  ".</span><br><br><a class='btn' href='/api/download?t="+T+"'>Download scan workbook</a> <span class='mut'>"+esc(j.result.name)+" - send us this ONE file</span>";
  else if(j.state=="done")$("res").innerHTML="<span class='ok'>Done: "+j.result.projects+" folders, "+j.result.files.toLocaleString()+" files"+(j.result.errors?", "+j.result.errors+" unreadable":"")+
   ".</span><br><br><a class='btn' href='/api/download?t="+T+"'>Download metrics zip</a> <span class='mut'>"+esc(j.result.name)+"</span><br><br>"+
   (j.result.stats_name?"<a class='btn' style='background:var(--ac)' href='/api/download_log?t="+T+"'>Download run statistics</a> <span class='mut'>timings and your machine's speed - no file names; safe to share</span>":"")+(j.result.map_name?"<br><br><a class='btn' style='background:var(--er)' href='/api/download_map?t="+T+"'>Download name map</a> <span class='mut'>"+esc(j.result.map_name)+" - KEEP PRIVATE: it turns the codes back into the real names. Do not send it with the profile.</span>":"");
@@ -387,7 +390,7 @@ def choose_server(host, want, handler, explicit=False):
     return TS((host, 0), handler), why
 
 
-def _run(path, folders=None, anon=False, tier=2, depth=1, fresh=False, quick=False, anon_names=False, anon_map=True, list_paths=True):
+def _run(path, folders=None, anon=False, tier=2, depth=1, fresh=False, quick=False, anon_names=False, anon_map=True, list_paths=True, dl_cloud=False):
     def log(msg):
         with LOCK:
             STATE["log"].append(_stamp() + "  " + msg.rstrip())
@@ -408,6 +411,17 @@ def _run(path, folders=None, anon=False, tier=2, depth=1, fresh=False, quick=Fal
                                                    "projects": nproj, "files": nfiles, "errors": errors, "quick": True,
                                                    "top": fp.LAST_RUN.get("top", []), "total_bytes": fp.LAST_RUN.get("total_bytes", 0),
                                                    "types": fp.LAST_RUN.get("distinct_extensions", 0), "seconds": fp.LAST_RUN.get("seconds", 0)})
+            return
+        if not os.environ.get("PROFILER_LEGACY_PROFILE"):      # step 2 = the CAD project scan workbook (cad_scan.py)
+            import cad_scan
+            if anon_names:
+                log("Note: name anonymisation does not apply to the scan workbook (its Real Files sheet lists real paths).")
+            t0 = time.time()
+            xlsx, nproj, nfiles, problems = cad_scan.scan(path, OUT_DIR, log=log, label=label, progress=progress, download_cloud=dl_cloud, host=fp,
+                                                          folders=folders)
+            with LOCK:
+                STATE.update(state="done", result={"path": xlsx, "name": os.path.basename(xlsx), "stats_path": "", "stats_name": "", "scan": True,
+                                                   "map_path": "", "map_name": "", "projects": nproj, "files": nfiles, "errors": problems})
             return
         zip_path, nproj, nfiles, errors = fp.profile(path, OUT_DIR, log=log, label=label, folders=folders, progress=progress,
                                                       anonymize_assembly_names=anon, tier=tier, project_depth=depth,
@@ -575,7 +589,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(404, "no result", "text/plain")
             size = os.path.getsize(res[key[0]])
             self.send_response(200)
-            self.send_header("Content-Type", "application/zip"); self.send_header("Content-Length", str(size))
+            self.send_header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" if res[key[0]].endswith(".xlsx") else "application/zip")
+            self.send_header("Content-Length", str(size))
             self.send_header("Content-Disposition", f'attachment; filename="{res[key[1]]}"'); self.end_headers()
             with open(res[key[0]], "rb") as f:                     # streamed: the zip can be hundreds of MB
                 while True:
@@ -684,7 +699,8 @@ class Handler(BaseHTTPRequestHandler):
             fp.CONTROL.reset(); HIST.clear(); fp.LIVE.clear(); STATE.update(state="running", log=[], result=None, error=None, fail=None,
                          progress={"phase": "scan", "files": 0, "total_files": 0, "bytes": 0, "total_bytes": 0})
         threading.Thread(target=_guarded, args=(_run, path, folders or None, bool(body.get("anon")), 2, 1,
-                                                          bool(body.get("fresh")), body.get("kind") == "quick", bool(body.get("anon_names")), body.get("anon_map", True) is not False, body.get("list_paths", True) is not False), daemon=True).start()
+                                                          bool(body.get("fresh")), body.get("kind") == "quick", bool(body.get("anon_names")), body.get("anon_map", True) is not False, body.get("list_paths", True) is not False,
+                                                          bool(body.get("dl_cloud"))), daemon=True).start()
         self._json({"ok": True})
 
 
