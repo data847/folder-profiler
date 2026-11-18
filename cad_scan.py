@@ -98,9 +98,13 @@ class Rec:
 
 
 def virtual_dir(pdir, arch, inner):
+    """Folder a file belongs to for the project split. 0.3: archive members are files of the folder the archive sits in, so the archive's own
+    name is NOT a path component (a copy of a folder inside an archive lands on the same folder as the extracted copy). Folders inside an
+    archive (and the folders a nested archive sits in) are kept."""
     d = tuple(pdir)
-    for a in arch:
-        d += tuple(c for c in re.split(r"[\\/]", a) if c)
+    for k, a in enumerate(arch):
+        if k:                                              # a nested archive: the folders it sits in inside its parent archive
+            d += tuple(c for c in re.split(r"[\\/]", a) if c)[:-1]
     return d + tuple(inner)
 
 
@@ -544,7 +548,7 @@ def _nested(ctx, name, data, pdir, my_arch, inner, depth, out, mtime):
             raw = gzip.GzipFile(fileobj=bio).read(MAX_NESTED_BYTES + 1)
             _member(ctx, [name[:-3]], len(raw), mtime, lambda raw=raw: io.BytesIO(raw), pdir, sub_chain, depth, out)
         else:
-            return nc("rar / 7z inside another archive: not opened")
+            return _expand_external(ctx, name, bio, len(data), pdir, sub_chain, depth, out, mtime, nc)
     except (zipfile.BadZipFile, tarfile.TarError, EOFError, gzip.BadGzipFile, NotImplementedError, OSError) as exc:
         nc(f"Archive is corrupt or unsupported ({type(exc).__name__})")
     except RuntimeError:
