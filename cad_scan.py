@@ -296,6 +296,7 @@ class Ctx:
         self.read_errors = collections.Counter()
         self.tools = find_archive_tools()
         self.tmp_root = None
+        self.zip_cache = _ZipCache()
         self.progress = lambda *a: None
         self.checkpoint = lambda: None
 
@@ -489,15 +490,27 @@ def _member(ctx, parts, size, mtime, opener, pdir, my_arch, depth, out):
     """One member: a plain file, or (recursively) another archive."""
     name, inner = parts[-1], tuple(parts[:-1])
     if archive_kind(name) and size <= MAX_NESTED_BYTES:
+        data = fobj = None
         try:
-            with opener() as mf:
-                data = mf.read()
+            if archive_kind(name) in ("zip", "tar", "gz"):
+                with opener() as mf:
+                    data = mf.read()
+            else:                                           # rar / 7z go to an external tool anyway: stream them to disk, not into memory
+                fobj = tempfile.TemporaryFile(dir=ctx.tmp_root)
+                with opener() as mf:
+                    shutil.copyfileobj(mf, fobj, 8 * 1024 * 1024)
         except Exception as exc:
+            if fobj is not None:
+                fobj.close()
             r = Rec(pdir, my_arch, inner, name, size, mtime)
             r.cat, r.status, r.reason = "Other", "nc", f"Archive member could not be read ({type(exc).__name__})"
             out.append(r)
             return
-        _nested(ctx, name, data, pdir, my_arch, inner, depth + 1, out, mtime)
+        try:
+            _nested(ctx, name, data, pdir, my_arch, inner, depth + 1, out, mtime, fobj=fobj, size=size)
+        finally:
+            if fobj is not None:
+                fobj.close()
         return
     if archive_kind(name):                                  # an archive too big to hold in memory
         r = Rec(pdir, my_arch, inner, name, size, mtime)
@@ -510,25 +523,26 @@ def _member(ctx, parts, size, mtime, opener, pdir, my_arch, depth, out):
     out.append(r)
 
 
-def _nested(ctx, name, data, pdir, my_arch, inner, depth, out, mtime):
+def _nested(ctx, name, data, pdir, my_arch, inner, depth, out, mtime, fobj=None, size=None):
     """Archive inside an archive: its members' archive chain gets the inner archive's path inside its parent."""
     full = "/".join(list(inner) + [name])
     chain = my_arch
     kind = archive_kind(name)
+    n = len(data) if data is not None else size
     ctx.archives += 1
     if depth > MAX_DEPTH:
-        r = Rec(pdir, chain, inner, name, len(data), mtime)
+        r = Rec(pdir, chain, inner, name, n, mtime)
         r.cat, r.status, r.reason = "Other", "nc", f"Archive nested deeper than {MAX_DEPTH} levels"
         out.append(r)
         return
     sub_chain = chain + (full,)
 
     def nc(reason):
-        r = Rec(pdir, chain, inner, name, len(data), mtime)
+        r = Rec(pdir, chain, inner, name, n, mtime)
         r.cat, r.status, r.reason = "Other", "nc", reason
         out.append(r)
     try:
-        bio = io.BytesIO(data)
+        bio = io.BytesIO(data) if data is not None else fobj
         if kind == "zip":
             with zipfile.ZipFile(bio) as zf:
                 infos = [i for i in zf.infolist() if not i.is_dir()]
@@ -548,7 +562,7 @@ def _nested(ctx, name, data, pdir, my_arch, inner, depth, out, mtime):
             raw = gzip.GzipFile(fileobj=bio).read(MAX_NESTED_BYTES + 1)
             _member(ctx, [name[:-3]], len(raw), mtime, lambda raw=raw: io.BytesIO(raw), pdir, sub_chain, depth, out)
         else:
-            return _expand_external(ctx, name, bio, len(data), pdir, sub_chain, depth, out, mtime, nc)
+            return _expand_external(ctx, name, bio, n, pdir, sub_chain, depth, out, mtime, nc)
     except (zipfile.BadZipFile, tarfile.TarError, EOFError, gzip.BadGzipFile, NotImplementedError, OSError) as exc:
         nc(f"Archive is corrupt or unsupported ({type(exc).__name__})")
     except RuntimeError:
@@ -968,18 +982,19 @@ def fuzzy_clusters(ctx, p):
         for md5, f in distinct.items():
             body = load_body(ctx, f)
             if body is None:
-                reps.append((md5, None))
+                if len(reps) < FUZZY_MAX_CLUSTERS:
+                    reps.append((md5, None))
                 continue
             hit = None
             for rm, rb in reps[:FUZZY_MAX_CLUSTERS]:
                 if rb is None or len(rb) != len(body):
                     continue
-                if diff_pct(rb, body) < FUZZY_PCT:
+                if diff_below(rb, body, FUZZY_PCT):
                     hit = rm
                     break
             if hit:
                 merged[md5] = hit
-            else:
+            elif len(reps) < FUZZY_MAX_CLUSTERS:        # only the first FUZZY_MAX_CLUSTERS are ever compared against: do not hold the rest in memory
                 reps.append((md5, body))
     return merged
 
@@ -993,6 +1008,110 @@ def diff_pct(a, b):
     return (n - x.count(0)) * 100.0 / max(1, n)
 
 
+_CHUNK = 64 * 1024
+
+
+def diff_below(a, b, pct):
+    """Exactly `diff_pct(a, b) < pct`, but stops as soon as the differing bytes already reach the limit (so unrelated bodies cost one chunk,
+    not the whole body). Equal-length inputs."""
+    n = len(a)
+    if a == b:
+        return True
+    limit = pct * n / 100.0                    # differing bytes must stay strictly below this
+    diff = 0
+    for i in range(0, n, _CHUNK):
+        x, y = a[i:i + _CHUNK], b[i:i + _CHUNK]
+        if x != y:
+            m = len(x)
+            z = (int.from_bytes(x, "little") ^ int.from_bytes(y, "little")).to_bytes(m, "little")
+            diff += m - z.count(0)
+            if diff >= limit:
+                return False
+    return diff < limit
+
+
+_NOT_A_ZIP = object()
+
+
+class _ZipCache:
+    """Open zip files kept for the duplicate check, so every re-read of a member does not re-read (and re-index) the whole archive."""
+    MAX = 6
+
+    def __init__(self):
+        self.d = collections.OrderedDict()      # key -> (ZipFile, {normalised member name: ZipInfo})
+
+    def get(self, key, opener):
+        hit = self.d.get(key)
+        if hit is not None:
+            self.d.move_to_end(key)
+            if hit is _NOT_A_ZIP:                      # this archive is not a readable zip (rar / 7z / corrupt): do not re-extract it per member
+                raise zipfile.BadZipFile("not a zip archive")
+            return hit
+        try:
+            zf = opener()
+            names = {}
+            for i in zf.infolist():
+                names.setdefault("/".join(_split(i.filename)), i)
+        except Exception:
+            self.d[key] = _NOT_A_ZIP                   # a marker, not the exception: its traceback would keep the archive's bytes alive
+            raise
+        self.d[key] = (zf, names)
+        while sum(v is not _NOT_A_ZIP for v in self.d.values()) > self.MAX:
+            for k, v in self.d.items():                 # drop the least recently used open archive (not-a-zip markers cost nothing and stay)
+                if v is not _NOT_A_ZIP:
+                    del self.d[k]
+                    _close_zip(v[0])
+                    break
+        return self.d[key]
+
+    def close(self):
+        for v in self.d.values():
+            if v is not _NOT_A_ZIP:
+                _close_zip(v[0])
+        self.d.clear()
+
+
+def _member_bytes(cache, key, opener, member):
+    zf, names = cache.get(key, opener)
+    info = names.get(member)
+    if info is None:
+        raise KeyError(member)
+    return zf.read(info)
+
+
+def _nested_zip_opener(cache, parent_key, parent_opener, member, tmp_dir=None):
+    """Opens a zip stored inside another zip. It is copied to a temporary file (not held in memory) and only when it really is a zip,
+    which is told from its first bytes, so a rar / 7z member is never read just to find that out."""
+    def opener():
+        zf, names = cache.get(parent_key, parent_opener)
+        info = names.get(member)
+        if info is None:
+            raise KeyError(member)
+        with zf.open(info) as src:
+            if src.read(2) != b"PK" and member.lower().endswith((".rar", ".7z")):   # only these are skipped unread; anything else gets the full zip check
+                raise zipfile.BadZipFile("not a zip archive")
+        tmp = tempfile.TemporaryFile(dir=tmp_dir)
+        try:
+            with zf.open(info) as src:
+                shutil.copyfileobj(src, tmp, 8 * 1024 * 1024)
+            z = zipfile.ZipFile(tmp)
+        except Exception:
+            tmp.close()
+            raise
+        z._datalabs_tmp = tmp
+        return z
+    return opener
+
+
+def _close_zip(zf):
+    for obj in (zf, getattr(zf, "_datalabs_tmp", None)):
+        try:
+            if obj is not None:
+                obj.close()
+        except Exception:
+            pass
+
+
 def load_body(ctx, f):
     """Re-open a Solid Edge part (on disk or inside zip files) and return its body bytes; None if it cannot be re-opened."""
     try:
@@ -1000,21 +1119,16 @@ def load_body(ctx, f):
         if not f.arch:
             with open(lp(os.path.join(base, f.name)), "rb") as fh:
                 return se_body_bytes(fh.read())
-        data = open(lp(os.path.join(base, f.arch[0])), "rb").read()
-        for lvl, name in enumerate(f.arch):
-            if lvl:
-                data = _zip_read(data, name)
-        return se_body_bytes(_zip_read(data, "/".join(list(f.inner) + [f.name])))
+        cache = ctx.zip_cache
+        path = lp(os.path.join(base, f.arch[0]))
+        key, opener = (path,), (lambda: zipfile.ZipFile(path))
+        for name in f.arch[1:]:
+            # the nested archive's bytes are only extracted when it is not already open in the cache
+            opener = _nested_zip_opener(cache, key, opener, name, ctx.tmp_root)
+            key = key + (name,)
+        return se_body_bytes(_member_bytes(cache, key, opener, "/".join(list(f.inner) + [f.name])))
     except Exception:
         return None
-
-
-def _zip_read(data, member):
-    with zipfile.ZipFile(io.BytesIO(data)) as zf:
-        for i in zf.infolist():
-            if "/".join(_split(i.filename)) == member:
-                return zf.read(i)
-    raise KeyError(member)
 
 
 def classify_project(ctx, p):
@@ -1470,6 +1584,7 @@ def scan(root, out_dir, log=print, label=None, workers=None, progress=None, down
     hollow_assemblies(recs)
     for p in projects:
         dedupe_project(ctx, p)
+    ctx.zip_cache.close()
     for p in projects:
         p.main = find_main(p, index)
     rows = []

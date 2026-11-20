@@ -48,7 +48,39 @@ def _base(name):
     return re.split(r"[\\/:]", name)[-1].strip().lower()
 
 
+# Candidate finders: the reference patterns above can only match where a literal ".ext" sits, and then only within 200 characters before it.
+# Searching just those windows gives exactly the same matches as scanning the whole blob, without trying a 200-character run from every byte.
+_ASCII_CAND = re.compile(rb"\.(?:" + _EXT_ALT.encode() + rb")(?![A-Za-z0-9_])", re.I)
+_UTF16_CAND = re.compile(rb"\.\x00(?:" + b"|".join(b"".join(bytes([ord(c)]) + b"\x00" for c in e) for e in CAD_EXTS) + rb")", re.I)
+_ASCII_REACH, _UTF16_REACH, _TAIL = 204, 408, 6
+
+
+def _windows(blob, cand, reach, width):
+    """Merged (start, end) windows around every candidate hit, each wide enough to hold any match that ends at one of them."""
+    n = len(blob)
+    out = []
+    for m in cand.finditer(blob):
+        a, b = max(0, m.start() - reach), min(n, m.start() + width + _TAIL)
+        if out and a <= out[-1][1]:
+            out[-1][1] = max(out[-1][1], b)
+        else:
+            out.append([a, b])
+    return out
+
+
 def _refs_in(blob, out):
+    for a, b in _windows(blob, _UTF16_CAND, _UTF16_REACH, 30):
+        for m in _UTF16_REF.finditer(blob, a, b):
+            txt = m.group(0).decode("utf-16le", "ignore")
+            txt = re.sub(r"[^\w\-. ()\[\]$#&+,\\/:]+$", "", txt)
+            out[_base(txt)] += 1
+    for a, b in _windows(blob, _ASCII_CAND, _ASCII_REACH, 16):
+        for m in _ASCII_REF.finditer(blob, a, b):
+            out[_base(m.group(0).decode("latin-1"))] += 1
+
+
+def _refs_in_whole(blob, out):
+    """The original whole-blob scan; kept as the reference the windowed version is tested against."""
     for m in _UTF16_REF.finditer(blob):
         txt = m.group(0).decode("utf-16le", "ignore")
         txt = re.sub(r"[^\w\-. ()\[\]$#&+,\\/:]+$", "", txt)

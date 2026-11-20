@@ -166,7 +166,9 @@ with tempfile.TemporaryDirectory() as t:
     import zipfile as zf
     if os.environ.get('SCAN_TEST_KEEP'):
         import shutil; shutil.copy(xlsx, os.environ['SCAN_TEST_KEEP'])
-    z = zf.ZipFile(xlsx)
+    import io as _io
+    with open(xlsx, 'rb') as _fh:
+        z = zf.ZipFile(_io.BytesIO(_fh.read()))          # in memory: a handle left open on the file stops Windows deleting the temp folder
     check("workbook has the 7 sheets of the template", sorted(n for n in z.namelist() if n.startswith("xl/worksheets/")), [f"xl/worksheets/sheet{i}.xml" for i in range(1, 8)])
     wbx = z.read("xl/workbook.xml").decode()
     check("sheet names in order", [s.split('"')[0] for s in wbx.split('<sheet name="')[1:]],
